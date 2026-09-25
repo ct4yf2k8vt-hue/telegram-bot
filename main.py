@@ -40,7 +40,14 @@ def atr(h, l, c, n=14):
     return a
 
 def bot_loop():
-    S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
+    S = []
+    while not S:
+        info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
+        if info and "symbols" in info:
+            S = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
+        if not S:
+            print("Binance API yanit vermedi, 10 saniye sonra tekrar denenecek...")
+            time.sleep(10)
     tg(C, "VOLATILITE + ZIRVE/DIP BOTU AKTIF " + str(len(S)))
     son_vol = {}
     son_zirve = {}
@@ -50,7 +57,7 @@ def bot_loop():
         try:
             for s in S:
                 try:
-                    # --- 1. ANORMAL VOLATILITE KONTROLU (Mevcut Sistem) ---
+                    # --- 1. ANORMAL VOLATILITE KONTROLU ---
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=100")
                     if k and len(k) >= 30:
                         c = [float(x[4]) for x in k][:-1]
@@ -100,7 +107,7 @@ def bot_loop():
                                                 son_vol[s] = time.time()
                                                 print(s, "VOL", yon)
 
-                    # --- 2. AYLIK/YILLIK ZIRVE-DIP KONTROLU (Yeni Sistem) ---
+                    # --- 2. AYLIK/YILLIK ZIRVE-DIP KONTROLU ---
                     kd = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1d&limit=365")
                     if kd and len(kd) >= 32:
                         c_d = float(kd[-1][4])
@@ -112,11 +119,9 @@ def bot_loop():
                         yillik_max = max(h_d[-365:])
                         yillik_min = min(l_d[-365:])
                         
-                        # Yakinlik toleransi (%0.5)
                         tol = 0.005
                         
-                        # Aylik Zirve
-                        if c_d >= acekylik_max * (1 - tol):
+                        if c_d >= aylik_max * (1 - tol):
                             if time.time() - son_zirve.get(s + "_A", 0) >= 1800:
                                 msg = ("🔺 <b>AYLIK ZIRVE</b>\n"
                                        "Signal: #" + s + "\n"
@@ -128,7 +133,6 @@ def bot_loop():
                                 son_zirve[s + "_A"] = time.time()
                                 print(s, "AYLIK ZIRVE")
                                 
-                        # Aylik Dip
                         if c_d <= aylik_min * (1 + tol):
                             if time.time() - son_dip.get(s + "_A", 0) >= 1800:
                                 msg = ("🔻 <b>AYLIK DIP</b>\n"
@@ -141,7 +145,6 @@ def bot_loop():
                                 son_dip[s + "_A"] = time.time()
                                 print(s, "AYLIK DIP")
                                 
-                        # Yillik Zirve
                         if c_d >= yillik_max * (1 - tol):
                             if time.time() - son_zirve.get(s + "_Y", 0) >= 1800:
                                 msg = ("🔺 <b>YILLIK ZIRVE</b>\n"
@@ -154,7 +157,6 @@ def bot_loop():
                                 son_zirve[s + "_Y"] = time.time()
                                 print(s, "YILLIK ZIRVE")
                                 
-                        # Yillik Dip
                         if c_d <= yillik_min * (1 + tol):
                             if time.time() - son_dip.get(s + "_Y", 0) >= 1800:
                                 msg = ("🔻 <b>YILLIK DIP</b>\n"
