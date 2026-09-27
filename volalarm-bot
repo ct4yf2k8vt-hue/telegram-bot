@@ -1,0 +1,76 @@
+import os, asyncio
+import ccxt, pandas as pd
+from telegram import Bot
+from telegram.constants import ParseMode
+
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+
+EXCHANGE = ccxt.binance({"enableRateLimit": True})
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+TIMEFRAME = "1h"
+SCAN_INTERVAL = 300
+LOOKBACK_DAYS = 365
+
+sent_alerts = {}
+
+def fetch_ohlcv(symbol):
+    try:
+        all_candles = []
+        since = EXCHANGE.milliseconds() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+        while True:
+            batch = EXCHANGE.fetch_ohlcv(symbol, TIMEFRAME, since=since, limit=1000)
+            if not batch:
+                break
+            all_candles += batch
+            if len(batch) < 1000:
+                break
+            since = batch[-1][0] + 1
+        return all_candles
+    except Exception as e:
+        print(f"[{symbol}] fetch hatasi: {e}")
+        return None
+
+def analyze(symbol):
+    ohlcv = fetch_ohlcv(symbol)
+    if not ohlcv or len(ohlcv) < 100:
+        return None
+    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    closed = df.iloc[:-1]
+    year_high = closed["high"].max()
+    year_low = closed["low"].min()
+    last_close = df["close"].iloc[-1]
+    last_high = df["high"].iloc[-1]
+    last_low = df["low"].iloc[-1]
+
+    if last_high >= year_high:
+        return ("high", year_high, last_close)
+    if last_low <= year_low:
+        return ("low", year_low, last_close)
+    return None
+
+async def main():
+    bot = Bot(token=TOKEN)
+    print("Bot basladi - yillik max/min takibi...")
+    while True:
+        for sym in SYMBOLS:
+            r = analyze(sym)
+            if not r:
+                continue
+            kind, level, price = r
+            if sent_alerts.get(sym) == kind:
+                continue
+            sent_alerts[sym] = kind
+            if kind == "high":
+                msg = f"🚨 *{sym}* - *YILLIK ZIRVE*\nSeviye: `{level}`\nFiyat: `{price}`\n⏱ {TIMEFRAME} | 365 gun"
+            else:
+                msg = f"🚨 *{sym}* - *YILLIK DIP*\nSeviye: `{level}`\nFiyat: `{price}`\n⏱ {TIMEFRAME} | 365 gun"
+            try:
+                await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+                print(f"Gonderildi: {sym} {kind}")
+            except Exception as e:
+                print("Telegram hata:", e)
+        await asyncio.sleep(SCAN_INTERVAL)
+
+if __name__ == "__main__":
+    asyncio.run(main())
