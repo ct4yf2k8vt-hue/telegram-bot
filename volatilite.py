@@ -1,281 +1,131 @@
+import urllib.request, urllib.parse, json, time
 import os
-import time
-import requests
-from datetime import datetime, timezone
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# =========================
-# AYARLAR
-# =========================
+T = os.environ.get("BOT_TOKEN")
+C = "1623907197"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
-CHECK_SECONDS = 60
-
-SPOT_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo"
-SPOT_KLINES = "https://api.binance.com/api/v3/klines"
-
-FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
-
-
-# =========================
-# TELEGRAM
-# =========================
-
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("TELEGRAM_TOKEN veya CHAT_ID eksik")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
+def tg(ci, m):
     try:
-        requests.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
-            timeout=15
-        )
-    except Exception as e:
-        print("Telegram hatası:", e)
+        d = urllib.parse.urlencode({"chat_id": ci, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
+        urllib.request.urlopen("https://api.telegram.org/bot" + T + "/sendMessage", d, timeout=10).read()
+    except:
+        pass
 
-
-# =========================
-# SPOT COINLER
-# =========================
-
-def get_spot_symbols():
-
+def gj(u):
     try:
-        data = requests.get(
-            SPOT_EXCHANGE_INFO,
-            timeout=20
-        ).json()
-
-        symbols = []
-
-        for s in data["symbols"]:
-
-            if (
-                s["quoteAsset"] == "USDT"
-                and s["status"] == "TRADING"
-                and s["isSpotTradingAllowed"]
-            ):
-                symbols.append(s["symbol"])
-
-        return symbols
-
-    except Exception as e:
-        print("Spot liste hatası:", e)
-        return []
-
-
-# =========================
-# FUTURES COINLER
-# =========================
-
-def get_futures_symbols():
-
-    try:
-        data = requests.get(
-            FUTURES_EXCHANGE_INFO,
-            timeout=20
-        ).json()
-
-        symbols = []
-
-        for s in data["symbols"]:
-
-            if (
-                s["quoteAsset"] == "USDT"
-                and s["status"] == "TRADING"
-                and s["contractType"] == "PERPETUAL"
-            ):
-                symbols.append(s["symbol"])
-
-        return symbols
-
-    except Exception as e:
-        print("Futures liste hatası:", e)
-        return []
-
-
-# =========================
-# GÜNLÜK MUM VERİSİ
-# =========================
-
-def get_daily_klines(symbol, futures=False):
-
-    url = FUTURES_KLINES if futures else SPOT_KLINES
-
-    try:
-
-        response = requests.get(
-            url,
-            params={
-                "symbol": symbol,
-                "interval": "1d",
-                "limit": 370
-            },
-            timeout=20
-        )
-
-        data = response.json()
-
-        if not isinstance(data, list):
-            return []
-
-        return data
-
-    except Exception as e:
-        print(symbol, "mum hatası:", e)
-        return []
-
-
-# =========================
-# AYLIK / YILLIK ANALİZ
-# =========================
-
-def analyze_symbol(symbol, futures=False):
-
-    candles = get_daily_klines(symbol, futures)
-
-    if not candles:
+        return json.loads(urllib.request.urlopen(u, timeout=20).read().decode())
+    except:
         return None
 
-    now = datetime.now(timezone.utc)
+def sma(v, n):
+    if len(v) < n: return None
+    return sum(v[-n:]) / n
 
-    current_year = now.year
-    current_month = now.month
+def std(v, n):
+    if len(v) < n: return None
+    m = sum(v[-n:]) / n
+    return (sum((x - m) ** 2 for x in v[-n:]) / n) ** 0.5
 
-    yearly_high = None
-    yearly_low = None
+def atr(h, l, c, n=14):
+    if len(c) < n + 1: return None
+    tr = []
+    for i in range(1, len(c)):
+        tr.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
+    if len(tr) < n: return None
+    a = sum(tr[:n]) / n
+    for x in tr[n:]:
+        a = (a * (n - 1) + x) / n
+    return a
 
-    monthly_high = None
-    monthly_low = None
+def bot_loop():
+    S = []
+    while not S:
+        info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
+        if info and "symbols" in info:
+            S = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
+        if not S:
+            print("Binance API yanit vermedi, 10 saniye sonra tekrar denenecek...")
+            time.sleep(10)
+    tg(C, "VOLATILITE BOTU AKTIF " + str(len(S)))
+    son = {}
+    while True:
+        try:
+            for s in S:
+                try:
+                    k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=100")
+                    if k and len(k) >= 30:
+                        c = [float(x[4]) for x in k][:-1]
+                        h = [float(x[2]) for x in k][:-1]
+                        l = [float(x[3]) for x in k][:-1]
+                        v = [float(x[5]) for x in k][:-1]
+                        sma20 = sma(c, 20)
+                        st20 = std(c, 20)
+                        if sma20 and st20:
+                            bu = sma20 + 2 * st20
+                            bl = sma20 - 2 * st20
+                            bw = (bu - bl) / sma20 if sma20 else 0
+                            bw_list = []
+                            for i in range(20, len(c)):
+                                s20 = sma(c[:i], 20)
+                                t20 = std(c[:i], 20)
+                                if s20 and t20 and s20 > 0:
+                                    bw_list.append(((s20 + 2 * t20) - (s20 - 2 * t20)) / s20)
+                            if len(bw_list) >= 20:
+                                bw_ort = sum(bw_list[-20:]) / 20
+                                if bw_ort > 0:
+                                    squeeze = bw < bw_ort * 0.7
+                                    f = c[-1]
+                                    breakout = f > bu or f < bl
+                                    a = atr(h, l, c)
+                                    if a and f > 0:
+                                        atr_pct = (a / f) * 100
+                                        if squeeze and breakout and atr_pct > 2:
+                                            if time.time() - son.get(s, 0) >= 1800:
+                                                yon = "LONG" if f > bu else "SHORT"
+                                                emoji = "🟢" if yon == "LONG" else "🔴"
+                                                chg = ((f - c[-2]) / c[-2]) * 100 if len(c) > 1 else 0
+                                                v_son = v[-1]
+                                                v_ort = sum(v[-20:]) / 20
+                                                v_oran = v_son / v_ort if v_ort > 0 else 0
+                                                msg = (emoji + " <b>ANORMAL VOLATILITE ALARMI</b>\n"
+                                                       "COIN: <b>" + s + "</b> (15m)\n"
+                                                       "YON: <b>" + yon + "</b>\n\n"
+                                                       "Fiyat: <code>" + format(f, ".6f") + "</code> (" + format(chg, ".2f") + "%)\n"
+                                                       "Bollinger: <code>" + format(bl, ".6f") + "</code> - <code>" + format(bu, ".6f") + "</code>\n"
+                                                       "ATR: <code>" + format(a, ".6f") + "</code> (" + format(atr_pct, ".2f") + "%)\n"
+                                                       "Hacim: <code>" + format(v_oran, ".2f") + "x</code>\n"
+                                                       "Sikisma: <code>" + format(bw / bw_ort * 100, ".0f") + "%</code>\n\n"
+                                                       "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
+                                                       "Link: marketowl.eu")
+                                                tg(C, msg)
+                                                son[s] = time.time()
+                                                print(s, "VOL", yon)
+                except:
+                    pass
+            print("Tarama bitti")
+            time.sleep(300)
+        except Exception as e:
+            print("Hata:", e)
+            time.sleep(30)
 
-    current_price = float(candles[-1][4])
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
-    for candle in candles:
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
 
-        candle_time = datetime.fromtimestamp(
-            candle[0] / 1000,
-            timezone.utc
-        )
-
-        high = float(candle[2])
-        low = float(candle[3])
-
-        # Takvim yılı
-        if candle_time.year == current_year:
-
-            if yearly_high is None or high > yearly_high:
-                yearly_high = high
-
-            if yearly_low is None or low < yearly_low:
-                yearly_low = low
-
-        # İçinde bulunduğumuz takvim ayı
-        if (
-            candle_time.year == current_year
-            and candle_time.month == current_month
-        ):
-
-            if monthly_high is None or high > monthly_high:
-                monthly_high = high
-
-            if monthly_low is None or low < monthly_low:
-                monthly_low = low
-
-    return {
-        "price": current_price,
-        "year_high": yearly_high,
-        "year_low": yearly_low,
-        "month_high": monthly_high,
-        "month_low": monthly_low
-    }
-
-
-# =========================
-# ANA SİSTEM
-# =========================
-
-def run_scan():
-
-    spot = get_spot_symbols()
-    futures = get_futures_symbols()
-
-    print(
-        "Spot:",
-        len(spot),
-        "| Futures:",
-        len(futures)
-    )
-
-    # Şimdilik test amacıyla ilk birkaç coin
-    # çalıştırıyoruz.
-    test_spot = spot[:5]
-    test_futures = futures[:5]
-
-    for symbol in test_spot:
-
-        result = analyze_symbol(
-            symbol,
-            futures=False
-        )
-
-        if result:
-
-            print(
-                "SPOT",
-                symbol,
-                "Fiyat:", result["price"],
-                "Aylık High:", result["month_high"],
-                "Aylık Low:", result["month_low"],
-                "Yıllık High:", result["year_high"],
-                "Yıllık Low:", result["year_low"]
-            )
-
-    for symbol in test_futures:
-
-        result = analyze_symbol(
-            symbol,
-            futures=True
-        )
-
-        if result:
-
-            print(
-                "FUTURES",
-                symbol,
-                "Fiyat:", result["price"],
-                "Aylık High:", result["month_high"],
-                "Aylık Low:", result["month_low"],
-                "Yıllık High:", result["year_high"],
-                "Yıllık Low:", result["year_low"]
-            )
-
-
-# =========================
-# BAŞLAT
-# =========================
-
-print("================================")
-print(" BINANCE SPOT + FUTURES BOT")
-print(" Aylık / Yıllık High-Low")
-print("================================")
-
-while True:
-
-    try:
-
-        run_scan()
-
-    except Exception as e:
-
-        print("Ana hata:", e)
-
-    time.sleep(CHECK_SECONDS)
+if __name__ == "__main__":
+    bot_thread = threading.Thread(target=bot_loop)
+    bot_thread.daemon = True
+    bot_thread.start()
+    run_web_server()
