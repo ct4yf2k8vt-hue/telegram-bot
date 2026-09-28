@@ -19,7 +19,7 @@ def gj(u):
 
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
 
-tg(C, "5 MUM ARDI ARDA BOTU AKTIF - " + str(len(S)) + " COIN")
+tg(C, "5 MUM ARDI ARDA (SIRALI) BOTU AKTIF - " + str(len(S)) + " COIN")
 son = {}
 
 while True:
@@ -34,10 +34,25 @@ while True:
                 if len(kapanmis) < 10:
                     continue
                 
-                # Son 5 mumun verileri
+                # Son 5 mumun kapanis fiyatlari ve hacimleri
                 son5 = kapanmis[-5:]
+                c1 = float(son5[0][4])
+                c2 = float(son5[1][4])
+                c3 = float(son5[2][4])
+                c4 = float(son5[3][4])
+                c5 = float(son5[4][4])
                 
-                # Yesil mum sayisi (kapanis > acilis)
+                # Hacimler
+                v1 = float(son5[0][5])
+                v2 = float(son5[1][5])
+                v3 = float(son5[2][5])
+                v4 = float(son5[3][5])
+                v5 = float(son5[4][5])
+                
+                # Hacim artis kontrolu
+                hacim_artiyor = v1 < v2 < v3 < v4 < v5
+                
+                # Yesil mum kontrolu (kapanis > acilis)
                 yesil = 0
                 kirmizi = 0
                 for m in son5:
@@ -48,52 +63,48 @@ while True:
                     elif c < o:
                         kirmizi += 1
                 
-                # Hacim artis kontrolu (son 5 mumun hacmi artiyor mu?)
-                v1 = float(son5[0][5])
-                v2 = float(son5[1][5])
-                v3 = float(son5[2][5])
-                v4 = float(son5[3][5])
-                v5 = float(son5[4][5])
-                hacim_artiyor = v1 < v2 < v3 < v4 < v5
-                
-                # Fiyat degisimi (ilk ve son kapanis)
-                ilk = float(son5[0][1])
-                son_fiyat = float(son5[4][4])
+                # Fiyat degisimi
+                ilk = c1
+                son_fiyat = c5
                 degisim = ((son_fiyat - ilk) / ilk) * 100
                 
-                # YUKSELIS: 5 ard arda yesil + hacim artiyor
-                if yesil == 5 and hacim_artiyor:
+                # YUKSELIS: 5 yesil mum + fiyatlar KUCUKTEN BUYUGE + hacim artiyor
+                if yesil == 5 and c1 < c2 < c3 < c4 < c5 and hacim_artiyor:
                     if time.time() - son.get(s + "_UP", 0) >= 3600:
-                        msg = ("🚀 <b>5 ARDI ARDA YESIL MUM</b>\n"
+                        msg = ("🚀 <b>5 ARDI ARDA YESIL MUM (SIRALI)</b>\n"
                                "COIN: <b>" + s + "</b> (4h)\n\n"
-                               "Ilk Fiyat: <code>" + format(ilk, ".6f") + "</code>\n"
-                               "Son Fiyat: <code>" + format(son_fiyat, ".6f") + "</code>\n"
-                               "Degisim: <b>+" + format(degisim, ".2f") + "%</b>\n\n"
-                               "Hacim Artisi:\n"
-                               "M1: <code>" + format(v1, ".0f") + "</code>\n"
-                               "M5: <code>" + format(v5, ".0f") + "</code>\n\n"
+                               "Fiyat Siralamasi:\n"
+                               "M1: <code>" + format(c1, ".6f") + "</code>\n"
+                               "M2: <code>" + format(c2, ".6f") + "</code>\n"
+                               "M3: <code>" + format(c3, ".6f") + "</code>\n"
+                               "M4: <code>" + format(c4, ".6f") + "</code>\n"
+                               "M5: <code>" + format(c5, ".6f") + "</code>\n\n"
+                               "Degisim: <b>+" + format(degisim, ".2f") + "%</b>\n"
+                               "Hacim Artisi: <b>EVET</b>\n\n"
                                "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
                                "Link: marketowl.eu")
                         tg(C, msg)
                         son[s + "_UP"] = time.time()
-                        print(s, "5 YESIL", format(degisim, ".2f"))
+                        print(s, "5 YESIL SIRALI", format(degisim, ".2f"))
                 
-                # DUSUS: 5 ard arda kirmizi + hacim artiyor
-                if kirmizi == 5 and hacim_artiyor:
+                # DUSUS: 5 kirmizi mum + fiyatlar BUYUKTEN KUCUGE + hacim artiyor
+                if kirmizi == 5 and c1 > c2 > c3 > c4 > c5 and hacim_artiyor:
                     if time.time() - son.get(s + "_DOWN", 0) >= 3600:
-                        msg = ("🔻 <b>5 ARDI ARDA KIRMIZI MUM</b>\n"
+                        msg = ("🔻 <b>5 ARDI ARDA KIRMIZI MUM (SIRALI)</b>\n"
                                "COIN: <b>" + s + "</b> (4h)\n\n"
-                               "Ilk Fiyat: <code>" + format(ilk, ".6f") + "</code>\n"
-                               "Son Fiyat: <code>" + format(son_fiyat, ".6f") + "</code>\n"
-                               "Degisim: <b>" + format(degisim, ".2f") + "%</b>\n\n"
-                               "Hacim Artisi:\n"
-                               "M1: <code>" + format(v1, ".0f") + "</code>\n"
-                               "M5: <code>" + format(v5, ".0f") + "</code>\n\n"
+                               "Fiyat Siralamasi:\n"
+                               "M1: <code>" + format(c1, ".6f") + "</code>\n"
+                               "M2: <code>" + format(c2, ".6f") + "</code>\n"
+                               "M3: <code>" + format(c3, ".6f") + "</code>\n"
+                               "M4: <code>" + format(c4, ".6f") + "</code>\n"
+                               "M5: <code>" + format(c5, ".6f") + "</code>\n\n"
+                               "Degisim: <b>" + format(degisim, ".2f") + "%</b>\n"
+                               "Hacim Artisi: <b>EVET</b>\n\n"
                                "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
                                "Link: marketowl.eu")
                         tg(C, msg)
                         son[s + "_DOWN"] = time.time()
-                        print(s, "5 KIRMIZI", format(degisim, ".2f"))
+                        print(s, "5 KIRMIZI SIRALI", format(degisim, ".2f"))
             except:
                 pass
         print("Tarama bitti")
