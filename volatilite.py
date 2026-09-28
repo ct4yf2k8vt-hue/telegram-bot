@@ -17,84 +17,87 @@ def gj(u):
     except:
         return None
 
-def ema(v, p):
-    if len(v) < p: return None
-    k = 2 / (p + 1)
-    e = sum(v[:p]) / p
-    for x in v[p:]:
-        e = x * k + e * (1 - k)
-    return e
-
-# TUM COINLER
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
 
-tg(C, "24 SAATLIK YUKSELIS TAKIP BOTU AKTIF - " + str(len(S)) + " COIN")
-
-# Sayaçlar
-sayaclar = {}       # symbol -> sinyal sayisi
-ilk_sinyal = {}     # symbol -> ilk sinyal zamani
-bildirildi = {}     # symbol -> bildirim yapildi mi
-son_sinyal = {}     # symbol -> son sinyal zamani (cooldown icin)
-
-ESIK = 3            # 24 saat icinde en az kac sinyal gelmeli
-PENCERE = 86400     # 24 saat (saniye)
-COOLDOWN = 3600     # Ayni coin icin sinyal cooldown (1 saat)
+tg(C, "5 MUM ARDI ARDA BOTU AKTIF - " + str(len(S)) + " COIN")
+son = {}
 
 while True:
     try:
         for s in S:
             try:
-                # 15 dakikalik son 50 mumu al
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=50")
-                if not k or len(k) < 30:
+                # 4 saatlik son 30 mumu al
+                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=4h&limit=30")
+                if not k or len(k) < 12:
                     continue
                 kapanmis = k[:-1]
-                if len(kapanmis) < 30:
+                if len(kapanmis) < 10:
                     continue
-                c = [float(x[4]) for x in kapanmis]
-                prev_ema7 = ema(c[:-1], 7)
-                prev_ema25 = ema(c[:-1], 25)
-                now_ema7 = ema(c, 7)
-                now_ema25 = ema(c, 25)
-                if None in (prev_ema7, prev_ema25, now_ema7, now_ema25):
-                    continue
-                fiyat = c[-1]
                 
-                # YUKARI KESISIM (LONG)
-                if prev_ema7 <= prev_ema25 and now_ema7 > now_ema25:
-                    if time.time() - son_sinyal.get(s, 0) >= COOLDOWN:
-                        son_sinyal[s] = time.time()
-                        
-                        # 24 saatlik pencere kontrolu
-                        simdi = time.time()
-                        if s not in ilk_sinyal or (simdi - ilk_sinyal[s]) > PENCERE:
-                            # Yeni pencere baslat
-                            ilk_sinyal[s] = simdi
-                            sayaclar[s] = 1
-                            bildirildi[s] = False
-                        else:
-                            # Mevcut pencereye ekle
-                            sayaclar[s] = sayaclar.get(s, 0) + 1
-                        
-                        # Esik asildiysa ve henuz bildirilmediyse
-                        if sayaclar[s] >= ESIK and not bildirildi.get(s, False):
-                            bildirildi[s] = True
-                            gecen = (simdi - ilk_sinyal[s]) / 3600
-                            msg = ("🔥 <b>SUREKLI YUKSELIS SINYALI</b>\n"
-                                   "COIN: <b>" + s + "</b> (15m)\n\n"
-                                   "Sinyal Sayisi: <b>" + str(sayaclar[s]) + "</b>\n"
-                                   "Gecen Sure: <b>" + format(gecen, ".1f") + " saat</b>\n"
-                                   "Son Fiyat: <code>" + format(fiyat, ".6f") + "</code>\n"
-                                   "EMA 7: <code>" + format(now_ema7, ".6f") + "</code>\n"
-                                   "EMA 25: <code>" + format(now_ema25, ".6f") + "</code>\n\n"
-                                   "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                                   "Link: marketowl.eu")
-                            tg(C, msg)
-                            print(s, "SUREKLI YUKSELIS", sayaclar[s])
+                # Son 5 mumun verileri
+                son5 = kapanmis[-5:]
+                
+                # Yesil mum sayisi (kapanis > acilis)
+                yesil = 0
+                kirmizi = 0
+                for m in son5:
+                    o = float(m[1])
+                    c = float(m[4])
+                    if c > o:
+                        yesil += 1
+                    elif c < o:
+                        kirmizi += 1
+                
+                # Hacim artis kontrolu (son 5 mumun hacmi artiyor mu?)
+                v1 = float(son5[0][5])
+                v2 = float(son5[1][5])
+                v3 = float(son5[2][5])
+                v4 = float(son5[3][5])
+                v5 = float(son5[4][5])
+                hacim_artiyor = v1 < v2 < v3 < v4 < v5
+                
+                # Fiyat degisimi (ilk ve son kapanis)
+                ilk = float(son5[0][1])
+                son_fiyat = float(son5[4][4])
+                degisim = ((son_fiyat - ilk) / ilk) * 100
+                
+                # YUKSELIS: 5 ard arda yesil + hacim artiyor
+                if yesil == 5 and hacim_artiyor:
+                    if time.time() - son.get(s + "_UP", 0) >= 3600:
+                        msg = ("🚀 <b>5 ARDI ARDA YESIL MUM</b>\n"
+                               "COIN: <b>" + s + "</b> (4h)\n\n"
+                               "Ilk Fiyat: <code>" + format(ilk, ".6f") + "</code>\n"
+                               "Son Fiyat: <code>" + format(son_fiyat, ".6f") + "</code>\n"
+                               "Degisim: <b>+" + format(degisim, ".2f") + "%</b>\n\n"
+                               "Hacim Artisi:\n"
+                               "M1: <code>" + format(v1, ".0f") + "</code>\n"
+                               "M5: <code>" + format(v5, ".0f") + "</code>\n\n"
+                               "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
+                               "Link: marketowl.eu")
+                        tg(C, msg)
+                        son[s + "_UP"] = time.time()
+                        print(s, "5 YESIL", format(degisim, ".2f"))
+                
+                # DUSUS: 5 ard arda kirmizi + hacim artiyor
+                if kirmizi == 5 and hacim_artiyor:
+                    if time.time() - son.get(s + "_DOWN", 0) >= 3600:
+                        msg = ("🔻 <b>5 ARDI ARDA KIRMIZI MUM</b>\n"
+                               "COIN: <b>" + s + "</b> (4h)\n\n"
+                               "Ilk Fiyat: <code>" + format(ilk, ".6f") + "</code>\n"
+                               "Son Fiyat: <code>" + format(son_fiyat, ".6f") + "</code>\n"
+                               "Degisim: <b>" + format(degisim, ".2f") + "%</b>\n\n"
+                               "Hacim Artisi:\n"
+                               "M1: <code>" + format(v1, ".0f") + "</code>\n"
+                               "M5: <code>" + format(v5, ".0f") + "</code>\n\n"
+                               "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
+                               "Link: marketowl.eu")
+                        tg(C, msg)
+                        son[s + "_DOWN"] = time.time()
+                        print(s, "5 KIRMIZI", format(degisim, ".2f"))
             except:
                 pass
         print("Tarama bitti")
-        time.sleep(60)
+        time.sleep(300)
     except Exception as e:
         print("Hata:", e)
         time.sleep(30)
