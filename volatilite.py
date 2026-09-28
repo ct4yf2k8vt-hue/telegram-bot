@@ -17,73 +17,77 @@ def gj(u):
     except:
         return None
 
-def ema(v, p):
-    if len(v) < p: return None
-    k = 2 / (p + 1)
-    e = sum(v[:p]) / p
-    for x in v[p:]:
-        e = x * k + e * (1 - k)
-    return e
-
-# TUM COINLER
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-
-tg(C, "EMA 7/25 KESISIM BOTU AKTIF - " + str(len(S)) + " COIN")
+tg(C, "XDECOW TARZI DETAYLI BOT AKTIF " + str(len(S)))
 son = {}
 
 while True:
     try:
         for s in S:
             try:
-                # 15 dakikalik son 50 mumu al
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=50")
-                if not k or len(k) < 30:
+                # 1. Son 1 saatlik ve 2 saatlik mum verileri
+                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1h&limit=3")
+                if not k or len(k) < 3:
                     continue
-                # Son kapanmis mumlari al (sonuncuyu at - henuz kapanmadi)
-                kapanmis = k[:-1]
-                if len(kapanmis) < 30:
+                # Son kapanmis mum (1h)
+                m = k[-2]
+                fiyat = float(m[4])
+                onceki_fiyat = float(m[1])
+                degisim = ((fiyat - onceki_fiyat) / onceki_fiyat) * 100
+                hacim = float(m[5])
+                trade_sayisi = int(m[8])
+                # Onceki mum (1h)
+                m_onceki = k[-3]
+                hacim_onceki = float(m_onceki[5])
+                trade_onceki = int(m_onceki[8])
+                # Hacim ve trade degisimi
+                hacim_degisim = ((hacim - hacim_onceki) / hacim_onceki) * 100 if hacim_onceki > 0 else 0
+                trade_degisim = ((trade_sayisi - trade_onceki) / trade_onceki) * 100 if trade_onceki > 0 else 0
+                # Trades Spike kontrolu: trade sayisi %200'den fazla artmissa
+                if trade_degisim < 200:
                     continue
-                c = [float(x[4]) for x in kapanmis]
-                # EMA 7 ve EMA 25 hesapla
-                prev_ema7 = ema(c[:-1], 7)
-                prev_ema25 = ema(c[:-1], 25)
-                now_ema7 = ema(c, 7)
-                now_ema25 = ema(c, 25)
-                if None in (prev_ema7, prev_ema25, now_ema7, now_ema25):
-                    continue
-                fiyat = c[-1]
-                # YUKARI KESISIM (LONG)
-                if prev_ema7 <= prev_ema25 and now_ema7 > now_ema25:
-                    if time.time() - son.get(s, 0) >= 3600:
-                        msg = ("🟢 <b>EMA 7/25 YUKARI KESISIM (LONG)</b>\n"
-                               "COIN: <b>" + s + "</b> (15m)\n\n"
-                               "Fiyat: <code>" + format(fiyat, ".6f") + "</code>\n"
-                               "EMA 7: <code>" + format(now_ema7, ".6f") + "</code>\n"
-                               "EMA 25: <code>" + format(now_ema25, ".6f") + "</code>\n"
-                               "Fark: <code>" + format(now_ema7 - now_ema25, ".6f") + "</code>\n\n"
-                               "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                               "Link: marketowl.eu")
-                        tg(C, msg)
-                        son[s] = time.time()
-                        print(s, "LONG")
-                # ASAGI KESISIM (SHORT)
-                if prev_ema7 >= prev_ema25 and now_ema7 < now_ema25:
-                    if time.time() - son.get(s, 0) >= 3600:
-                        msg = ("🔴 <b>EMA 7/25 ASAGI KESISIM (SHORT)</b>\n"
-                               "COIN: <b>" + s + "</b> (15m)\n\n"
-                               "Fiyat: <code>" + format(fiyat, ".6f") + "</code>\n"
-                               "EMA 7: <code>" + format(now_ema7, ".6f") + "</code>\n"
-                               "EMA 25: <code>" + format(now_ema25, ".6f") + "</code>\n"
-                               "Fark: <code>" + format(now_ema7 - now_ema25, ".6f") + "</code>\n\n"
-                               "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                               "Link: marketowl.eu")
-                        tg(C, msg)
-                        son[s] = time.time()
-                        print(s, "SHORT")
+                # 2. Acik Pozisyon (OI) verisi
+                oi_data = gj("https://fapi.binance.com/futures/data/openInterestHist?symbol=" + s + "&period=1h&limit=2")
+                oi_degisim = 0
+                oi_deger = 0
+                if oi_data and len(oi_data) >= 2:
+                    oi_deger = float(oi_data[-1]["sumOpenInterestValue"])
+                    oi_onceki = float(oi_data[-2]["sumOpenInterestValue"])
+                    if oi_onceki > 0:
+                        oi_degisim = ((oi_deger - oi_onceki) / oi_onceki) * 100
+                # 3. Long/Short Ratio (LSR) verisi
+                lsr_data = gj("https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=" + s + "&period=1h&limit=1")
+                lsr_deger = 0
+                if lsr_data and len(lsr_data) > 0:
+                    lsr_deger = float(lsr_data[0]["longShortRatio"])
+                # 4. Taker Buy/Sell Volume (Taker Flow) verisi
+                taker_data = gj("https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=" + s + "&period=1h&limit=1")
+                taker_oran = 0
+                if taker_data and len(taker_data) > 0:
+                    taker_oran = float(taker_data[0]["buySellRatio"])
+                
+                if time.time() - son.get(s, 0) >= 3600:
+                    emoji = "🚀" if degisim > 0 else "⚠️"
+                    msg = (emoji + " <b>" + s + "</b>\n"
+                           "🔄 <b>Trades Spike +" + format(trade_degisim, ".1f") + "% (1h)</b>\n"
+                           "🕐 " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()) + "\n\n"
+                           "ℹ️ 1h changes #" + s + "\n"
+                           "────────────────────\n"
+                           "💵 Price: $" + format(fiyat, ".4f") + " | " + format(degisim, "+.1f") + "%\n"
+                           "📊 Vol: $" + format(hacim / 1000000, ".1f") + "M | " + format(hacim_degisim, "+.1f") + "%\n"
+                           "💰 OI: $" + format(oi_deger / 1000000, ".1f") + "M | " + format(oi_degisim, "+.1f") + "%\n"
+                           "⚖️ LSR: " + format(lsr_deger, ".2f") + " | +0.1\n"
+                           "🤝 Trades: " + format(trade_sayisi / 1000, ".1f") + "K | " + format(trade_degisim, "+.1f") + "%\n\n"
+                           "📈 View chart\n"
+                           "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
+                           "Link: marketowl.eu")
+                    tg(C, msg)
+                    son[s] = time.time()
+                    print(s, "SPIKE", format(trade_degisim, ".1f"))
             except:
                 pass
         print("Tarama bitti")
-        time.sleep(60)
+        time.sleep(300)
     except Exception as e:
         print("Hata:", e)
         time.sleep(30)
