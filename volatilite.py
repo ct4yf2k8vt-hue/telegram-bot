@@ -25,10 +25,10 @@ def ema(v, p):
         e = x * k + e * (1 - k)
     return e
 
-# Sadece BTC ve ETH
-S = ["BTCUSDT", "ETHUSDT"]
+# TUM COINLER
+S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
 
-tg(C, "EMA 7/25 KESISIM BOTU AKTIF - BTC & ETH")
+tg(C, "EMA 7/25 KESISIM BOTU AKTIF - " + str(len(S)) + " COIN")
 son = {}
 
 while True:
@@ -52,29 +52,29 @@ while True:
                 if None in (prev_ema7, prev_ema25, now_ema7, now_ema25):
                     continue
                 fiyat = c[-1]
-                # YUKARI KESISIM (LONG): EMA7, EMA25'i yukari kesti
+                # YUKARI KESISIM (LONG)
                 if prev_ema7 <= prev_ema25 and now_ema7 > now_ema25:
-                    if time.time() - son.get(s, 0) >= 1800:
+                    if time.time() - son.get(s, 0) >= 3600:
                         msg = ("🟢 <b>EMA 7/25 YUKARI KESISIM (LONG)</b>\n"
                                "COIN: <b>" + s + "</b> (15m)\n\n"
-                               "Fiyat: <code>" + format(fiyat, ".4f") + "</code>\n"
-                               "EMA 7: <code>" + format(now_ema7, ".4f") + "</code>\n"
-                               "EMA 25: <code>" + format(now_ema25, ".4f") + "</code>\n"
-                               "Fark: <code>" + format(now_ema7 - now_ema25, ".4f") + "</code>\n\n"
+                               "Fiyat: <code>" + format(fiyat, ".6f") + "</code>\n"
+                               "EMA 7: <code>" + format(now_ema7, ".6f") + "</code>\n"
+                               "EMA 25: <code>" + format(now_ema25, ".6f") + "</code>\n"
+                               "Fark: <code>" + format(now_ema7 - now_ema25, ".6f") + "</code>\n\n"
                                "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
                                "Link: marketowl.eu")
                         tg(C, msg)
                         son[s] = time.time()
                         print(s, "LONG")
-                # ASAGI KESISIM (SHORT): EMA7, EMA25'i asagi kesti
+                # ASAGI KESISIM (SHORT)
                 if prev_ema7 >= prev_ema25 and now_ema7 < now_ema25:
-                    if time.time() - son.get(s, 0) >= 1800:
+                    if time.time() - son.get(s, 0) >= 3600:
                         msg = ("🔴 <b>EMA 7/25 ASAGI KESISIM (SHORT)</b>\n"
                                "COIN: <b>" + s + "</b> (15m)\n\n"
-                               "Fiyat: <code>" + format(fiyat, ".4f") + "</code>\n"
-                               "EMA 7: <code>" + format(now_ema7, ".4f") + "</code>\n"
-                               "EMA 25: <code>" + format(now_ema25, ".4f") + "</code>\n"
-                               "Fark: <code>" + format(now_ema7 - now_ema25, ".4f") + "</code>\n\n"
+                               "Fiyat: <code>" + format(fiyat, ".6f") + "</code>\n"
+                               "EMA 7: <code>" + format(now_ema7, ".6f") + "</code>\n"
+                               "EMA 25: <code>" + format(now_ema25, ".6f") + "</code>\n"
+                               "Fark: <code>" + format(now_ema7 - now_ema25, ".6f") + "</code>\n\n"
                                "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
                                "Link: marketowl.eu")
                         tg(C, msg)
