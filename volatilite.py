@@ -38,14 +38,11 @@ def atr(h, l, c, n=14):
     return a
 
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-tg(C, "ANORMAL VOLATILITE + ARDI ARDA BOTU AKTIF " + str(len(S)))
+tg(C, "ANORMAL VOLATILITE BOTU AKTIF " + str(len(S)))
 son = {}
-son_yukselis = {}
-son_dusus = {}
 
 while True:
     try:
-        # --- 1. ANORMAL VOLATILITE ---
         for s in S:
             try:
                 k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=100")
@@ -102,55 +99,9 @@ while True:
                                "Link: marketowl.eu")
                         tg(C, msg)
                         son[s] = time.time()
-                        print(s, "VOL", yon)
+                        print(s, yon)
             except:
                 pass
-
-        # --- 2. ARDI ARDA YUKSELIS/DUSUS ---
-        for s in S:
-            try:
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=6")
-                if not k or len(k) < 6:
-                    continue
-                kapanmis = k[:-1]
-                if len(kapanmis) < 5:
-                    continue
-                c1 = float(kapanmis[-5][4])
-                c2 = float(kapanmis[-4][4])
-                c3 = float(kapanmis[-3][4])
-                c4 = float(kapanmis[-2][4])
-                c5 = float(kapanmis[-1][4])
-                # Ardi ardina 5 yesil mum
-                if c1 < c2 < c3 < c4 < c5:
-                    if time.time() - son_yukselis.get(s, 0) >= 1800:
-                        degisim = ((c5 - c1) / c1) * 100
-                        msg = ("🟢 <b>ARDI ARDA YUKSELIS (5 MUM)</b>\n"
-                               "COIN: <b>" + s + "</b> (15m)\n\n"
-                               "Ilk: <code>" + format(c1, ".6f") + "</code>\n"
-                               "Son: <code>" + format(c5, ".6f") + "</code>\n"
-                               "Degisim: <b>+" + format(degisim, ".2f") + "%</b>\n\n"
-                               "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                               "Link: marketowl.eu")
-                        tg(C, msg)
-                        son_yukselis[s] = time.time()
-                        print(s, "YUKSELIS", format(degisim, ".2f"))
-                # Ardi ardina 5 kirmizi mum
-                if c1 > c2 > c3 > c4 > c5:
-                    if time.time() - son_dusus.get(s, 0) >= 1800:
-                        degisim = ((c5 - c1) / c1) * 100
-                        msg = ("🔴 <b>ARDI ARDA DUSUS (5 MUM)</b>\n"
-                               "COIN: <b>" + s + "</b> (15m)\n\n"
-                               "Ilk: <code>" + format(c1, ".6f") + "</code>\n"
-                               "Son: <code>" + format(c5, ".6f") + "</code>\n"
-                               "Degisim: <b>" + format(degisim, ".2f") + "%</b>\n\n"
-                               "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                               "Link: marketowl.eu")
-                        tg(C, msg)
-                        son_dusus[s] = time.time()
-                        print(s, "DUSUS", format(degisim, ".2f"))
-            except:
-                pass
-
         print("Tarama bitti")
         time.sleep(300)
     except Exception as e:
