@@ -1,3 +1,26 @@
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Render'ın beklediği portu dinleyen basit web sunucusu
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+def run_web_server():
+    # Render, PORT ortam değişkenini otomatik olarak ayarlar (varsayılan 10000)
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"WEB SUNUCUSU BASLADI - PORT: {port}")
+    server.serve_forever()
+
+# Web sunucusunu ayrı bir thread'de başlat
+threading.Thread(target=run_web_server, daemon=True).start()
 import urllib.request, urllib.parse, json, time
 import os
 
