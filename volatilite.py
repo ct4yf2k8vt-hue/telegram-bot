@@ -17,57 +17,57 @@ def gj(u):
     except:
         return None
 
+print("BASLADI")
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-tg(C, "TOP MOVERS - NEW HIGH BOTU AKTIF " + str(len(S)))
+print("COIN:", len(S))
+tg(C, "NEW HIGH BOTU AKTIF " + str(len(S)))
+print("TG GONDERILDI")
 
 while True:
     try:
+        print("--- TARAMA BASLADI ---")
         sonuclar = []
-        for s in S:
+        for i, s in enumerate(S):
             try:
-                # Gunluk mumlari al (son 31 gun)
+                # Gunluk 31 mum (30 gun once + bugun)
                 kd = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1d&limit=31")
                 if not kd or len(kd) < 31:
                     continue
-                # Simdiki fiyat (son kapanmis gun)
-                simdi = float(kd[-2][4])
-                # 24 saatlik degisim (son 2 gunluk)
-                onceki_24s = float(kd[-3][4])
-                degisim_24s = ((simdi - onceki_24s) / onceki_24s) * 100
-                # Son 1 gunun en yuksegi
-                son_1g_high = float(kd[-2][2])
-                # Son 7 gunun en yuksegi (bugun haric)
-                son_7g_high = max([float(x[2]) for x in kd[-8:-1]])
-                # Son 24 saatin en yuksegi (bugun haric)
-                son_24s_high = max([float(x[2]) for x in kd[-3:-1]])
-                # Son 30 gunun en yuksegi (bugun haric)
-                son_30g_high = max([float(x[2]) for x in kd[-31:-1]])
+                # Son kapanmis gunun en yuksegi (kd[-2])
+                bugun_high = float(kd[-2][2])
+                # Son kapanmis gunun kapanisi
+                bugun_close = float(kd[-2][4])
+                # Onceki gun kapanisi (24h degisim icin)
+                onceki_close = float(kd[-3][4])
+                degisim = ((bugun_close - onceki_close) / onceki_close) * 100
+                # Onceki 29 gunun en yuksegi (kd[-31:-2])
+                onceki_max = max([float(x[2]) for x in kd[-31:-2]])
                 # Yeni zirve kontrolu
-                if son_1g_high > son_30g_high:
-                    sonuclar.append(("New 30day High", simdi, degisim_24s, s))
-                if son_1g_high > son_7g_high:
-                    sonuclar.append(("New 7day High", simdi, degisim_24s, s))
-                if son_1g_high > son_24s_high:
-                    sonuclar.append(("New 24hr High", simdi, degisim_24s, s))
+                if bugun_high > onceki_max:
+                    sonuclar.append((degisim, s, bugun_close, bugun_high))
             except:
                 pass
-        # Degisime gore sirala (en yuksekten en dusuge)
-        sonuclar.sort(reverse=True, key=lambda x: x[2])
+            # Her 50 coinde bir log
+            if i % 50 == 0:
+                print("Islenen:", i)
+        print("YENI ZIRVE SAYISI:", len(sonuclar))
+        # Degisime gore sirala
+        sonuclar.sort(reverse=True)
         sonuclar = sonuclar[:15]
         if sonuclar:
             msg = "📊 <b>TOP MOVERS - NEW HIGH</b>\n\n"
-            for durum, fiyat, degisim, s in sonuclar:
+            for degisim, s, fiyat, high in sonuclar:
                 emoji = "🟢" if degisim > 0 else "🔴"
                 msg += (emoji + " <b>" + s + "</b>\n"
                         "24h Chg: <b>" + format(degisim, "+.2f") + "%</b>\n"
-                        "Status: <b>" + durum + "</b>\n\n")
-            msg += "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-            msg += "Link: marketowl.eu"
+                        "Fiyat: <code>" + format(fiyat, ".4f") + "</code>\n"
+                        "High: <code>" + format(high, ".4f") + "</code>\n\n")
+            msg += "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime())
             tg(C, msg)
-            print("Tablo gonderildi:", len(sonuclar))
+            print("TABLO GONDERILDI")
         else:
-            print("Yeni zirve yok")
-        print("Tarama bitti")
+            print("Yeni zirve bulunamadi")
+        print("--- TARAMA BITTI ---")
         time.sleep(300)
     except Exception as e:
         print("Hata:", e)
