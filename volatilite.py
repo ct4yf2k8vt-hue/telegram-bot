@@ -17,57 +17,57 @@ def gj(u):
     except:
         return None
 
-print("BASLADI")
-S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-print("COIN:", len(S))
-tg(C, "NEW HIGH BOTU AKTIF " + str(len(S)))
-print("TG GONDERILDI")
+tg(C, "TOP MOVERS BOTU AKTIF")
+print("BOT BASLADI")
 
 while True:
     try:
-        print("--- TARAMA BASLADI ---")
+        # TEK ISTEKLE tum coinlerin 24 saatlik verisini al
+        data = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
+        if not data:
+            print("Veri alinamadi")
+            time.sleep(60)
+            continue
+        
+        # Sadece USDT pariteleri ve yuksek hacimliler
         sonuclar = []
-        for i, s in enumerate(S):
+        for x in data:
+            s = x["symbol"]
+            if not s.endswith("USDT"):
+                continue
             try:
-                # Gunluk 31 mum (30 gun once + bugun)
-                kd = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1d&limit=31")
-                if not kd or len(kd) < 31:
-                    continue
-                # Son kapanmis gunun en yuksegi (kd[-2])
-                bugun_high = float(kd[-2][2])
-                # Son kapanmis gunun kapanisi
-                bugun_close = float(kd[-2][4])
-                # Onceki gun kapanisi (24h degisim icin)
-                onceki_close = float(kd[-3][4])
-                degisim = ((bugun_close - onceki_close) / onceki_close) * 100
-                # Onceki 29 gunun en yuksegi (kd[-31:-2])
-                onceki_max = max([float(x[2]) for x in kd[-31:-2]])
-                # Yeni zirve kontrolu
-                if bugun_high > onceki_max:
-                    sonuclar.append((degisim, s, bugun_close, bugun_high))
+                degisim = float(x["priceChangePercent"])
+                son_fiyat = float(x["lastPrice"])
+                yuksek = float(x["highPrice"])
+                hacim = float(x["quoteVolume"])
+                # Son fiyat, 24 saatlik zirveye cok yakinsa (yeni zirve)
+                if son_fiyat >= yuksek * 0.998:
+                    if hacim >= 1000000:  # 1M USDT uzeri hacim
+                        sonuclar.append((degisim, s, son_fiyat, yuksek, hacim))
             except:
                 pass
-            # Her 50 coinde bir log
-            if i % 50 == 0:
-                print("Islenen:", i)
-        print("YENI ZIRVE SAYISI:", len(sonuclar))
+        
         # Degisime gore sirala
         sonuclar.sort(reverse=True)
         sonuclar = sonuclar[:15]
+        
         if sonuclar:
-            msg = "📊 <b>TOP MOVERS - NEW HIGH</b>\n\n"
-            for degisim, s, fiyat, high in sonuclar:
+            msg = "📊 <b>TOP MOVERS - NEW HIGH (24h)</b>\n\n"
+            for degisim, s, fiyat, yuksek, hacim in sonuclar:
                 emoji = "🟢" if degisim > 0 else "🔴"
                 msg += (emoji + " <b>" + s + "</b>\n"
                         "24h Chg: <b>" + format(degisim, "+.2f") + "%</b>\n"
+                        "Status: <b>New 24hr High</b>\n"
                         "Fiyat: <code>" + format(fiyat, ".4f") + "</code>\n"
-                        "High: <code>" + format(high, ".4f") + "</code>\n\n")
-            msg += "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime())
+                        "Hacim: <code>$" + format(hacim / 1000000, ".1f") + "M</code>\n\n")
+            msg += "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
+            msg += "Link: marketowl.eu"
             tg(C, msg)
-            print("TABLO GONDERILDI")
+            print("TABLO GONDERILDI:", len(sonuclar))
         else:
-            print("Yeni zirve bulunamadi")
-        print("--- TARAMA BITTI ---")
+            print("Yeni zirve yok")
+        
+        print("Tarama bitti")
         time.sleep(300)
     except Exception as e:
         print("Hata:", e)
