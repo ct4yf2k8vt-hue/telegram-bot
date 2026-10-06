@@ -17,91 +17,97 @@ def gj(u):
     except:
         return None
 
-def sma(v, n):
-    if len(v) < n: return None
-    return sum(v[-n:]) / n
-
-def std(v, n):
-    if len(v) < n: return None
-    m = sum(v[-n:]) / n
-    return (sum((x - m) ** 2 for x in v[-n:]) / n) ** 0.5
-
-def atr(h, l, c, n=14):
-    if len(c) < n + 1: return None
-    tr = []
-    for i in range(1, len(c)):
-        tr.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
-    if len(tr) < n: return None
-    a = sum(tr[:n]) / n
-    for x in tr[n:]:
-        a = (a * (n - 1) + x) / n
-    return a
-
+print("BOT BASLADI")
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-tg(C, "ANORMAL VOLATILITE BOTU AKTIF " + str(len(S)))
-print("BOT BASLADI - COIN:", len(S))
-son = {}
+print("COIN:", len(S))
+tg(C, "XDECOW TARZI ALARM BOTU AKTIF " + str(len(S)))
+
+son_dump = {}
+son_spike = {}
 
 while True:
     try:
         for s in S:
             try:
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=100")
-                if not k or len(k) < 30:
-                    continue
-                c = [float(x[4]) for x in k][:-1]
-                h = [float(x[2]) for x in k][:-1]
-                l = [float(x[3]) for x in k][:-1]
-                v = [float(x[5]) for x in k][:-1]
-                if len(c) < 30:
-                    continue
-                sma20 = sma(c, 20)
-                st20 = std(c, 20)
-                if None in (sma20, st20):
-                    continue
-                bu = sma20 + 2 * st20
-                bl = sma20 - 2 * st20
-                bw = (bu - bl) / sma20 if sma20 else 0
-                bw_list = []
-                for i in range(20, len(c)):
-                    s20 = sma(c[:i], 20)
-                    t20 = std(c[:i], 20)
-                    if s20 and t20 and s20 > 0:
-                        bw_list.append(((s20 + 2 * t20) - (s20 - 2 * t20)) / s20)
-                if len(bw_list) < 20:
-                    continue
-                bw_ort = sum(bw_list[-20:]) / 20
-                if bw_ort == 0:
-                    continue
-                squeeze = bw < bw_ort * 0.7
-                f = c[-1]
-                breakout = f > bu or f < bl
-                a = atr(h, l, c)
-                if a is None or a == 0:
-                    continue
-                atr_pct = (a / f) * 100
-                if squeeze and breakout and atr_pct > 2:
-                    if time.time() - son.get(s, 0) >= 1800:
-                        yon = "LONG" if f > bu else "SHORT"
-                        emoji = "🟢" if yon == "LONG" else "🔴"
-                        chg = ((f - c[-2]) / c[-2]) * 100 if len(c) > 1 else 0
-                        v_son = v[-1]
-                        v_ort = sum(v[-20:]) / 20
-                        v_oran = v_son / v_ort if v_ort > 0 else 0
-                        sikisma_pct = (bw / bw_ort) * 100
-                        msg = (emoji + " <b>ANORMAL VOLATILITE ALARMI</b>\n"
-                               "COIN: <b>" + s + "</b> (15m)\n"
-                               "YON: <b>" + yon + "</b>\n\n"
-                               "Fiyat: <code>" + format(f, ".6f") + "</code> (" + format(chg, ".2f") + "%)\n"
-                               "Bollinger: <code>" + format(bl, ".6f") + "</code> - <code>" + format(bu, ".6f") + "</code>\n"
-                               "ATR: <code>" + format(a, ".6f") + "</code> (" + format(atr_pct, ".2f") + "%)\n"
-                               "Hacim: <code>" + format(v_oran, ".2f") + "x</code>\n"
-                               "Sikisma: <code>" + format(sikisma_pct, ".0f") + "%</code>\n\n"
-                               "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                               "Link: marketowl.eu")
-                        tg(C, msg)
-                        son[s] = time.time()
-                        print(s, yon, format(atr_pct, ".2f"))
+                # --- 1. PRICE DUMP KONTROLU (1 SAATLIK) ---
+                k1h = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1h&limit=2")
+                if k1h and len(k1h) >= 2:
+                    m = k1h[-2]  # son kapanmis 1h mum
+                    onceki = k1h[-3] if len(k1h) >= 3 else k1h[-2]
+                    fiyat = float(m[4])
+                    onceki_fiyat = float(onceki[4])
+                    degisim = ((fiyat - onceki_fiyat) / onceki_fiyat) * 100
+                    hacim = float(m[5])
+                    trade = int(m[8])
+                    
+                    # Fiyat %10'dan fazla dustuyse ve hacim 2x'ten fazlaysa
+                    if degisim <= -10:
+                        if time.time() - son_dump.get(s, 0) >= 3600:
+                            # Ek veriler
+                            oi_data = gj("https://fapi.binance.com/futures/data/openInterestHist?symbol=" + s + "&period=1h&limit=2")
+                            oi_degisim = 0
+                            if oi_data and len(oi_data) >= 2:
+                                oi_onceki = float(oi_data[-2]["sumOpenInterestValue"])
+                                if oi_onceki > 0:
+                                    oi_degisim = ((float(oi_data[-1]["sumOpenInterestValue"]) - oi_onceki) / oi_onceki) * 100
+                            
+                            lsr_data = gj("https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=" + s + "&period=1h&limit=1")
+                            lsr = float(lsr_data[0]["longShortRatio"]) if lsr_data and len(lsr_data) > 0 else 0
+                            
+                            msg = ("💀 <b>" + s + "</b>\n"
+                                   "Price Dump <b>" + format(degisim, ".1f") + "%</b> (1h)\n"
+                                   "🕐 " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()) + "\n\n"
+                                   "ℹ️ 1h changes #" + s + "\n"
+                                   "────────────────────\n"
+                                   "💵 Price: $" + format(fiyat, ".4f") + " | " + format(degisim, ".1f") + "%\n"
+                                   "📊 Vol: $" + format(hacim / 1000000, ".1f") + "M | " + format(degisim, ".1f") + "%\n"
+                                   "💰 OI: $" + format(oi_degisim, ".1f") + "%\n"
+                                   "⚖️ LSR: " + format(lsr, ".2f") + "\n"
+                                   "🤝 Trades: " + format(trade / 1000, ".1f") + "K\n\n"
+                                   "📈 View chart\n"
+                                   "Link: marketowl.eu")
+                            tg(C, msg)
+                            son_dump[s] = time.time()
+                            print(s, "DUMP", format(degisim, ".1f"))
+                
+                # --- 2. VOLUME SPIKE KONTROLU (30 DAKIKALIK) ---
+                k30m = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=30m&limit=3")
+                if k30m and len(k30m) >= 3:
+                    m30 = k30m[-2]
+                    hacim30 = float(m30[5])
+                    ort_hacim = (float(k30m[-4][5]) + float(k30m[-3][5]) + float(k30m[-2][5])) / 3
+                    if ort_hacim > 0:
+                        hacim_oran = hacim30 / ort_hacim
+                        if hacim_oran >= 10:
+                            if time.time() - son_spike.get(s, 0) >= 3600:
+                                fiyat30 = float(m30[4])
+                                degisim30 = ((fiyat30 - float(k30m[-3][4])) / float(k30m[-3][4])) * 100
+                                
+                                oi_data = gj("https://fapi.binance.com/futures/data/openInterestHist?symbol=" + s + "&period=30m&limit=2")
+                                oi_degisim = 0
+                                if oi_data and len(oi_data) >= 2:
+                                    oi_onceki = float(oi_data[-2]["sumOpenInterestValue"])
+                                    if oi_onceki > 0:
+                                        oi_degisim = ((float(oi_data[-1]["sumOpenInterestValue"]) - oi_onceki) / oi_onceki) * 100
+                                
+                                lsr_data = gj("https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=" + s + "&period=30m&limit=1")
+                                lsr = float(lsr_data[0]["longShortRatio"]) if lsr_data and len(lsr_data) > 0 else 0
+                                
+                                msg = ("🔥 <b>" + s + "</b>\n"
+                                       "Volume Spike <b>+" + format(hacim_oran, ".1f") + "x</b> (30m)\n"
+                                       "🕐 " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()) + "\n\n"
+                                       "ℹ️ 1h changes #" + s + "\n"
+                                       "────────────────────\n"
+                                       "💵 Price: $" + format(fiyat30, ".4f") + " | " + format(degisim30, ".1f") + "%\n"
+                                       "📊 Vol: $" + format(hacim30 / 1000000, ".1f") + "M | +" + format(hacim_oran * 100, ".0f") + "%\n"
+                                       "💰 OI: $" + format(oi_degisim, ".1f") + "%\n"
+                                       "⚖️ LSR: " + format(lsr, ".2f") + "\n"
+                                       "🤝 Trades: " + format(int(m30[8]) / 1000, ".1f") + "K\n\n"
+                                       "📈 View chart\n"
+                                       "Link: marketowl.eu")
+                                tg(C, msg)
+                                son_spike[s] = time.time()
+                                print(s, "SPIKE", format(hacim_oran, ".1f"))
             except:
                 pass
         print("Tarama bitti")
