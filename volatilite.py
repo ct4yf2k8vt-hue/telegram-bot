@@ -17,77 +17,57 @@ def gj(u):
     except:
         return None
 
-S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-tg(C, "ANORMAL VOLATILITE BOTU AKTIF " + str(len(S)))
+S = [x["symbol"] for x in gj("https://api.binance.com/api/v3/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT"]
+tg(C, "1 AYLIK / 1 YILLIK ZIRVE BOTU AKTIF " + str(len(S)))
 
 son = {}
 
 while True:
     try:
-        sayac = 0
+        aylik_zirveler = []
+        yillik_zirveler = []
         for s in S:
             try:
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=50")
+                k = gj("https://api.binance.com/api/v3/klines?symbol=" + s + "&interval=1d&limit=365")
                 if not k or len(k) < 30:
                     continue
                 km = k[:-1]
-                if len(km) < 25:
+                if len(km) < 30:
                     continue
-                c = [float(x[4]) for x in km]
-                h = [float(x[2]) for x in km]
-                l = [float(x[3]) for x in km]
-                v = [float(x[5]) for x in km]
-                
-                sma20 = sum(c[-20:]) / 20
-                var = sum((x - sma20) ** 2 for x in c[-20:]) / 20
-                std20 = var ** 0.5
-                bu = sma20 + 2 * std20
-                bl = sma20 - 2 * std20
-                f = c[-1]
-                
-                if not (f > bu or f < bl):
-                    continue
-                
-                tr_list = []
-                for i in range(1, 15):
-                    tr = max(h[-i] - l[-i], abs(h[-i] - c[-i-1]), abs(l[-i] - c[-i-1]))
-                    tr_list.append(tr)
-                atr14 = sum(tr_list) / 14
-                atr_pct = (atr14 / f) * 100
-                
-                if atr_pct < 2:
-                    continue
-                
-                if time.time() - son.get(s, 0) < 1800:
-                    continue
-                
-                yon = "LONG" if f > bu else "SHORT"
-                pumpdump = "PUMP" if yon == "LONG" else "DUMP"
-                emoji = "🟢" if yon == "LONG" else "🔴"
-                chg = ((f - c[-2]) / c[-2]) * 100 if len(c) > 1 else 0
-                v_son = v[-1]
-                v_ort = sum(v[-21:-1]) / 20
-                v_oran = v_son / v_ort if v_ort > 0 else 0
-                sikisma = ((bu - bl) / sma20) * 100
-                
-                msg = (emoji + " <b>ANORMAL VOLATILITE ALARMI</b>\n"
-                       "COIN: <b>" + s + "</b> (15m)\n"
-                       "YON: <b>" + yon + " (" + pumpdump + ")</b>\n\n"
-                       "Fiyat: <code>" + format(f, ".6f") + "</code> (" + format(chg, ".2f") + "%)\n"
-                       "Bollinger: <code>" + format(bl, ".6f") + "</code> - <code>" + format(bu, ".6f") + "</code>\n"
-                       "ATR: <code>" + format(atr14, ".6f") + "</code> (" + format(atr_pct, ".2f") + "%)\n"
-                       "Hacim: <code>" + format(v_oran, ".2f") + "x</code>\n"
-                       "Sikisma: <code>" + format(sikisma, ".0f") + "%</code>\n\n"
-                       "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                       "Link: marketowl.eu")
-                tg(C, msg)
-                son[s] = time.time()
-                sayac += 1
-                print(s, pumpdump, format(atr_pct, ".2f"))
+                high = [float(x[2]) for x in km]
+                fiyat = float(km[-1][4])
+                aylik_max = max(high[-30:])
+                yillik_max = max(high)
+                if fiyat >= aylik_max * 0.99:
+                    aylik_zirveler.append((fiyat / aylik_max, s, fiyat, aylik_max))
+                if fiyat >= yillik_max * 0.99:
+                    yillik_zirveler.append((fiyat / yillik_max, s, fiyat, yillik_max))
             except:
                 pass
-        print("Tarama bitti - Sinyal:", sayac)
-        time.sleep(300)
+        aylik_zirveler.sort(reverse=True)
+        yillik_zirveler.sort(reverse=True)
+        if aylik_zirveler:
+            msg = "📅 <b>1 AYLIK ZIRVE (30 GUN)</b>\n\n"
+            for oran, s, fiyat, max_f in aylik_zirveler[:15]:
+                msg += ("<b>" + s + "</b>\n"
+                        "Fiyat: <code>" + format(fiyat, ".6f") + "</code>\n"
+                        "1 Aylik Max: <code>" + format(max_f, ".6f") + "</code>\n"
+                        "Yakinlik: %" + format(oran * 100, ".2f") + "\n\n")
+            msg += "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime())
+            tg(C, msg)
+            print("AYLIK:", len(aylik_zirveler))
+        if yillik_zirveler:
+            msg = "📅 <b>1 YILLIK ZIRVE (365 GUN)</b>\n\n"
+            for oran, s, fiyat, max_f in yillik_zirveler[:15]:
+                msg += ("<b>" + s + "</b>\n"
+                        "Fiyat: <code>" + format(fiyat, ".6f") + "</code>\n"
+                        "1 Yillik Max: <code>" + format(max_f, ".6f") + "</code>\n"
+                        "Yakinlik: %" + format(oran * 100, ".2f") + "\n\n")
+            msg += "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime())
+            tg(C, msg)
+            print("YILLIK:", len(yillik_zirveler))
+        print("Tarama bitti")
+        time.sleep(1800)
     except Exception as e:
         print("Hata:", e)
         time.sleep(30)
