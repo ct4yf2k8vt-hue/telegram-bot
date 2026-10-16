@@ -17,8 +17,17 @@ def gj(u):
     except:
         return None
 
+# ===================================================
+# SADECE BINANCE API KULLANILIYOR
+# ===================================================
+# 1. Coin listesi: Binance Futures API
+# 2. Mum verileri: Binance Futures API
+# Baska hicbir borsa/global kaynak kullanilmiyor.
+# ===================================================
+
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
 tg(C, "5 DK HACIM PATLAMASI BOTU AKTIF " + str(len(S)))
+print("COIN SAYISI (Binance):", len(S))
 son = {}
 
 while True:
@@ -26,36 +35,33 @@ while True:
         sayac = 0
         for s in S:
             try:
-                # 5 dakikalik son 15 mumu al (son 1 + onceki 10 + biraz tampon)
+                # SADECE BINANCE FUTURES API'sinden veri cek
                 k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=15")
                 if not k or len(k) < 12:
                     continue
-                km = k[:-1]  # son kapanmis mumlari al
+                km = k[:-1]
                 if len(km) < 11:
                     continue
                 
-                # Son kapanmis mumun hacmi
                 v_son = float(km[-1][5])
                 fiyat = float(km[-1][4])
                 
-                # Onceki 10 mumun ortalama hacmi (son mum haric)
                 onceki_10 = [float(x[5]) for x in km[-11:-1]]
                 v_ort = sum(onceki_10) / 10
                 
                 if v_ort == 0:
                     continue
                 
-                # Hacim artis orani
                 v_oran = v_son / v_ort
                 artis_pct = (v_oran - 1) * 100
                 
-                # Kosul: hacim, onceki 10 mumun ortalamasindan %5 fazla
                 if artis_pct >= 5:
                     if time.time() - son.get(s, 0) >= 1800:
                         chg = ((fiyat - float(km[-2][4])) / float(km[-2][4])) * 100
                         emoji = "🟢" if chg > 0 else "🔴"
                         msg = ("🔥 <b>HACIM PATLAMASI</b>\n"
-                               "COIN: <b>" + s + "</b> (5m)\n\n"
+                               "COIN: <b>" + s + "</b> (5m)\n"
+                               "BORSA: <b>Binance Futures</b>\n\n"
                                "Son Hacim: <code>" + format(v_son, ".2f") + "</code>\n"
                                "10 Mum Ort: <code>" + format(v_ort, ".2f") + "</code>\n"
                                "Artis: <b>+" + format(artis_pct, ".2f") + "%</b>\n\n"
