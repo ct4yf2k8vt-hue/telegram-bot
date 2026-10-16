@@ -17,122 +17,56 @@ def gj(u):
     except:
         return None
 
-def sma(v, n):
-    if len(v) < n: return None
-    return sum(v[-n:]) / n
-
-def std(v, n):
-    if len(v) < n: return None
-    m = sum(v[-n:]) / n
-    return (sum((x - m) ** 2 for x in v[-n:]) / n) ** 0.5
-
-def atr(h, l, c, n=14):
-    if len(c) < n + 1: return None
-    tr = []
-    for i in range(1, len(c)):
-        tr.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
-    if len(tr) < n: return None
-    a = sum(tr[:n]) / n
-    for x in tr[n:]:
-        a = (a * (n - 1) + x) / n
-    return a
-
 S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-tg(C, "ANORMAL VOLATILITE BOTU AKTIF " + str(len(S)))
+tg(C, "5 DK HACIM PATLAMASI BOTU AKTIF " + str(len(S)))
 son = {}
-
-# Sinyal sayaci
-sayaclar = {}       # symbol -> {"ilk": timestamp, "sayi": int}
-bildirildi = {}     # symbol -> bool (1 saatte 5 sinyal bildirimi yapildi mi)
-
-ESIK = 5            # 1 saatte en az kac sinyal gelmeli
-PENCERE = 3600      # 1 saat (saniye)
 
 while True:
     try:
         sayac = 0
         for s in S:
             try:
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=100")
-                if not k or len(k) < 30:
+                # 5 dakikalik son 15 mumu al (son 1 + onceki 10 + biraz tampon)
+                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=15")
+                if not k or len(k) < 12:
                     continue
-                c = [float(x[4]) for x in k][:-1]
-                h = [float(x[2]) for x in k][:-1]
-                l = [float(x[3]) for x in k][:-1]
-                v = [float(x[5]) for x in k][:-1]
-                if len(c) < 30:
+                km = k[:-1]  # son kapanmis mumlari al
+                if len(km) < 11:
                     continue
-                sma20 = sma(c, 20)
-                st20 = std(c, 20)
-                if None in (sma20, st20):
+                
+                # Son kapanmis mumun hacmi
+                v_son = float(km[-1][5])
+                fiyat = float(km[-1][4])
+                
+                # Onceki 10 mumun ortalama hacmi (son mum haric)
+                onceki_10 = [float(x[5]) for x in km[-11:-1]]
+                v_ort = sum(onceki_10) / 10
+                
+                if v_ort == 0:
                     continue
-                bu = sma20 + 2 * st20
-                bl = sma20 - 2 * st20
-                bw = (bu - bl) / sma20 if sma20 else 0
-                bw_list = []
-                for i in range(20, len(c)):
-                    s20 = sma(c[:i], 20)
-                    t20 = std(c[:i], 20)
-                    if s20 and t20 and s20 > 0:
-                        bw_list.append(((s20 + 2 * t20) - (s20 - 2 * t20)) / s20)
-                if len(bw_list) < 20:
-                    continue
-                bw_ort = sum(bw_list[-20:]) / 20
-                if bw_ort == 0:
-                    continue
-                squeeze = bw < bw_ort * 0.7
-                f = c[-1]
-                breakout = f > bu or f < bl
-                a = atr(h, l, c)
-                if a is None or a == 0:
-                    continue
-                atr_pct = (a / f) * 100
-                if squeeze and breakout and atr_pct > 2:
+                
+                # Hacim artis orani
+                v_oran = v_son / v_ort
+                artis_pct = (v_oran - 1) * 100
+                
+                # Kosul: hacim, onceki 10 mumun ortalamasindan %5 fazla
+                if artis_pct >= 5:
                     if time.time() - son.get(s, 0) >= 1800:
-                        yon = "LONG" if f > bu else "SHORT"
-                        pumpdump = "PUMP" if yon == "LONG" else "DUMP"
-                        emoji = "🟢" if yon == "LONG" else "🔴"
-                        chg = ((f - c[-2]) / c[-2]) * 100 if len(c) > 1 else 0
-                        v_son = v[-1]
-                        v_ort = sum(v[-20:]) / 20
-                        v_oran = v_son / v_ort if v_ort > 0 else 0
-                        sikisma_pct = (bw / bw_ort) * 100
-                        msg = (emoji + " <b>ANORMAL VOLATILITE ALARMI</b>\n"
-                               "COIN: <b>" + s + "</b> (15m)\n"
-                               "YON: <b>" + yon + " (" + pumpdump + ")</b>\n\n"
-                               "Fiyat: <code>" + format(f, ".6f") + "</code> (" + format(chg, ".2f") + "%)\n"
-                               "Bollinger: <code>" + format(bl, ".6f") + "</code> - <code>" + format(bu, ".6f") + "</code>\n"
-                               "ATR: <code>" + format(a, ".6f") + "</code> (" + format(atr_pct, ".2f") + "%)\n"
-                               "Hacim: <code>" + format(v_oran, ".2f") + "x</code>\n"
-                               "Sikisma: <code>" + format(sikisma_pct, ".0f") + "%</code>\n\n"
+                        chg = ((fiyat - float(km[-2][4])) / float(km[-2][4])) * 100
+                        emoji = "🟢" if chg > 0 else "🔴"
+                        msg = ("🔥 <b>HACIM PATLAMASI</b>\n"
+                               "COIN: <b>" + s + "</b> (5m)\n\n"
+                               "Son Hacim: <code>" + format(v_son, ".2f") + "</code>\n"
+                               "10 Mum Ort: <code>" + format(v_ort, ".2f") + "</code>\n"
+                               "Artis: <b>+" + format(artis_pct, ".2f") + "%</b>\n\n"
+                               "Fiyat: <code>" + format(fiyat, ".6f") + "</code> (" + format(chg, ".2f") + "%)\n"
+                               "Hacim Orani: <code>" + format(v_oran, ".2f") + "x</code>\n\n"
                                "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
                                "Link: marketowl.eu")
                         tg(C, msg)
                         son[s] = time.time()
                         sayac += 1
-                        print(s, pumpdump, format(atr_pct, ".2f"))
-
-                        # --- SINYAL SAYACI ---
-                        simdi = time.time()
-                        if s not in sayaclar or (simdi - sayaclar[s]["ilk"]) > PENCERE:
-                            # Yeni pencere baslat
-                            sayaclar[s] = {"ilk": simdi, "sayi": 1}
-                            bildirildi[s] = False
-                        else:
-                            # Mevcut pencereye ekle
-                            sayaclar[s]["sayi"] += 1
-
-                        # 1 saatte 5 sinyal asildiysa ve henuz bildirilmediyse
-                        if sayaclar[s]["sayi"] >= ESIK and not bildirildi.get(s, False):
-                            bildirildi[s] = True
-                            gecen = (simdi - sayaclar[s]["ilk"]) / 60
-                            uyari = ("🔥 <b>YOGUN SINYAL UYARISI</b>\n"
-                                     "COIN: <b>" + s + "</b>\n\n"
-                                     "Son " + format(gecen, ".0f") + " dakikada <b>" + str(sayaclar[s]["sayi"]) + "</b> sinyal geldi!\n\n"
-                                     "Time: " + time.strftime("%d/%m/%Y %H:%M (UTC)", time.gmtime()) + "\n"
-                                     "Link: marketowl.eu")
-                            tg(C, uyari)
-                            print(s, "YOGUN SINYAL", sayaclar[s]["sayi"])
+                        print(s, "HACIM", format(artis_pct, ".2f") + "%")
             except:
                 pass
         print("Tarama bitti - Sinyal:", sayac)
