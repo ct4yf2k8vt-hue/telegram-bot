@@ -20,7 +20,7 @@ def gj(u):
 print("BOT BASLADI")
 info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
 S = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-print("COIN:", len(S))
+print("COIN SAYISI:", len(S))
 tg(C, "PUMP ALERT BOTU AKTIF " + str(len(S)))
 son = {}
 
@@ -29,9 +29,9 @@ while True:
         sayac = 0
         for s in S:
             try:
-                # Son 21 tane 5 dakikalik mum al
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=21")
-                if not k or len(k) < 21:
+                # Son 25 tane 5 dakikalik mum al
+                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
+                if not k or len(k) < 22:
                     continue
                 
                 # Son kapanmis mum
@@ -40,14 +40,13 @@ while True:
                 
                 fiyat_simdi = float(son_mum[4])     # Kapanis
                 fiyat_onceki = float(onceki_mum[4]) # Onceki kapanis
-                hacim_simdi = float(son_mum[5])     # Son mumun hacmi (Coin miktari)
                 hacim_usdt = float(son_mum[7])      # Son mumun USDT hacmi
                 
                 # Fiyat degisimi
                 fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
                 
-                # Son 20 mumun ortalama hacmi (USDT)
-                onceki_20 = [float(x[7]) for x in k[:-2]]
+                # Onceki 20 mumun ortalama USDT hacmi
+                onceki_20 = [float(x[7]) for x in k[-22:-2]]
                 v_ort = sum(onceki_20) / 20
                 if v_ort == 0:
                     continue
@@ -56,8 +55,8 @@ while True:
                 hacim_orani = hacim_usdt / v_ort
                 hacim_artis_pct = (hacim_orani - 1) * 100
                 
-                # Filtre: Hacim normalin 2.5 katindan fazla VE fiyat %2'den fazla artmis olmali
-                if hacim_orani >= 2.5 and fiyat_degisim >= 2.0:
+                # Filtre: Hacim normalin en az 3 kati VE fiyat %2'den fazla artmis olmali
+                if hacim_orani >= 3.0 and fiyat_degisim >= 2.0:
                     if time.time() - son.get(s, 0) >= 1800: # 30 dakika cooldown
                         
                         emoji = "🚀"
@@ -65,6 +64,7 @@ while True:
                         pair = s.replace("USDT", "/USDT")
                         coin = s.replace("USDT", "")
                         
+                        # Görseldeki formata birebir uygun mesaj
                         msg = (emoji + " <b>Pump - " + pair + " [Binance]</b>\n"
                                "💵 Price: <code>" + format(fiyat_onceki, ".5f") + "</code> ➜ <code>" + format(fiyat_simdi, ".5f") + "</code> (+" + format(fiyat_degisim, ".1f") + "%)\n"
                                "📊 Volume: " + format(hacim_usdt, ".0f") + " (+" + format(hacim_artis_pct, ".0f") + " %)\n"
