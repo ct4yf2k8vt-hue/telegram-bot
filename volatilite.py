@@ -17,10 +17,11 @@ def gj(u):
     except:
         return None
 
-# Sadece Binance Futures USDT Perpetual pariteleri
-S = [x["symbol"] for x in gj("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-tg(C, "GELISMIS PUMP ALERT BOTU AKTIF " + str(len(S)))
-print("COIN SAYISI:", len(S))
+print("BOT BASLADI")
+info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
+S = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
+print("COIN:", len(S))
+tg(C, "PUMP ALERT BOTU AKTIF " + str(len(S)))
 son = {}
 
 while True:
@@ -28,52 +29,53 @@ while True:
         sayac = 0
         for s in S:
             try:
-                # 5 dakikalik son 30 mumu al
-                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=30")
-                if not k or len(k) < 25:
-                    continue
-                km = k[:-1]  # son kapanmis mumlari al
-                if len(km) < 20:
+                # Son 21 tane 5 dakikalik mum al
+                k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=21")
+                if not k or len(k) < 21:
                     continue
                 
-                # Son kapanmis mum ve onceki mum
-                son_mum = km[-1]
-                onceki_mum = km[-2]
+                # Son kapanmis mum
+                son_mum = k[-2]
+                onceki_mum = k[-3]
                 
-                # Fiyat ve Hacim verileri
-                fiyat_simdi = float(son_mum[4])
-                fiyat_onceki = float(onceki_mum[4])
-                hacim_simdi = float(son_mum[5])
+                fiyat_simdi = float(son_mum[4])     # Kapanis
+                fiyat_onceki = float(onceki_mum[4]) # Onceki kapanis
+                hacim_simdi = float(son_mum[5])     # Son mumun hacmi (Coin miktari)
+                hacim_usdt = float(son_mum[7])      # Son mumun USDT hacmi
                 
                 # Fiyat degisimi
                 fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
                 
-                # Hacim karsilastirmasi: Son 1 mumun hacmi, son 20 mumun ortalama hacminin en az 5 kati mi?
-                v_ort = sum(float(x[5]) for x in km[-21:-1]) / 20
+                # Son 20 mumun ortalama hacmi (USDT)
+                onceki_20 = [float(x[7]) for x in k[:-2]]
+                v_ort = sum(onceki_20) / 20
                 if v_ort == 0:
                     continue
                 
-                hacim_orani = hacim_simdi / v_ort
+                # Hacim artis orani
+                hacim_orani = hacim_usdt / v_ort
                 hacim_artis_pct = (hacim_orani - 1) * 100
                 
-                # KOSULLAR: Hacim normalin EN AZ 5 kati VE fiyat %3+ artmis olmali
-                if hacim_orani >= 5 and fiyat_degisim >= 3:
-                    if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
+                # Filtre: Hacim normalin 2.5 katindan fazla VE fiyat %2'den fazla artmis olmali
+                if hacim_orani >= 2.5 and fiyat_degisim >= 2.0:
+                    if time.time() - son.get(s, 0) >= 1800: # 30 dakika cooldown
                         
-                        # Mesaj formati (Görseldeki gibi)
                         emoji = "🚀"
-                        hacim_artis_miktari = hacim_simdi - v_ort
-                        msg = (emoji + " <b>Pump - " + s + " [Binance]</b>\n"
+                        hacim_farki = hacim_usdt - v_ort
+                        pair = s.replace("USDT", "/USDT")
+                        coin = s.replace("USDT", "")
+                        
+                        msg = (emoji + " <b>Pump - " + pair + " [Binance]</b>\n"
                                "💵 Price: <code>" + format(fiyat_onceki, ".5f") + "</code> ➜ <code>" + format(fiyat_simdi, ".5f") + "</code> (+" + format(fiyat_degisim, ".1f") + "%)\n"
-                               "📊 Volume: " + format(hacim_simdi, ".0f") + " (+" + format(hacim_artis_pct, ".0f") + " %)\n"
-                               "Volume increased by " + format(hacim_artis_miktari, ".0f") + " ⬆️\n"
+                               "📊 Volume: " + format(hacim_usdt, ".0f") + " (+" + format(hacim_artis_pct, ".0f") + " %)\n"
+                               "Volume increased by " + format(hacim_farki, ".0f") + " ⬆️\n"
                                "Time: " + time.strftime("%I:%M:%S %p", time.localtime()) + " 🕒\n\n"
-                               "🔗 <a href='https://www.binance.com/en/futures/" + s + "'>Pair on Binance</a>\n\n"
-                               "#" + s.replace("USDT", ""))
+                               "🔗 <a href='https://www.binance.com/en/futures/" + s + "'>Pair on Binance.</a>\n\n"
+                               "$" + coin + " #" + coin)
                         tg(C, msg)
                         son[s] = time.time()
                         sayac += 1
-                        print(s, "PUMP", format(fiyat_degisim, ".1f") + "%", "Hacim:", format(hacim_orani, ".1f") + "x")
+                        print(s, "PUMP", format(fiyat_degisim, ".1f") + "%", format(hacim_orani, ".1f") + "x")
             except:
                 pass
         print("Tarama bitti - Sinyal:", sayac)
