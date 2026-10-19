@@ -40,6 +40,7 @@ def bot_loop():
             sayac = 0
             for s in S:
                 try:
+                    # Son 25 tane 5 dakikalik mum al
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
                     if not k or len(k) < 22:
                         continue
@@ -50,8 +51,10 @@ def bot_loop():
                     fiyat_onceki = float(onceki_mum[4])
                     hacim_usdt = float(son_mum[7])
                     
+                    # Fiyat degisimi
                     fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
                     
+                    # Onceki 20 mumun ortalama hacmi
                     onceki_20 = [float(x[7]) for x in k[-22:-2]]
                     v_ort = sum(onceki_20) / 20
                     if v_ort == 0:
@@ -60,8 +63,9 @@ def bot_loop():
                     hacim_orani = hacim_usdt / v_ort
                     hacim_artis_pct = (hacim_orani - 1) * 100
                     
-                    # Test icin esikleri dusuk tuttuk (%1.5 hacim, %0.5 fiyat)
-                    if hacim_orani >= 1.5 and fiyat_degisim >= 0.5:
+                    # GÖRSELDEKİ GİBİ BÜYÜK PUMP FİLTRESİ (Hacim en az 3x, Fiyat en az %3)
+                    if hacim_orani >= 3.0 and fiyat_degisim >= 3.0:
+                        # 30 dakika cooldown
                         if time.time() - son.get(s, 0) >= 1800:
                             emoji = "🚀"
                             hacim_farki = hacim_usdt - v_ort
@@ -85,7 +89,7 @@ def bot_loop():
             time.sleep(300)
         except Exception as e:
             print("LOOP HATASI (Kendini yeniden baslatacak):", e)
-            time.sleep(10) # Hata olursa 10 saniye bekle ve donguye devam et
+            time.sleep(10)
 
 # Render Web Sunucusu
 class Handler(BaseHTTPRequestHandler):
