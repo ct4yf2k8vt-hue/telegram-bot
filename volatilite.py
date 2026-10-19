@@ -21,34 +21,29 @@ def gj(u):
 
 def bot_loop():
     print("--- 1. BOT LOOP BASLADI ---", flush=True)
-    tg(C, "AKILLI PUMP BOTU AKTIF!")
+    tg(C, "TAM KAPSAMLI PUMP BOTU AKTIF! (Tum Coinler)")
     
     son = {}
 
     while True:
         try:
-            print("--- 2. EN YUKSEK HACIMLI COINLER ALINIYOR ---", flush=True)
-            
-            # Tek istekle tum Futures coinlerinin 24 saatlik istatistiklerini al
-            tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
-            if not tickers:
-                print("Binance API'ye erisilemedi, 10 sn bekleniyor...", flush=True)
+            print("--- 2. TUM BINANCE FUTURES COINLERI ALINIYOR ---", flush=True)
+            info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
+            if not info or "symbols" not in info:
+                print("API Hatasi, 10 sn sonra tekrar denenecek...", flush=True)
                 time.sleep(10)
                 continue
                 
-            # USDT paritelerini filtrele ve hacme gore sirala
-            usdt_tickers = [t for t in tickers if t["symbol"].endswith("USDT")]
-            usdt_tickers.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-            
-            # En hacimli ilk 150 coini al (Ban yememek icin)
-            top_coins = [t["symbol"] for t in usdt_tickers[:150]]
-            print("--- 3. TARANACAK COIN SAYISI:", len(top_coins), "---", flush=True)
+            # TUM USDT PERPETUAL COINLERI (Filtresiz)
+            all_coins = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
+            print("--- 3. TARANACAK COIN SAYISI:", len(all_coins), "---", flush=True)
 
             print("--- 4. TARAMA BASLIYOR...", time.strftime("%H:%M:%S"), "---", flush=True)
             sayac = 0
             
-            for s in top_coins:
+            for s in all_coins:
                 try:
+                    # 5 dakikalik mumlar
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
                     if not k or len(k) < 22:
                         continue
@@ -63,15 +58,17 @@ def bot_loop():
                     
                     onceki_20 = [float(x[7]) for x in k[-22:-2]]
                     v_ort = sum(onceki_20) / 20
+                    
+                    # Eger ortalama hacim 0 ise (hic islem yoksa) atla
                     if v_ort == 0:
                         continue
                     
                     hacim_orani = hacim_usdt / v_ort
                     hacim_artis_pct = (hacim_orani - 1) * 100
                     
-                    # Eşikler (Hacim 2.5 katı, Fiyat %2.5)
+                    # KOSUL: Hacim 2.5 katı VE Fiyat %2.5
                     if hacim_orani >= 2.5 and fiyat_degisim >= 2.5:
-                        if time.time() - son.get(s, 0) >= 1800:
+                        if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
                             emoji = "🚀"
                             hacim_farki = hacim_usdt - v_ort
                             pair = s.replace("USDT", "/USDT")
@@ -88,11 +85,15 @@ def bot_loop():
                             son[s] = time.time()
                             sayac += 1
                             print(">>> SINYAL GONDERILDI:", s, flush=True)
-                except:
+                    
+                    # API BAN YEMEMEK ICIN HER COIN ARASINDA 0.05 SANIYE BEKLE
+                    time.sleep(0.05)
+                    
+                except Exception as e:
                     pass
                     
             print("--- 5. TARAMA BITTI - Sinyal:", sayac, time.strftime("%H:%M:%S"), "---", flush=True)
-            time.sleep(120) # 2 dakikada bir tara (Daha hızlı yakalamak için)
+            time.sleep(180) # 3 dakikada bir tara
             
         except Exception as e:
             print("--- LOOP HATASI:", e, "---", flush=True)
