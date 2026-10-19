@@ -74,9 +74,7 @@ def bot_loop():
                             tg(C, msg)
                             son[s] = time.time()
                             sayac += 1
-                            print(s, "PUMP", format(fiyat_degisim, ".```
-
-1f") + "%", format(hacim_orani, ".1f") + "##x")
+                            print(s, "PUMP", format(fiyat_degisim, ".1f") + "%", format(hacim_orani, ".1f") + "x")
                 except:
                     pass
             print("Tarama bitti - Sinyal:", sayac)
@@ -85,7 +83,6 @@ def bot_loop():
             print("Ana Hata:", e)
             time.sleep(30)
 
-# Render'in beklediği port dinleyicisi
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -102,14 +99,7 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Botu arka planda baslat
     bot_thread = threading.Thread(target=bot_loop)
     bot_thread.daemon = True
     bot_thread.start()
-    # Web sunucusunu ana thread'de calistir (Render bunu gormeli)
     run_web_server()
- 🚀 Şimdi Yapmanız Gerekenler
-
-1. **Kodu Yapıştırın:** Yukarıdaki kodu `volatilite.py` dosyanıza yapıştırıp **Commit** edin.
-2. **Render'da Deploy Edin:** Render'a gidin, **Manual Deploy** → **"Clear build cache & deploy"** butonuna basın.
-3. **Logları İzleyin:** Bu sefer loglarda şunu göreceksiniz:
