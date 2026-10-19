@@ -15,24 +15,28 @@ def tg(ci, m):
 
 def gj(u):
     try:
-        return json.loads(urllib.request.urlopen(u, timeout=20).read().decode())
+        return json.loads(urllib.request.urlopen(u, timeout=15).read().decode())
     except:
         return None
 
 def bot_loop():
-    print("BOT BASLADI")
-    info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
-    if not info or "symbols" not in info:
-        print("Binance API'sine erisilemedi.")
-        return
-        
-    S = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-    print("COIN SAYISI:", len(S))
+    print("1. BOT LOOP BASLADI")
+    S = []
+    while not S:
+        info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
+        if info and "symbols" in info:
+            S = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
+        if not S:
+            print("Coinler alinamadi, 10 sn sonra tekrar denenecek...")
+            time.sleep(10)
+            
+    print("2. COIN SAYISI:", len(S))
     tg(C, "PUMP ALERT BOTU AKTIF " + str(len(S)))
     son = {}
 
     while True:
         try:
+            print("3. TARAMA BASLIYOR...", time.strftime("%H:%M:%S"))
             sayac = 0
             for s in S:
                 try:
@@ -42,7 +46,6 @@ def bot_loop():
                     
                     son_mum = k[-2]
                     onceki_mum = k[-3]
-                    
                     fiyat_simdi = float(son_mum[4])
                     fiyat_onceki = float(onceki_mum[4])
                     hacim_usdt = float(son_mum[7])
@@ -57,7 +60,8 @@ def bot_loop():
                     hacim_orani = hacim_usdt / v_ort
                     hacim_artis_pct = (hacim_orani - 1) * 100
                     
-                    if hacim_orani >= 3.0 and fiyat_degisim >= 2.0:
+                    # Test icin esikleri dusuk tuttuk (%1.5 hacim, %0.5 fiyat)
+                    if hacim_orani >= 1.5 and fiyat_degisim >= 0.5:
                         if time.time() - son.get(s, 0) >= 1800:
                             emoji = "🚀"
                             hacim_farki = hacim_usdt - v_ort
@@ -74,15 +78,16 @@ def bot_loop():
                             tg(C, msg)
                             son[s] = time.time()
                             sayac += 1
-                            print(s, "PUMP", format(fiyat_degisim, ".1f") + "%", format(hacim_orani, ".1f") + "x")
+                            print(">>> SINYAL GONDERILDI:", s)
                 except:
                     pass
-            print("Tarama bitti - Sinyal:", sayac)
+            print("4. TARAMA BITTI - Sinyal:", sayac, time.strftime("%H:%M:%S"))
             time.sleep(300)
         except Exception as e:
-            print("Ana Hata:", e)
-            time.sleep(30)
+            print("LOOP HATASI (Kendini yeniden baslatacak):", e)
+            time.sleep(10) # Hata olursa 10 saniye bekle ve donguye devam et
 
+# Render Web Sunucusu
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
