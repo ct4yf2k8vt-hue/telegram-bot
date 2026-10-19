@@ -20,27 +20,35 @@ def gj(u):
         return None
 
 def bot_loop():
-    print("1. BOT LOOP BASLADI")
-    S = []
-    while not S:
-        info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
-        if info and "symbols" in info:
-            S = [x["symbol"] for x in info["symbols"] if x["status"] == "TRADING" and x["quoteAsset"] == "USDT" and x["contractType"] == "PERPETUAL"]
-        if not S:
-            print("Coinler alinamadi, 10 sn sonra tekrar denenecek...")
-            time.sleep(10)
-            
-    print("2. COIN SAYISI:", len(S))
-    tg(C, "PUMP ALERT BOTU AKTIF " + str(len(S)))
+    print("--- 1. BOT LOOP BASLADI ---", flush=True)
+    tg(C, "AKILLI PUMP BOTU AKTIF!")
+    
     son = {}
 
     while True:
         try:
-            print("3. TARAMA BASLIYOR...", time.strftime("%H:%M:%S"))
+            print("--- 2. EN YUKSEK HACIMLI COINLER ALINIYOR ---", flush=True)
+            
+            # Tek istekle tum Futures coinlerinin 24 saatlik istatistiklerini al
+            tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
+            if not tickers:
+                print("Binance API'ye erisilemedi, 10 sn bekleniyor...", flush=True)
+                time.sleep(10)
+                continue
+                
+            # USDT paritelerini filtrele ve hacme gore sirala
+            usdt_tickers = [t for t in tickers if t["symbol"].endswith("USDT")]
+            usdt_tickers.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+            
+            # En hacimli ilk 150 coini al (Ban yememek icin)
+            top_coins = [t["symbol"] for t in usdt_tickers[:150]]
+            print("--- 3. TARANACAK COIN SAYISI:", len(top_coins), "---", flush=True)
+
+            print("--- 4. TARAMA BASLIYOR...", time.strftime("%H:%M:%S"), "---", flush=True)
             sayac = 0
-            for s in S:
+            
+            for s in top_coins:
                 try:
-                    # Son 25 tane 5 dakikalik mum al
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
                     if not k or len(k) < 22:
                         continue
@@ -51,10 +59,8 @@ def bot_loop():
                     fiyat_onceki = float(onceki_mum[4])
                     hacim_usdt = float(son_mum[7])
                     
-                    # Fiyat degisimi
                     fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
                     
-                    # Onceki 20 mumun ortalama hacmi
                     onceki_20 = [float(x[7]) for x in k[-22:-2]]
                     v_ort = sum(onceki_20) / 20
                     if v_ort == 0:
@@ -63,16 +69,15 @@ def bot_loop():
                     hacim_orani = hacim_usdt / v_ort
                     hacim_artis_pct = (hacim_orani - 1) * 100
                     
-                    # GÖRSELDEKİ GİBİ BÜYÜK PUMP FİLTRESİ (Hacim en az 3x, Fiyat en az %3)
-                    if hacim_orani >= 3.0 and fiyat_degisim >= 3.0:
-                        # 30 dakika cooldown
+                    # Eşikler (Hacim 2.5 katı, Fiyat %2.5)
+                    if hacim_orani >= 2.5 and fiyat_degisim >= 2.5:
                         if time.time() - son.get(s, 0) >= 1800:
                             emoji = "🚀"
                             hacim_farki = hacim_usdt - v_ort
                             pair = s.replace("USDT", "/USDT")
                             coin = s.replace("USDT", "")
                             
-                            msg = (emoji + " <b>Pump - " + pair + " [Binance]</b>\n"
+                            msg = (emoji + " <b>Pump - " + pair + " [Binance Futures]</b>\n"
                                    "💵 Price: <code>" + format(fiyat_onceki, ".5f") + "</code> ➜ <code>" + format(fiyat_simdi, ".5f") + "</code> (+" + format(fiyat_degisim, ".1f") + "%)\n"
                                    "📊 Volume: " + format(hacim_usdt, ".0f") + " (+" + format(hacim_artis_pct, ".0f") + " %)\n"
                                    "Volume increased by " + format(hacim_farki, ".0f") + " ⬆️\n"
@@ -82,16 +87,17 @@ def bot_loop():
                             tg(C, msg)
                             son[s] = time.time()
                             sayac += 1
-                            print(">>> SINYAL GONDERILDI:", s)
+                            print(">>> SINYAL GONDERILDI:", s, flush=True)
                 except:
                     pass
-            print("4. TARAMA BITTI - Sinyal:", sayac, time.strftime("%H:%M:%S"))
-            time.sleep(300)
+                    
+            print("--- 5. TARAMA BITTI - Sinyal:", sayac, time.strftime("%H:%M:%S"), "---", flush=True)
+            time.sleep(120) # 2 dakikada bir tara (Daha hızlı yakalamak için)
+            
         except Exception as e:
-            print("LOOP HATASI (Kendini yeniden baslatacak):", e)
+            print("--- LOOP HATASI:", e, "---", flush=True)
             time.sleep(10)
 
-# Render Web Sunucusu
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -104,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), Handler)
-    print("WEB SUNUCUSU BASLADI - PORT:", port)
+    print("WEB SUNUCUSU BASLADI - PORT:", port, flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
