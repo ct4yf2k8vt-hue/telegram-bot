@@ -20,7 +20,7 @@ def gj(u):
         return None
 
 def bot_loop():
-    print("--- 1. BOT LOOP BASLADI ---", flush=True)
+    print("--- 1. BOT LOOP BASLADI (GERCEK ZAMANLI) ---", flush=True)
     son = {}
 
     while True:
@@ -30,48 +30,47 @@ def bot_loop():
                 time.sleep(10)
                 continue
                 
-            # TÜM Binance Futures Coinleri
             all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
             print("--- 2. TARAMA BASLIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(all_coins), "---", flush=True)
             sayac = 0
             
             for s in all_coins:
                 try:
-                    # 5 DAKİKALIK mumlara bakıyoruz (Görseldeki M5 gibi)
+                    # 5 DAKİKALIK mumlara bakıyoruz
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
                     if not k or len(k) < 22: continue
                     
-                    son_mum = k[-2]  # Son kapanmış 5 dakikalık mum
-                    onceki_mum = k[-3]
+                    # DİKKAT: k[-1] henüz kapanmamış, ŞU ANKİ CANLI MUM!
+                    canli_mum = k[-1]
+                    onceki_mum = k[-2]
                     
-                    fiyat_simdi = float(son_mum[4])   # Kapanış
-                    fiyat_onceki = float(onceki_mum[4]) # Önceki Kapanış
-                    hacim_usdt = float(son_mum[7])    # Son mumun USDT hacmi
+                    acilis = float(canli_mum[1])       # 5 dk önceki açılış
+                    su_anki_fiyat = float(canli_mum[4]) # Şu anki fiyat
+                    canli_hacim = float(canli_mum[7])  # Şu ana kadar yenen hacim
                     
-                    # Fiyat Değişimi (%)
-                    fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
+                    # Fiyat Değişimi (Açılıştan şu ana kadar)
+                    fiyat_degisim = ((su_anki_fiyat - acilis) / acilis) * 100
                     
-                    # Önceki 20 mumun ortalama hacmi
-                    onceki_20 = [float(x[7]) for x in k[-22:-2]]
+                    # Önceki 20 kapanmış mumun ortalama hacmi
+                    onceki_20 = [float(x[7]) for x in k[-21:-1]]
                     v_ort = sum(onceki_20) / 20
                     if v_ort == 0: continue
                     
-                    # Hacim Oranı ve Yüzdesi
-                    hacim_orani = hacim_usdt / v_ort
+                    # Canlı Hacim Oranı (Şu ana kadar olan hacim / ortalama)
+                    hacim_orani = canli_hacim / v_ort
                     hacim_artis_pct = (hacim_orani - 1) * 100
                     
-                    # KOSUL: Hacim en az 2 Katı (2.0x) VE Fiyat en az %3 Artmış olmalı
+                    # KOSUL: Canlı hacim 2x (veya daha fazla) VE fiyat %3+ artmışsa (Anlık yakalar)
                     if hacim_orani >= 2.0 and fiyat_degisim >= 3.0:
                         if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
                             
                             pair = s.replace("USDT", "/USDT")
                             coin = s.replace("USDT", "")
                             
-                            # TAM GÖRSELDEKİ FORMAT
                             msg = (f"🚀 <b>Pump - {pair} [Binance]</b>\n"
-                                   f"💰 Price: <code>{format(fiyat_onceki, '.4f')}</code> ➜ <code>{format(fiyat_simdi, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                   f"📊 Volume: {format(hacim_usdt, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
-                                   f"Volume increased by {format(hacim_usdt - v_ort, '.0f')} ⬆️\n"
+                                   f"💰 Price: <code>{format(acilis, '.4f')}</code> ➜ <code>{format(su_anki_fiyat, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
+                                   f"📊 Volume: {format(canli_hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
+                                   f"Volume increased by {format(canli_hacim - v_ort, '.0f')} ⬆️\n"
                                    f"Time: {time.strftime('%I:%M:%S %p', time.localtime())} 🕒\n\n"
                                    f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n\n"
                                    f"${coin} #{coin}")
@@ -86,7 +85,7 @@ def bot_loop():
                     pass
                     
             print("--- 3. TARAMA BITTI - Sinyal:", sayac, "---", flush=True)
-            time.sleep(180) # 3 dakika bekle
+            time.sleep(120) # 2 dakika bekle (Daha sık kontrol)
         except Exception as e:
             print("--- LOOP HATASI:", e, "---", flush=True)
             time.sleep(10)
