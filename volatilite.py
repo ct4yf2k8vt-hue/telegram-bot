@@ -19,8 +19,19 @@ def gj(u):
     except:
         return None
 
+def send_signal(borsa, pair, coin, acilis, su_anki, fiyat_degisim, hacim, hacim_orani):
+    hacim_artis_pct = (hacim_orani - 1) * 100
+    
+    msg = (f"🔥 <b>DIKEY PUMP (Anlik) - {pair} [{borsa}]</b>\n"
+           f"💰 Start Price: <code>{format(acilis, '.5f')}</code>\n"
+           f"💰 Current Price: <code>{format(su_anki, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
+           f"📊 Volume: {format(hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
+           f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
+           f"🔗 <a href='https://www.binance.com/en/futures/{pair.replace('/', '')}'>Pair on Binance.</a>")
+    tg(msg)
+
 # ==========================================
-# MOTOR 1: BINANCE (Dikey Pump Yakalayıcı)
+# MOTOR 1: BINANCE (Anlık Dikey Pump)
 # ==========================================
 def binance_loop():
     print("--- BINANCE MOTORU BASLADI ---", flush=True)
@@ -30,52 +41,43 @@ def binance_loop():
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if tickers:
                 all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
+                print(f"[{time.strftime('%H:%M:%S')}] BINANCE TARANIYOR | Coin: {len(all_coins)}", flush=True)
                 for s in all_coins:
                     try:
-                        # 5 dakikalık son mumları al
-                        k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
+                        # Son 2 mumu al (biri kapanmış, biri ŞU AN oluşan canlı mum)
+                        k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1m&limit=25")
                         if not k or len(k) < 22: continue
                         
-                        # CANLI MUM: Şu an oluşmakta olan mum (k[-1])
+                        # CANLI MUM: k[-1] (Saniyelik patlamayı görmek için)
                         canli_mum = k[-1]
-                        onceki_kapanmis = k[-2]
                         
                         acilis = float(canli_mum[1])
                         su_anki = float(canli_mum[4])
-                        canli_hacim = float(canli_mum[7])
+                        hacim = float(canli_mum[7])
                         
-                        # Anlık fiyat değişimi (Saniyelik patlama)
+                        # Anlık fiyat değişimi (Mumun açılışından bu yana)
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         
                         # Önceki 20 mumun ortalama hacmi
                         v_ort = sum(float(x[7]) for x in k[-22:-2]) / 20
                         if v_ort == 0: continue
+                        hacim_orani = hacim / v_ort
                         
-                        hacim_orani = canli_hacim / v_ort
-                        
-                        # DOODUSDT TARZI FİLTRE: 
-                        # Anlık fiyat %5'ten fazla zıplamış VE hacim normalin 4 katına çıkmışsa
-                        if fiyat_degisim >= 5.0 and hacim_orani >= 4.0:
+                        # DOODUSDT FİLTRESİ: Sadece 1 dakikalık mumda %4+ fiyat VE 3+ hacim
+                        if fiyat_degisim >= 4.0 and hacim_orani >= 3.0:
                             if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
                                 pair = s.replace("USDT", "/USDT")
-                                coin = s.replace("USDT", "")
-                                msg = (f"🔥 <b>DIKEY PUMP YAKALANDI - {pair} [Binance]</b>\n"
-                                       f"💰 Start Price: <code>{format(acilis, '.5f')}</code>\n"
-                                       f"💰 Current Price: <code>{format(su_anki, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                       f"📊 Volume: {format(canli_hacim, '.0f')} (+{format((hacim_orani - 1)*100, '.0f')}%)\n"
-                                       f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-                                       f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>")
-                                tg(msg)
+                                send_signal("Binance", pair, s.replace("USDT", ""), acilis, su_anki, fiyat_degisim, hacim, hacim_orani)
                                 son[s] = time.time()
                                 print(">>> BINANCE DIKEY PUMP:", s, flush=True)
-                        time.sleep(0.05)
+                        time.sleep(0.1)
                     except: pass
-            time.sleep(60) # 1 dakikada bir kontrol et (Anı yakalamak için)
+            time.sleep(60) # 1 dakikada bir tara
         except Exception as e:
             print("BINANCE HATA:", e, flush=True); time.sleep(10)
 
 # ==========================================
-# MOTOR 2: KUCOIN (Dikey Pump Yakalayıcı)
+# MOTOR 2: KUCOIN (Anlık Dikey Pump)
 # ==========================================
 def kucoin_loop():
     print("--- KUCOIN MOTORU BASLADI ---", flush=True)
@@ -85,48 +87,40 @@ def kucoin_loop():
             kc_tickers = gj("https://api.kucoin.com/api/v1/market/allTickers")
             if kc_tickers and kc_tickers.get("code") == "200000":
                 kc_coins = [t for t in kc_tickers["data"]["ticker"] if t["symbol"].endswith("-USDT")]
+                print(f"[{time.strftime('%H:%M:%S')}] KUCOIN TARANIYOR | Coin: {len(kc_coins)}", flush=True)
                 for t in kc_coins:
                     try:
                         sym = t["symbol"]
-                        k_kc = gj(f"https://api.kucoin.com/api/v1/market/candles?type=5min&symbol={sym}&limit=25")
+                        k_kc = gj(f"https://api.kucoin.com/api/v1/market/candles?type=1min&symbol={sym}&limit=25")
                         if not k_kc or k_kc.get("code") != "200000" or len(k_kc["data"]) < 22: continue
                         
                         k_list = k_kc["data"]
-                        # KuCoin'de [0] en son (canlı) mumdur
-                        canli_mum = k_list[0]
+                        canli_mum = k_list[0] # En son mum (canlı)
                         
                         acilis = float(canli_mum[1])
                         su_anki = float(canli_mum[2])
-                        canli_hacim = float(canli_mum[6])
+                        hacim = float(canli_mum[6])
                         
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         
                         v_ort = sum(float(x[6]) for x in k_list[3:23]) / 20
                         if v_ort == 0: continue
-                        hacim_orani = canli_hacim / v_ort
+                        hacim_orani = hacim / v_ort
                         
-                        # DOODUSDT TARZI FİLTRE
-                        if fiyat_degisim >= 5.0 and hacim_orani >= 4.0:
+                        if fiyat_degisim >= 4.0 and hacim_orani >= 3.0:
                             if time.time() - son.get(sym, 0) >= 1800:
                                 pair = sym.replace("-", "/")
-                                coin = sym.replace("-USDT", "")
-                                msg = (f"🔥 <b>DIKEY PUMP YAKALANDI - {pair} [KuCoin]</b>\n"
-                                       f"💰 Start Price: <code>{format(acilis, '.5f')}</code>\n"
-                                       f"💰 Current Price: <code>{format(su_anki, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                       f"📊 Volume: {format(canli_hacim, '.0f')} (+{format((hacim_orani - 1)*100, '.0f')}%)\n"
-                                       f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-                                       f"🔗 <a href='https://www.kucoin.com/trade/{sym}'>Pair on KuCoin.</a>")
-                                tg(msg)
+                                send_signal("KuCoin", pair, sym.replace("-USDT", ""), acilis, su_anki, fiyat_degisim, hacim, hacim_orani)
                                 son[sym] = time.time()
                                 print(">>> KUCOIN DIKEY PUMP:", sym, flush=True)
-                        time.sleep(0.05)
+                        time.sleep(0.3) # Ban koruması
                     except: pass
             time.sleep(60)
         except Exception as e:
             print("KUCOIN HATA:", e, flush=True); time.sleep(10)
 
 # ==========================================
-# MOTOR 3: MEXC (Dikey Pump Yakalayıcı)
+# MOTOR 3: MEXC (Anlık Dikey Pump)
 # ==========================================
 def mexc_loop():
     print("--- MEXC MOTORU BASLADI ---", flush=True)
@@ -136,38 +130,31 @@ def mexc_loop():
             mexc_tickers = gj("https://api.mexc.com/api/v3/ticker/24hr")
             if mexc_tickers:
                 mexc_coins = [t for t in mexc_tickers if t.get("symbol", "").endswith("USDT")]
+                print(f"[{time.strftime('%H:%M:%S')}] MEXC TARANIYOR | Coin: {len(mexc_coins)}", flush=True)
                 for t in mexc_coins:
                     try:
                         sym = t["symbol"]
-                        k_mexc = gj(f"https://api.mexc.com/api/v3/klines?symbol={sym}&interval=5m&limit=25")
+                        k_mexc = gj(f"https://api.mexc.com/api/v3/klines?symbol={sym}&interval=1m&limit=25")
                         if not k_mexc or len(k_mexc) < 22: continue
                         
                         canli_mum = k_mexc[-1]
                         acilis = float(canli_mum[1])
                         su_anki = float(canli_mum[4])
-                        canli_hacim = float(canli_mum[5])
+                        hacim = float(canli_mum[5])
                         
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         
                         v_ort = sum(float(x[5]) for x in k_mexc[-22:-2]) / 20
                         if v_ort == 0: continue
-                        hacim_orani = canli_hacim / v_ort
+                        hacim_orani = hacim / v_ort
                         
-                        # DOODUSDT TARZI FİLTRE
-                        if fiyat_degisim >= 5.0 and hacim_orani >= 4.0:
+                        if fiyat_degisim >= 4.0 and hacim_orani >= 3.0:
                             if time.time() - son.get(sym, 0) >= 1800:
                                 pair = sym.replace("USDT", "/USDT")
-                                coin = sym.replace("USDT", "")
-                                msg = (f"🔥 <b>DIKEY PUMP YAKALANDI - {pair} [MEXC]</b>\n"
-                                       f"💰 Start Price: <code>{format(acilis, '.5f')}</code>\n"
-                                       f"💰 Current Price: <code>{format(su_anki, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                       f"📊 Volume: {format(canli_hacim, '.0f')} (+{format((hacim_orani - 1)*100, '.0f')}%)\n"
-                                       f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-                                       f"🔗 <a href='https://www.mexc.com/exchange/{sym}'>Pair on MEXC.</a>")
-                                tg(msg)
+                                send_signal("MEXC", pair, sym.replace("USDT", ""), acilis, su_anki, fiyat_degisim, hacim, hacim_orani)
                                 son[sym] = time.time()
                                 print(">>> MEXC DIKEY PUMP:", sym, flush=True)
-                        time.sleep(0.05)
+                        time.sleep(0.3) # Ban koruması
                     except: pass
             time.sleep(60)
         except Exception as e:
