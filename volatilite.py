@@ -20,16 +20,23 @@ def gj(u):
         return None
 
 # ==========================================
-# ORTAK MESAJ FORMATI
+# ORTAK MESAJ FORMATI (Limit Fiyatları Hesaplamalı)
 # ==========================================
 def send_signal(borsa, pair, coin, acilis, su_anki, fiyat_degisim, hacim, hacim_orani):
     hacim_artis_pct = (hacim_orani - 1) * 100
+    
+    # %30 ve %50 Düşüş Hesaplamaları (Current Price üzerinden)
+    limit_30 = su_anki * 0.70  # %30 düşüş
+    limit_50 = su_anki * 0.50  # %50 düşüş
+    
     msg = (f"🚀 <b>Pump - {pair} [{borsa}]</b>\n"
            f"💰 Start Price: <code>{format(acilis, '.5f')}</code>\n"
            f"💰 Current Price: <code>{format(su_anki, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
            f"📊 Volume: {format(hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
            f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-           f"📉 <b>STRATEJI:</b> Limit emrinizi Current Price'ın %30 - %50 altına yerleştirin.\n"
+           f"📉 <b>STRATEJI (Limit Emirleri):</b>\n"
+           f"🔸 <b>%30 Altı:</b> <code>{format(limit_30, '.5f')}</code>\n"
+           f"🔸 <b>%50 Altı:</b> <code>{format(limit_50, '.5f')}</code>\n"
            f"⚠️ <i>Kullanımı kendi riskinize bağlıdır.</i>\n\n"
            f"🔗 <a href='https://www.binance.com/en/futures/{pair.replace('/', '')}'>Pair on Binance.</a>")
     tg(msg)
