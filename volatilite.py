@@ -25,48 +25,51 @@ def bot_loop():
 
     while True:
         try:
-            print("--- 2. TUM BINANCE FUTURES COINLERI ALINIYOR ---", flush=True)
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers: 
                 time.sleep(10)
                 continue
                 
+            # TÜM Binance Futures Coinleri
             all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
-            print("--- 3. TARANACAK COIN SAYISI:", len(all_coins), "---", flush=True)
-            
-            print("--- 4. TARAMA BASLIYOR:", time.strftime("%H:%M:%S"), "---", flush=True)
+            print("--- 2. TARAMA BASLIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(all_coins), "---", flush=True)
             sayac = 0
             
             for s in all_coins:
                 try:
-                    # 15 dakikalik mumlari al (Grafik yerine hizli metin icin)
-                    k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=25")
+                    # 5 DAKİKALIK mumlara bakıyoruz (Görseldeki M5 gibi)
+                    k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
                     if not k or len(k) < 22: continue
                     
-                    son_mum = k[-2]
+                    son_mum = k[-2]  # Son kapanmış 5 dakikalık mum
                     onceki_mum = k[-3]
-                    fiyat_simdi = float(son_mum[4])
-                    fiyat_onceki = float(onceki_mum[4])
-                    hacim_usdt = float(son_mum[7])
                     
+                    fiyat_simdi = float(son_mum[4])   # Kapanış
+                    fiyat_onceki = float(onceki_mum[4]) # Önceki Kapanış
+                    hacim_usdt = float(son_mum[7])    # Son mumun USDT hacmi
+                    
+                    # Fiyat Değişimi (%)
                     fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
                     
+                    # Önceki 20 mumun ortalama hacmi
                     onceki_20 = [float(x[7]) for x in k[-22:-2]]
                     v_ort = sum(onceki_20) / 20
                     if v_ort == 0: continue
                     
+                    # Hacim Oranı ve Yüzdesi
                     hacim_orani = hacim_usdt / v_ort
                     hacim_artis_pct = (hacim_orani - 1) * 100
                     
-                    # SADECE BÜYÜK PUMP'LAR (Fiyat %5+, Hacim 3x+)
-                    if hacim_orani >= 3.0 and fiyat_degisim >= 5.0:
+                    # KOSUL: Hacim en az 2 Katı (2.0x) VE Fiyat en az %3 Artmış olmalı
+                    if hacim_orani >= 2.0 and fiyat_degisim >= 3.0:
                         if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
                             
                             pair = s.replace("USDT", "/USDT")
                             coin = s.replace("USDT", "")
                             
+                            # TAM GÖRSELDEKİ FORMAT
                             msg = (f"🚀 <b>Pump - {pair} [Binance]</b>\n"
-                                   f"💵 Price: <code>{format(fiyat_onceki, '.5f')}</code> ➜ <code>{format(fiyat_simdi, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
+                                   f"💰 Price: <code>{format(fiyat_onceki, '.4f')}</code> ➜ <code>{format(fiyat_simdi, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
                                    f"📊 Volume: {format(hacim_usdt, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
                                    f"Volume increased by {format(hacim_usdt - v_ort, '.0f')} ⬆️\n"
                                    f"Time: {time.strftime('%I:%M:%S %p', time.localtime())} 🕒\n\n"
@@ -82,7 +85,7 @@ def bot_loop():
                 except:
                     pass
                     
-            print("--- 5. TARAMA BITTI - Sinyal:", sayac, "---", flush=True)
+            print("--- 3. TARAMA BITTI - Sinyal:", sayac, "---", flush=True)
             time.sleep(180) # 3 dakika bekle
         except Exception as e:
             print("--- LOOP HATASI:", e, "---", flush=True)
