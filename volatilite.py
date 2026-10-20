@@ -20,10 +20,9 @@ def gj(u):
         return None
 
 def mexc_loop():
-    print("--- MEXC MOTORU BASLADI (TEK BORSA) ---", flush=True)
+    print("--- MEXC MOTORU BASLADI ---", flush=True)
     son = {}
     
-    # Ilk basta tum MEXC coinlerini al
     all_coins = []
     while not all_coins:
         print("MEXC coin listesi aliniyor...", flush=True)
@@ -33,65 +32,59 @@ def mexc_loop():
         if not all_coins:
             time.sleep(10)
             
-    print(f"MEXC COIN SAYISI: {len(all_coins)}", flush=True)
-    tg(f"🔥 <b>MEXC DIKEY PUMP BOTU AKTIF</b>\n{len(all_coins)} coin izleniyor.")
+    print("MEXC COIN SAYISI: " + str(len(all_coins)), flush=True)
+    tg("MEXC DIKEY PUMP BOTU AKTIF " + str(len(all_coins)) + " coin izleniyor.")
 
     while True:
         try:
-            print(f"[{time.strftime('%H:%M:%S')}] MEXC TARAMASI BASLIYOR", flush=True)
+            print("MEXC TARAMASI BASLIYOR", flush=True)
             sayac = 0
             
             for s in all_coins:
                 try:
-                    # 1 DAKIKALIK mumlara bakiyoruz (Anlik patlamayi gormek icin)
-                    k_mexc = gj(f"https://api.mexc.com/api/v3/klines?symbol={s}&interval=1m&limit=25")
+                    k_mexc = gj("https://api.mexc.com/api/v3/klines?symbol=" + s + "&interval=1m&limit=25")
                     if not k_mexc or len(k_mexc) < 22: 
                         time.sleep(0.1)
                         continue
                     
-                    # CANLI MUM (Su an olusan)
                     canli_mum = k_mexc[-1]
-                    
                     acilis = float(canli_mum[1])
                     su_anki = float(canli_mum[4])
                     hacim = float(canli_mum[5])
                     
-                    # Fiyat degisimi (Mumun acilisindan bu yana)
                     fiyat_degisim = ((su_anki - acilis) / acilis) * 100
-                    
-                    # Önceki 20 mumun ortalama hacmi
                     v_ort = sum(float(x[5]) for x in k_mexc[-22:-2]) / 20
+                    
                     if v_ort == 0: 
                         time.sleep(0.1)
                         continue
                         
                     hacim_orani = hacim / v_ort
                     
-                    # FILTRE: 1 dakikada %3+ fiyat VE 2.5x+ hacim
                     if fiyat_degisim >= 3.0 and hacim_orani >= 2.5:
-                        if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
+                        if time.time() - son.get(s, 0) >= 1800:
                             pair = s.replace("USDT", "/USDT")
-                            coin = s.replace("USDT", "")
                             
-                            msg = (f"🔥 <b>DIKEY PUMP (Anlik) - {pair} [MEXC]</b>\n"
-                                   f"💰 Start Price: <code>{format(acilis, '.5f')}</code>\n"
-                                   f"💰 Current Price: <code>{format(su_anki, '.5f')}</DTcode> (+{format(fiy gat_degisim, '.1ibif')}%)\n"
-                                   f d"📊 Volume: {format(hacim, '.0f')} (+{format((hacim_orani - 1)*100, '.0f')} %)\n"
-                                   f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-                                   f"🔗 <a href='https://www.mexc.com/exchange/{s}'>Pair on MEXC.</a>")
+                            msg = (
+                                "🔥 DIKEY PUMP (Anlik) - " + pair + " [MEXC]\n"
+                                "💰 Start Price: " + format(acilis, '.5f') + "\n"
+                                "💰 Current Price: " + format(su_anki, '.5f') + " (+" + format(fiyat_degisim, '.1f') + "%)\n"
+                                "📊 Volume: " + format(hacim, '.0f') + " (+" + format((hacim_orani - 1)*100, '.0f') + " %)\n"
+                                "⏱ Time: " + time.strftime('%I:%M:%S %p', time.localtime()) + "\n\n"
+                                "🔗 <a href='https://www.mexc.com/exchange/" + s + "'>Pair on MEXC.</a>"
+                            )
                             tg(msg)
                             son[s] = time.time()
                             sayac += 1
-                            print(">>> MEXC DIKEY PUMP:", s, flush=True)
+                            print(">>> MEXC DIKEY PUMP: " + s, flush=True)
                     
-                    # MEXC API'sini bogmamak icin her istek arasi bekle
                     time.sleep(0.2) 
                     
                 except:
                     pass
             
-            print(f"[{time.strftime('%H:%M:%S')}] MEXC TARAMASI BITTI - Sinyal: {sayac}", flush=True)
-            time.sleep(60) # 1 dakika bekle ve tekrar tara
+            print("MEXC TARAMASI BITTI - Sinyal: " + str(sayac), flush=True)
+            time.sleep(60)
             
         except Exception as e:
             print("MEXC HATA:", e, flush=True)
