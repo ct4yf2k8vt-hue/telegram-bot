@@ -19,60 +19,48 @@ def gj(u):
     except:
         return None
 
-def bot_loop():
-    print("--- 1. BOT LOOP BASLADI (GELISMIS FILTRE) ---", flush=True)
+# ==========================================
+# MOTOR 1: BINANCE TARAYICI
+# ==========================================
+def binance_loop():
+    print("--- BINANCE MOTORU BASLADI ---", flush=True)
     son = {}
-
     while True:
         try:
-            # ==========================================
-            # 1. BINANCE FUTURES (GERÇEK ZAMANLI)
-            # ==========================================
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if tickers:
                 all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
-                print("--- 2. BINANCE TARANIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(all_coins), "---", flush=True)
+                print("--- BINANCE TARANIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(all_coins), "---", flush=True)
                 
                 for s in all_coins:
                     try:
-                        # 5 dakikalık mumlar (Son 3 mumu al)
                         k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
                         if not k or len(k) < 22: continue
                         
-                        # Kapanmış mumlar
-                        m1 = k[-3] # 15 dk önce
-                        m2 = k[-2] # 10 dk önce
-                        m3 = k[-1] # 5 dk önce (CANLI)
-                        
+                        m1 = k[-3]
+                        m3 = k[-1]
                         acilis = float(m1[1])
                         su_anki = float(m3[4])
                         hacim = float(m3[7])
                         
-                        # 1. FİLTRE: Fiyat artışı (En az %3)
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         if fiyat_degisim < 3.0: continue
                         
-                        # 2. FİLTRE: Hacim patlaması (Ortalamanın en az 3 katı)
                         onceki_20 = [float(x[7]) for x in k[-22:-2]]
                         v_ort = sum(onceki_20) / 20
                         if v_ort == 0: continue
                         hacim_orani = hacim / v_ort
                         if hacim_orani < 3.0: continue
                         
-                        # 3. FİLTRE: Ardışık Yeşil Mum (En az 2 yeşil mum)
                         yesil = 0
-                        for m in [m2, m3]:
+                        for m in [k[-2], k[-1]]:
                             if float(m[4]) > float(m[1]): yesil += 1
                         if yesil < 2: continue
                         
-                        # 4. FİLTRE: Alım Baskısı (Taker Buy > %60)
                         taker_buy = float(m3[9])
-                        if hacim > 0:
-                            taker_oran = (taker_buy / hacim) * 100
-                            if taker_oran < 60: continue
-                        else: continue
+                        taker_oran = (taker_buy / hacim) * 100 if hacim > 0 else 0
+                        if taker_oran < 60: continue
 
-                        # TÜM FİLTRELER GEÇTİYSE SİNYAL GÖNDER
                         if time.time() - son.get(s, 0) >= 1800:
                             pair = s.replace("USDT", "/USDT")
                             coin = s.replace("USDT", "")
@@ -92,14 +80,23 @@ def bot_loop():
                         time.sleep(0.05)
                     except:
                         pass
+            time.sleep(120)
+        except Exception as e:
+            print("BINANCE HATA:", e, flush=True)
+            time.sleep(10)
 
-            # ==========================================
-            # 2. KUCOIN SPOT (GERÇEK ZAMANLI)
-            # ==========================================
+# ==========================================
+# MOTOR 2: KUCOIN TARAYICI
+# ==========================================
+def kucoin_loop():
+    print("--- KUCOIN MOTORU BASLADI ---", flush=True)
+    son = {}
+    while True:
+        try:
             kc_tickers = gj("https://api.kucoin.com/api/v1/market/allTickers")
             if kc_tickers and kc_tickers.get("code") == "200000":
                 kc_coins = [t for t in kc_tickers.get("data", {}).get("ticker", []) if t.get("symbol", "").endswith("-USDT")]
-                print("--- 3. KUCOIN TARANIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(kc_coins), "---", flush=True)
+                print("--- KUCOIN TARANIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(kc_coins), "---", flush=True)
                 
                 for t in kc_coins:
                     try:
@@ -107,12 +104,11 @@ def bot_loop():
                         k_kc = gj(f"https://api.kucoin.com/api/v1/market/candles?type=5min&symbol={sym}&limit=25")
                         if not k_kc or k_kc.get("code") != "200000": continue
                         
-                        k_list = k_kc["data"] # En yeni ilk sırada
+                        k_list = k_kc["data"]
                         if len(k_list) < 22: continue
                         
-                        # KuCoin verisi tersten gelir: [0] en son, [1] bir önceki
-                        m1 = k_list[2] # 15 dk önce
-                        m3 = k_list[0] # 5 dk önce (CANLI)
+                        m1 = k_list[2]
+                        m3 = k_list[0]
                         
                         acilis = float(m1[1])
                         su_anki = float(m3[2])
@@ -127,15 +123,12 @@ def bot_loop():
                         hacim_orani = hacim / v_ort
                         if hacim_orani < 3.0: continue
                         
-                        # KuCoin için ardışık yeşil mum ve taker buy kontrolü
                         yesil = 0
                         for m in [k_list[1], k_list[0]]:
                             if float(m[2]) > float(m[1]): yesil += 1
                         if yesil < 2: continue
-                        
-                        # KuCoin'de taker buy verisi kline'da yok, bu yüzden bu filtreyi atlıyoruz.
 
-                        if time.time() - son.get("KC_" + sym, 0) >= 1800:
+                        if time.time() - son.get(sym, 0) >= 1800:
                             pair = sym.replace("-", "/")
                             coin = sym.replace("-USDT", "")
                             hacim_artis = (hacim_orani - 1) * 100
@@ -148,17 +141,15 @@ def bot_loop():
                                    f"🔗 <a href='https://www.kucoin.com/trade/{sym}'>Pair on KuCoin.</a>\n\n"
                                    f"${coin} #{coin}")
                             tg(msg)
-                            son["KC_" + sym] = time.time()
+                            son[sym] = time.time()
                             print(">>> KUCOIN SINYAL:", sym, flush=True)
                             
                         time.sleep(0.05)
                     except:
                         pass
-
-            print("--- 4. TARAMA BITTI ---", flush=True)
-            time.sleep(120) # 2 dakika bekle
+            time.sleep(120)
         except Exception as e:
-            print("--- LOOP HATASI:", e, "---", flush=True)
+            print("KUCOIN HATA:", e, flush=True)
             time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
@@ -177,5 +168,7 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
+    # İki motoru da aynı anda başlat
+    threading.Thread(target=binance_loop, daemon=True).start()
+    threading.Thread(target=kucoin_loop, daemon=True).start()
     run_web_server()
