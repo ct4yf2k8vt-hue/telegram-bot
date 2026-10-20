@@ -19,8 +19,27 @@ def gj(u):
     except:
         return None
 
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return 50
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def mexc_loop():
-    print("--- MEXC MOTORU BASLADI ---", flush=True)
+    print("--- AZCRYPTO TARZI MOTOR BASLADI (MEXC) ---", flush=True)
     son = {}
     
     all_coins = []
@@ -33,7 +52,7 @@ def mexc_loop():
             time.sleep(10)
             
     print("MEXC COIN SAYISI: " + str(len(all_coins)), flush=True)
-    tg("MEXC DIKEY PUMP BOTU AKTIF " + str(len(all_coins)) + " coin izleniyor.")
+    tg("🔥 <b>MEXC AZCRYPTO TARZI BOT AKTIF</b>\n" + str(len(all_coins)) + " coin izleniyor.")
 
     while True:
         try:
@@ -42,10 +61,15 @@ def mexc_loop():
             
             for s in all_coins:
                 try:
-                    k_mexc = gj("https://api.mexc.com/api/v3/klines?symbol=" + s + "&interval=1m&limit=25")
-                    if not k_mexc or len(k_mexc) < 22: 
+                    # 5 dakikalik mumlari al (RSI ve Hacim icin)
+                    k_mexc = gj("https://api.mexc.com/api/v3/klines?symbol=" + s + "&interval=5m&limit=30")
+                    if not k_mexc or len(k_mexc) < 25: 
                         time.sleep(0.1)
                         continue
+                    
+                    # Kapanmis mumlar (sonuncuyu at)
+                    kapanmis = k_mexc[:-1]
+                    closes = [float(x[4]) for x in kapanmis]
                     
                     canli_mum = k_mexc[-1]
                     acilis = float(canli_mum[1])
@@ -53,30 +77,57 @@ def mexc_loop():
                     hacim = float(canli_mum[5])
                     
                     fiyat_degisim = ((su_anki - acilis) / acilis) * 100
-                    v_ort = sum(float(x[5]) for x in k_mexc[-22:-2]) / 20
                     
+                    # Hacim Orani
+                    v_ort = sum(float(x[5]) for x in kapanmis[-20:]) / 20
                     if v_ort == 0: 
                         time.sleep(0.1)
                         continue
-                        
                     hacim_orani = hacim / v_ort
                     
+                    # FILTRE: %3+ Fiyat ve 2.5x+ Hacim
                     if fiyat_degisim >= 3.0 and hacim_orani >= 2.5:
                         if time.time() - son.get(s, 0) >= 1800:
-                            pair = s.replace("USDT", "/USDT")
                             
-                            msg = (
-                                "🔥 DIKEY PUMP (Anlik) - " + pair + " [MEXC]\n"
-                                "💰 Start Price: " + format(acilis, '.5f') + "\n"
-                                "💰 Current Price: " + format(su_anki, '.5f') + " (+" + format(fiyat_degisim, '.1f') + "%)\n"
-                                "📊 Volume: " + format(hacim, '.0f') + " (+" + format((hacim_orani - 1)*100, '.0f') + " %)\n"
-                                "⏱ Time: " + time.strftime('%I:%M:%S %p', time.localtime()) + "\n\n"
-                                "🔗 <a href='https://www.mexc.com/exchange/" + s + "'>Pair on MEXC.</a>"
-                            )
+                            # --- EKSTRA VERILERI CEK ---
+                            # 1. Taker Orani (Son 100 islem)
+                            trades_data = gj("https://api.mexc.com/api/v3/trades?symbol=" + s + "&limit=100")
+                            taker_pct = 50
+                            if trades_data and isinstance(trades_data, list):
+                                buy_vol = sum(float(t["qty"]) for t in trades_data if t["isBuyerMaker"] == False)
+                                total_vol = sum(float(t["qty"]) for t in trades_data)
+                                if total_vol > 0:
+                                    taker_pct = (buy_vol / total_vol) * 100
+                            
+                            # 2. 24s Yuksek/Dusuk
+                            ticker = gj("https://api.mexc.com/api/v3/ticker/24hr?symbol=" + s)
+                            h24 = float(ticker["highPrice"]) if ticker else 0
+                            l24 = float(ticker["lowPrice"]) if ticker else 0
+                            
+                            # 3. RSI
+                            rsi = calculate_rsi(closes)
+                            
+                            # --- MESAJ FORMATI (AzCryptoBot Tarzi) ---
+                            pair = s.replace("USDT", "/USDT")
+                            coin = s.replace("USDT", "")
+                            
+                            # Hacim Barı (Kac katı ise o kadar 💰)
+                            hacim_bari = "💰" * int(min(hacim_orani, 10))
+                            
+                            msg = (f"<b>#{s}</b> 💚 <b>Price +{format(fiyat_degisim, '.2f')}% Vol</b>\n"
+                                   f"❌ {format(hacim_orani, '.1f')} {hacim_bari} (M5 Spot)\n\n"
+                                   f"Total Vol {format(hacim, '.0f')} Taker {format(taker_pct, '.0f')}% Rsi/{format(rsi, '.0f')}\n"
+                                   f"────────────────\n\n"
+                                   f"🏷 Price: {format(su_anki, '.4f')} 🚀 pump ···\n"
+                                   f"🕐 24h: +{format(fiyat_degisim, '.2f')}% Vol {format(hacim, '.0f')}\n"
+                                   f"⬆ High: {format(h24, '.4f')} ({format(((h24 - su_anki)/su_anki)*100, '.2f')}%)\n"
+                                   f"⬇ Low: {format(l24, '.4f')} (+{format(((su_anki - l24)/l24)*100, '.2f')}%)\n\n"
+                                   f"🔗 <a href='https://www.mexc.com/exchange/{s}'>Pair on MEXC.</a>")
+                            
                             tg(msg)
                             son[s] = time.time()
                             sayac += 1
-                            print(">>> MEXC DIKEY PUMP: " + s, flush=True)
+                            print(">>> MEXC SINYAL:", s, flush=True)
                     
                     time.sleep(0.2) 
                     
