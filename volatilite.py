@@ -20,72 +20,121 @@ def gj(u):
         return None
 
 def bot_loop():
-    print("--- 1. BOT LOOP BASLADI (GERCEK ZAMANLI) ---", flush=True)
+    print("--- 1. BOT LOOP BASLADI ---", flush=True)
     son = {}
 
     while True:
         try:
-            tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
-            if not tickers: 
-                time.sleep(10)
-                continue
+            # ==========================================
+            # 1. BINANCE FUTURES TARAMASI
+            # ==========================================
+            tickers_binance = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
+            if tickers_binance:
+                all_coins_binance = [t["symbol"] for t in tickers_binance if t["symbol"].endswith("USDT")]
+                print("--- 2. BINANCE TARANIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(all_coins_binance), "---", flush=True)
                 
-            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
-            print("--- 2. TARAMA BASLIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(all_coins), "---", flush=True)
-            sayac = 0
-            
-            for s in all_coins:
-                try:
-                    # 5 DAKİKALIK mumlara bakıyoruz
-                    k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
-                    if not k or len(k) < 22: continue
-                    
-                    # DİKKAT: k[-1] henüz kapanmamış, ŞU ANKİ CANLI MUM!
-                    canli_mum = k[-1]
-                    onceki_mum = k[-2]
-                    
-                    acilis = float(canli_mum[1])       # 5 dk önceki açılış
-                    su_anki_fiyat = float(canli_mum[4]) # Şu anki fiyat
-                    canli_hacim = float(canli_mum[7])  # Şu ana kadar yenen hacim
-                    
-                    # Fiyat Değişimi (Açılıştan şu ana kadar)
-                    fiyat_degisim = ((su_anki_fiyat - acilis) / acilis) * 100
-                    
-                    # Önceki 20 kapanmış mumun ortalama hacmi
-                    onceki_20 = [float(x[7]) for x in k[-21:-1]]
-                    v_ort = sum(onceki_20) / 20
-                    if v_ort == 0: continue
-                    
-                    # Canlı Hacim Oranı (Şu ana kadar olan hacim / ortalama)
-                    hacim_orani = canli_hacim / v_ort
-                    hacim_artis_pct = (hacim_orani - 1) * 100
-                    
-                    # KOSUL: Canlı hacim 2x (veya daha fazla) VE fiyat %3+ artmışsa (Anlık yakalar)
-                    if hacim_orani >= 2.0 and fiyat_degisim >= 3.0:
-                        if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
-                            
-                            pair = s.replace("USDT", "/USDT")
-                            coin = s.replace("USDT", "")
-                            
-                            msg = (f"🚀 <b>Pump - {pair} [Binance]</b>\n"
-                                   f"💰 Price: <code>{format(acilis, '.4f')}</code> ➜ <code>{format(su_anki_fiyat, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                   f"📊 Volume: {format(canli_hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
-                                   f"Volume increased by {format(canli_hacim - v_ort, '.0f')} ⬆️\n"
-                                   f"Time: {time.strftime('%I:%M:%S %p', time.localtime())} 🕒\n\n"
-                                   f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n\n"
-                                   f"${coin} #{coin}")
-                            
-                            tg(msg)
-                            son[s] = time.time()
-                            sayac += 1
-                            print(">>> SINYAL GONDERILDI:", s, flush=True)
-                            
-                    time.sleep(0.05) # API Ban Korumasi
-                except:
-                    pass
-                    
-            print("--- 3. TARAMA BITTI - Sinyal:", sayac, "---", flush=True)
-            time.sleep(120) # 2 dakika bekle (Daha sık kontrol)
+                for s in all_coins_binance:
+                    try:
+                        k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=25")
+                        if not k or len(k) < 22: continue
+                        
+                        canli_mum = k[-1]
+                        acilis = float(canli_mum[1])
+                        su_anki_fiyat = float(canli_mum[4])
+                        canli_hacim = float(canli_mum[7])
+                        
+                        fiyat_degisim = ((su_anki_fiyat - acilis) / acilis) * 100
+                        
+                        onceki_20 = [float(x[7]) for x in k[-21:-1]]
+                        v_ort = sum(onceki_20) / 20
+                        if v_ort == 0: continue
+                        
+                        hacim_orani = canli_hacim / v_ort
+                        hacim_artis_pct = (hacim_orani - 1) * 100
+                        
+                        # Filtre: Hacim 2x+ VE Fiyat %3+
+                        if hacim_orani >= 2.0 and fiyat_degisim >= 3.0:
+                            if time.time() - son.get("BN_" + s, 0) >= 1800:
+                                pair = s.replace("USDT", "/USDT")
+                                coin = s.replace("USDT", "")
+                                
+                                msg = (f"🚀 <b>Pump - {pair} [Binance]</b>\n"
+                                       f"💰 Price: <code>{format(acilis, '.4f')}</code> ➜ <code>{format(su_anki_fiyat, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
+                                       f"📊 Volume: {format(canli_hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
+                                       f"Volume increased by {format(canli_hacim - v_ort, '.0f')} ⬆️\n"
+                                       f"Time: {time.strftime('%I:%M:%S %p', time.localtime())} 🕒\n\n"
+                                       f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n\n"
+                                       f"${coin} #{coin}")
+                                tg(msg)
+                                son["BN_" + s] = time.time()
+                                print(">>> BINANCE SINYAL:", s, flush=True)
+                        time.sleep(0.05)
+                    except:
+                        pass
+
+            # ==========================================
+            # 2. KUCOIN SPOT TARAMASI
+            # ==========================================
+            # KuCoin tüm tickerları tek seferde verir (API Limit dostu)
+            tickers_kucoin = gj("https://api.kucoin.com/api/v1/market/allTickers")
+            if tickers_kucoin and tickers_kucoin.get("code") == "200000":
+                data = tickers_kucoin.get("data", {}).get("ticker", [])
+                # USDT paritelerini al
+                kc_coins = [t for t in data if t.get("symbol", "").endswith("-USDT")]
+                print("--- 3. KUCOIN TARANIYOR:", time.strftime("%H:%M:%S"), "| Coin:", len(kc_coins), "---", flush=True)
+                
+                for t in kc_coins:
+                    try:
+                        sym = t["symbol"]  # Örn: BTC-USDT
+                        fiyat = float(t["last"])
+                        degisim24 = float(t["changeRate"]) * 100 # KuCoin oranı 0.05 gibi verir, %5 yaparız
+                        
+                        # KuCoin'de anlık hacim patlaması için kline verisi çekelim
+                        # KuCoin sembol formatı: BTC-USDT
+                        k_kc = gj(f"https://api.kucoin.com/api/v1/market/candles?type=5min&symbol={sym}&limit=25")
+                        if not k_kc or k_kc.get("code") != "200000": continue
+                        
+                        k_list = k_kc["data"] # KuCoin verisi tersten gelir (en yeni ilk)
+                        if len(k_list) < 22: continue
+                        
+                        # KuCoin kline: [time, open, close, high, low, volume, turnover]
+                        son_mum = k_list[0] # En son mum
+                        acilis = float(son_mum[1])
+                        su_anki_fiyat = float(son_mum[2])
+                        canli_hacim = float(son_mum[6]) # Turnover (USDT hacmi)
+                        
+                        fiyat_degisim = ((su_anki_fiyat - acilis) / acilis) * 100
+                        
+                        # Önceki 20 mumun ortalaması (1'den 21'e kadar)
+                        onceki_20 = [float(x[6]) for x in k_list[1:21]]
+                        v_ort = sum(onceki_20) / 20
+                        if v_ort == 0: continue
+                        
+                        hacim_orani = canli_hacim / v_ort
+                        hacim_artis_pct = (hacim_orani - 1) * 100
+                        
+                        # Filtre: Hacim 2x+ VE Fiyat %3+
+                        if hacim_orani >= 2.0 and fiyat_degisim >= 3.0:
+                            if time.time() - son.get("KC_" + sym, 0) >= 1800:
+                                pair = sym.replace("-", "/")
+                                coin = sym.replace("-USDT", "")
+                                
+                                msg = (f"🚀 <b>Pump - {pair} [KuCoin]</b>\n"
+                                       f"💰 Price: <code>{format(acilis, '.4f')}</code> ➜ <code>{format(su_anki_fiyat, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
+                                       f"📊 Volume: {format(canli_hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
+                                       f"Volume increased by {format(canli_hacim - v_ort, '.0f')} ⬆️\n"
+                                       f"Time: {time.strftime('%I:%M:%S %p', time.localtime())} 🕒\n\n"
+                                       f"🔗 <a href='https://www.kucoin.com/trade/{sym}'>Pair on KuCoin.</a>\n\n"
+                                       f"${coin} #{coin}")
+                                tg(msg)
+                                son["KC_" + sym] = time.time()
+                                print(">>> KUCOIN SINYAL:", sym, flush=True)
+                        time.sleep(0.05)
+                    except:
+                        pass
+
+            print("--- 4. TARAMA BITTI ---", flush=True)
+            time.sleep(120) # 2 dakika bekle
         except Exception as e:
             print("--- LOOP HATASI:", e, "---", flush=True)
             time.sleep(10)
