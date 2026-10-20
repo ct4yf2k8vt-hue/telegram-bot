@@ -20,6 +20,21 @@ def gj(u):
         return None
 
 # ==========================================
+# ORTAK MESAJ FORMATI
+# ==========================================
+def send_signal(borsa, pair, coin, acilis, su_anki, fiyat_degisim, hacim, hacim_orani):
+    hacim_artis_pct = (hacim_orani - 1) * 100
+    msg = (f"🚀 <b>Pump - {pair} [{borsa}]</b>\n"
+           f"💰 Start Price: <code>{format(acilis, '.5f')}</code>\n"
+           f"💰 Current Price: <code>{format(su_anki, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
+           f"📊 Volume: {format(hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
+           f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
+           f"📉 <b>STRATEJI:</b> Limit emrinizi Current Price'ın %30 - %50 altına yerleştirin.\n"
+           f"⚠️ <i>Kullanımı kendi riskinize bağlıdır.</i>\n\n"
+           f"🔗 <a href='https://www.binance.com/en/futures/{pair.replace('/', '')}'>Pair on Binance.</a>")
+    tg(msg)
+
+# ==========================================
 # MOTOR 1: BINANCE
 # ==========================================
 def binance_loop():
@@ -40,16 +55,12 @@ def binance_loop():
                         if fiyat_degisim < 3.0: continue
                         onceki_20 = [float(x[7]) for x in k[-22:-2]]
                         v_ort = sum(onceki_20) / 20
-                        if v_ort == 0 or (hacim / v_ort) < 3.0: continue
-                        if (float(k[-2][4]) > float(k[-2][1]) and float(k[-1][4]) > float(k[-1][1])) and time.time() - son.get(s, 0) >= 1800:
+                        if v_ort == 0 or (hacim / v_ort) < 2.5: continue
+                        
+                        if time.time() - son.get(s, 0) >= 1800:
                             pair = s.replace("USDT", "/USDT")
-                            msg = (f"🚀 <b>Pump - {pair} [Binance]</b>\n"
-                                   f"💰 Start Price: <code>{format(acilis, '.4f')}</code>\n"
-                                   f"💰 Current Price: <code>{format(su_anki, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                   f"📊 Volume: {format(hacim, '.0f')} (+{format((hacim/v_ort - 1) * 100, '.0f')} %)\n"
-                                   f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-                                   f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>")
-                            tg(msg); son[s] = time.time()
+                            send_signal("Binance", pair, s.replace("USDT", ""), acilis, su_anki, fiyat_degisim, hacim, hacim / v_ort)
+                            son[s] = time.time()
                             print(">>> BINANCE SINYAL:", s, flush=True)
                         time.sleep(0.05)
                     except: pass
@@ -79,16 +90,12 @@ def kucoin_loop():
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         if fiyat_degisim < 3.0: continue
                         v_ort = sum(float(x[6]) for x in k_list[3:23]) / 20
-                        if v_ort == 0 or (hacim / v_ort) < 3.0: continue
+                        if v_ort == 0 or (hacim / v_ort) < 2.5: continue
+                        
                         if time.time() - son.get(sym, 0) >= 1800:
                             pair = sym.replace("-", "/")
-                            msg = (f"🚀 <b>Pump - {pair} [KuCoin]</b>\n"
-                                   f"💰 Start Price: <code>{format(acilis, '.4f')}</code>\n"
-                                   f"💰 Current Price: <code>{format(su_anki, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                   f"📊 Volume: {format(hacim, '.0f')} (+{format((hacim/v_ort - 1) * 100, '.0f')} %)\n"
-                                   f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-                                   f"🔗 <a href='https://www.kucoin.com/trade/{sym}'>Pair on KuCoin.</a>")
-                            tg(msg); son[sym] = time.time()
+                            send_signal("KuCoin", pair, sym.replace("-USDT", ""), acilis, su_anki, fiyat_degisim, hacim, hacim / v_ort)
+                            son[sym] = time.time()
                             print(">>> KUCOIN SINYAL:", sym, flush=True)
                         time.sleep(0.05)
                     except: pass
@@ -97,14 +104,13 @@ def kucoin_loop():
             print("KUCOIN HATA:", e, flush=True); time.sleep(10)
 
 # ==========================================
-# MOTOR 3: MEXC (YENİ EKLENDİ)
+# MOTOR 3: MEXC
 # ==========================================
 def mexc_loop():
     print("--- MEXC MOTORU BASLADI ---", flush=True)
     son = {}
     while True:
         try:
-            # MEXC anlık ticker verilerini al
             mexc_tickers = gj("https://api.mexc.com/api/v3/ticker/24hr")
             if mexc_tickers:
                 mexc_coins = [t for t in mexc_tickers if t.get("symbol", "").endswith("USDT")]
@@ -112,7 +118,6 @@ def mexc_loop():
                 for t in mexc_coins:
                     try:
                         sym = t["symbol"]
-                        # MEXC mum verisi (5 dakikalık)
                         k_mexc = gj(f"https://api.mexc.com/api/v3/klines?symbol={sym}&interval=5m&limit=25")
                         if not k_mexc or len(k_mexc) < 22: continue
                         
@@ -120,19 +125,13 @@ def mexc_loop():
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         if fiyat_degisim < 3.0: continue
                         
-                        # Önceki 20 mumun ortalama hacmi
                         v_ort = sum(float(x[5]) for x in k_mexc[-22:-2]) / 20
-                        if v_ort == 0 or (hacim / v_ort) < 3.0: continue
+                        if v_ort == 0 or (hacim / v_ort) < 2.5: continue
                         
                         if time.time() - son.get(sym, 0) >= 1800:
                             pair = sym.replace("USDT", "/USDT")
-                            msg = (f"🚀 <b>Pump - {pair} [MEXC]</b>\n"
-                                   f"💰 Start Price: <code>{format(acilis, '.4f')}</code>\n"
-                                   f"💰 Current Price: <code>{format(su_anki, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
-                                   f"📊 Volume: {format(hacim, '.0f')} (+{format((hacim/v_ort - 1) * 100, '.0f')} %)\n"
-                                   f"⏱ Time: {time.strftime('%I:%M:%S %p', time.localtime())}\n\n"
-                                   f"🔗 <a href='https://www.mexc.com/exchange/{sym}'>Pair on MEXC.</a>")
-                            tg(msg); son[sym] = time.time()
+                            send_signal("MEXC", pair, sym.replace("USDT", ""), acilis, su_anki, fiyat_degisim, hacim, hacim / v_ort)
+                            son[sym] = time.time()
                             print(">>> MEXC SINYAL:", sym, flush=True)
                         time.sleep(0.05)
                     except: pass
