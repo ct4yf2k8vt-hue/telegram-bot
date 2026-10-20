@@ -19,33 +19,10 @@ def gj(u):
     except:
         return None
 
-def rsi(prices, period=14):
-    if len(prices) < period + 1: return 50
-    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0: return 100
-    return 100 - (100 / (1 + (avg_gain / avg_loss)))
-
-def send_signal(borsa, s, acilis, su_anki, fiyat_degisim, hacim, hacim_orani, h24, l24, degisim24, hacim24, rsi_deger, taker_pct):
-    pair = s.replace("USDT", "/USDT")
-    hacim_bari = "💰" * int(min(hacim_orani, 10))
-    rsi_emoji = "🔴" if rsi_deger > 70 else "🟢" if rsi_deger < 30 else ""
-    
-    msg = (f"<b>#{s}</b> 💚 <b>Price +{format(fiyat_degisim, '.2f')}% Vol</b>\n"
-           f"❌ {format(hacim_orani, '.1f')} {hacim_bari} (M5 {borsa})\n\n"
-           f"Total Vol {format(hacim, '.0f')} Taker {format(taker_pct, '.0f')}% Rsi/{format(rsi_deger, '.0f')}{rsi_emoji}\n"
-           f"────────────────\n\n"
-           f"🏷 Price: {format(su_anki, '.4f')} 🚀 pump ···\n"
-           f"🕐 24h: {format(degisim24, '+.2f')}% Vol {format(hacim24/1000000, '.2f')}M\n"
-           f"⬆ High: {format(h24, '.4f')} ({format(((h24 - su_anki)/su_anki)*100, '.2f')}%)\n"
-           f"⬇ Low: {format(l24, '.4f')} ({format(((su_anki - l24)/l24)*100, '+.2f')}%)\n\n"
-           f"🔗 <a href='https://www.{borsa.lower()}.com/'>Pair on {borsa}.</a>")
+def send_pump_message(coin, fiyat_degisim, borsalar):
+    # Görseldeki gibi sade format
+    msg = (f"🟢 <b>#{coin}: +{format(fiyat_degisim, '.2f')}%</b> 🔔 2\n"
+           f"<code>{borsalar}</code>")
     tg(msg)
 
 # ==========================================
@@ -62,33 +39,20 @@ def binance_loop():
                 print(f"[{time.strftime('%H:%M:%S')}] BINANCE TARANIYOR | Coin: {len(all_coins)}", flush=True)
                 for s in all_coins:
                     try:
-                        k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=30")
-                        if not k or len(k) < 25: continue
+                        k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1m&limit=25")
+                        if not k or len(k) < 22: continue
                         
-                        kapanmis = k[:-1]
-                        closes = [float(x[4]) for x in kapanmis]
                         canli = k[-1]
-                        
                         acilis = float(canli[1]); su_anki = float(canli[4]); hacim = float(canli[7])
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         
-                        v_ort = sum(float(x[7]) for x in kapanmis[-20:]) / 20
-                        if v_ort == 0: continue
-                        hacim_orani = hacim / v_ort
+                        v_ort = sum(float(x[7]) for x in k[-22:-2]) / 20
+                        if v_ort == 0 or (hacim / v_ort) < 2.5: continue
                         
-                        if fiyat_degisim >= 5.0 and hacim_orani >= 3.0:
+                        if fiyat_degisim >= 5.0:
                             if time.time() - son.get(s, 0) >= 1800:
-                                ticker = gj("https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=" + s)
-                                if not ticker: continue
-                                
-                                taker_pct = 50
-                                taker = gj("https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=" + s + "&period=5m&limit=1")
-                                if taker and len(taker) > 0: taker_pct = float(taker[0]["buySellRatio"]) * 100
-                                
-                                send_signal("Binance", s, acilis, su_anki, fiyat_degisim, hacim, hacim_orani,
-                                            float(ticker["highPrice"]), float(ticker["lowPrice"]),
-                                            float(ticker["priceChangePercent"]), float(ticker["quoteVolume"]),
-                                            rsi(closes), taker_pct)
+                                coin = s.replace("USDT", "")
+                                send_pump_message(coin, fiyat_degisim, "BINANCE")
                                 son[s] = time.time()
                                 print(f">>> BINANCE SINYAL: {s}", flush=True)
                         time.sleep(0.05)
@@ -111,36 +75,20 @@ def mexc_loop():
                 print(f"[{time.strftime('%H:%M:%S')}] MEXC TARANIYOR | Coin: {len(all_coins)}", flush=True)
                 for s in all_coins:
                     try:
-                        k = gj(f"https://api.mexc.com/api/v3/klines?symbol={s}&interval=5m&limit=30")
-                        if not k or len(k) < 25: continue
+                        k = gj(f"https://api.mexc.com/api/v3/klines?symbol={s}&interval=1m&limit=25")
+                        if not k or len(k) < 22: continue
                         
-                        kapanmis = k[:-1]
-                        closes = [float(x[4]) for x in kapanmis]
                         canli = k[-1]
-                        
                         acilis = float(canli[1]); su_anki = float(canli[4]); hacim = float(canli[5])
                         fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                         
-                        v_ort = sum(float(x[5]) for x in kapanmis[-20:]) / 20
-                        if v_ort == 0: continue
-                        hacim_orani = hacim / v_ort
+                        v_ort = sum(float(x[5]) for x in k[-22:-2]) / 20
+                        if v_ort == 0 or (hacim / v_ort) < 2.5: continue
                         
-                        if fiyat_degisim >= 5.0 and hacim_orani >= 3.0:
+                        if fiyat_degisim >= 5.0:
                             if time.time() - son.get(s, 0) >= 1800:
-                                ticker = gj(f"https://api.mexc.com/api/v3/ticker/24hr?symbol={s}")
-                                if not ticker: continue
-                                
-                                taker_pct = 50
-                                trades = gj(f"https://api.mexc.com/api/v3/trades?symbol={s}&limit=100")
-                                if trades and isinstance(trades, list):
-                                    buy_vol = sum(float(t["qty"]) for t in trades if t["isBuyerMaker"] == False)
-                                    total_vol = sum(float(t["qty"]) for t in trades)
-                                    if total_vol > 0: taker_pct = (buy_vol / total_vol) * 100
-                                
-                                send_signal("Mexc", s, acilis, su_anki, fiyat_degisim, hacim, hacim_orani,
-                                            float(ticker["highPrice"]), float(ticker["lowPrice"]),
-                                            float(ticker["priceChangePercent"]), float(ticker["quoteVolume"]),
-                                            rsi(closes), taker_pct)
+                                coin = s.replace("USDT", "")
+                                send_pump_message(coin, fiyat_degisim, "MEXC")
                                 son[s] = time.time()
                                 print(f">>> MEXC SINYAL: {s}", flush=True)
                         time.sleep(0.2)
@@ -148,6 +96,84 @@ def mexc_loop():
             time.sleep(60)
         except Exception as e:
             print("MEXC HATA:", e, flush=True); time.sleep(10)
+
+# ==========================================
+# MOTOR 3: BYBIT
+# ==========================================
+def bybit_loop():
+    print("--- BYBIT MOTORU BASLADI ---", flush=True)
+    son = {}
+    while True:
+        try:
+            tickers = gj("https://api.bybit.com/v5/market/tickers?category=linear")
+            if tickers and tickers.get("retCode") == 0:
+                all_coins = [t["symbol"] for t in tickers["result"]["list"] if t["symbol"].endswith("USDT")]
+                print(f"[{time.strftime('%H:%M:%S')}] BYBIT TARANIYOR | Coin: {len(all_coins)}", flush=True)
+                for s in all_coins:
+                    try:
+                        k = gj(f"https://api.bybit.com/v5/market/kline?category=linear&symbol={s}&interval=1&limit=25")
+                        if not k or k.get("retCode") != 0 or len(k["result"]["list"]) < 22: continue
+                        
+                        # Bybit tersten verir (en yeni ilk)
+                        k_list = k["result"]["list"]
+                        canli = k_list[0]
+                        
+                        acilis = float(canli[1]); su_anki = float(canli[4]); hacim = float(canli[5])
+                        fiyat_degisim = ((su_anki - acilis) / acilis) * 100
+                        
+                        v_ort = sum(float(x[5]) for x in k_list[2:22]) / 20
+                        if v_ort == 0 or (hacim / v_ort) < 2.5: continue
+                        
+                        if fiyat_degisim >= 5.0:
+                            if time.time() - son.get(s, 0) >= 1800:
+                                coin = s.replace("USDT", "")
+                                send_pump_message(coin, fiyat_degisim, "BYBIT")
+                                son[s] = time.time()
+                                print(f">>> BYBIT SINYAL: {s}", flush=True)
+                        time.sleep(0.1)
+                    except: pass
+            time.sleep(60)
+        except Exception as e:
+            print("BYBIT HATA:", e, flush=True); time.sleep(10)
+
+# ==========================================
+# MOTOR 4: OKX
+# ==========================================
+def okx_loop():
+    print("--- OKX MOTORU BASLADI ---", flush=True)
+    son = {}
+    while True:
+        try:
+            tickers = gj("https://www.okx.com/api/v5/market/tickers?instType=SWAP")
+            if tickers and tickers.get("code") == "0":
+                all_coins = [t["instId"] for t in tickers["data"] if t["instId"].endswith("-USDT-SWAP")]
+                print(f"[{time.strftime('%H:%M:%S')}] OKX TARANIYOR | Coin: {len(all_coins)}", flush=True)
+                for s in all_coins:
+                    try:
+                        k = gj(f"https://www.okx.com/api/v5/market/candles?instId={s}&bar=1m&limit=25")
+                        if not k or k.get("code") != "0" or len(k["data"]) < 22: continue
+                        
+                        # OKX tersten verir
+                        k_list = k["data"]
+                        canli = k_list[0]
+                        
+                        acilis = float(canli[1]); su_anki = float(canli[4]); hacim = float(canli[5])
+                        fiyat_degisim = ((su_anki - acilis) / acilis) * 100
+                        
+                        v_ort = sum(float(x[5]) for x in k_list[2:22]) / 20
+                        if v_ort == 0 or (hacim / v_ort) < 2.5: continue
+                        
+                        if fiyat_degisim >= 5.0:
+                            if time.time() - son.get(s, 0) >= 1800:
+                                coin = s.replace("-USDT-SWAP", "")
+                                send_pump_message(coin, fiyat_degisim, "OKX")
+                                son[s] = time.time()
+                                print(f">>> OKX SINYAL: {s}", flush=True)
+                        time.sleep(0.1)
+                    except: pass
+            time.sleep(60)
+        except Exception as e:
+            print("OKX HATA:", e, flush=True); time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -164,4 +190,6 @@ def run_web_server():
 if __name__ == "__main__":
     threading.Thread(target=binance_loop, daemon=True).start()
     threading.Thread(target=mexc_loop, daemon=True).start()
+    threading.Thread(target=bybit_loop, daemon=True).start()
+    threading.Thread(target=okx_loop, daemon=True).start()
     run_web_server()
