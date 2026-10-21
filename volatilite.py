@@ -1,23 +1,17 @@
 import urllib.request, urllib.parse, json, time
 import os
 import threading
-import io
-import requests
-import pandas as pd
-import mplfinance as mpf
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 
-def tg_photo(image_bytes, caption):
+def tg(m):
     try:
-        url = "https://api.telegram.org/bot" + T + "/sendPhoto"
-        files = {'photo': ('chart.png', image_bytes, 'image/png')}
-        data = {'chat_id': C, 'caption': caption, 'parse_mode': 'HTML'}
-        requests.post(url, files=files, data=data, timeout=15)
-    except Exception as e:
-        print("FOTO HATASI:", e, flush=True)
+        d = urllib.parse.urlencode({"chat_id": C, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
+        urllib.request.urlopen("https://api.telegram.org/bot" + T + "/sendMessage", d, timeout=10).read()
+    except:
+        pass
 
 def gj(u):
     try:
@@ -26,21 +20,26 @@ def gj(u):
         return None
 
 def bot_loop():
-    print("--- BOT BASLADI ---", flush=True)
+    print("--- 1. BOT LOOP BASLADI ---", flush=True)
     son = {}
 
     while True:
         try:
+            print("--- 2. TUM BINANCE FUTURES COINLERI ALINIYOR ---", flush=True)
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers: 
                 time.sleep(10)
                 continue
                 
             all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
-            print("--- TARAMA BASLIYOR ---", flush=True)
+            print("--- 3. TARANACAK COIN SAYISI:", len(all_coins), "---", flush=True)
+            
+            print("--- 4. TARAMA BASLIYOR:", time.strftime("%H:%M:%S"), "---", flush=True)
+            sayac = 0
             
             for s in all_coins:
                 try:
+                    # 15 dakikalik mumlari al (Grafik yerine hizli metin icin)
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=25")
                     if not k or len(k) < 22: continue
                     
@@ -61,27 +60,11 @@ def bot_loop():
                     
                     # SADECE BÜYÜK PUMP'LAR (Fiyat %5+, Hacim 3x+)
                     if hacim_orani >= 3.0 and fiyat_degisim >= 5.0:
-                        if time.time() - son.get(s, 0) >= 1800:
-                            
-                            df_data = []
-                            for x in k[:-1]:
-                                df_data.append({
-                                    "Date": pd.to_datetime(x[0], unit='ms'),
-                                    "Open": float(x[1]), "High": float(x[2]),
-                                    "Low": float(x[3]), "Close": float(x[4]),
-                                    "Volume": float(x[5])
-                                })
-                            df = pd.DataFrame(df_data)
-                            df.set_index('Date', inplace=True)
-                            
-                            buf = io.BytesIO()
-                            mc = mpf.make_marketcolors(up='#00ff00', down='#ff0000', edge='inherit', wick='inherit', volume='in')
-                            s_style = mpf.make_mpf_style(marketcolors=mc, gridstyle='', facecolor='#131722')
-                            mpf.plot(df, type='candle', style=s_style, volume=True, savefig=buf, figsize=(10, 6), axisoff=True)
-                            buf.seek(0)
+                        if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
                             
                             pair = s.replace("USDT", "/USDT")
                             coin = s.replace("USDT", "")
+                            
                             msg = (f"🚀 <b>Pump - {pair} [Binance]</b>\n"
                                    f"💵 Price: <code>{format(fiyat_onceki, '.5f')}</code> ➜ <code>{format(fiyat_simdi, '.5f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
                                    f"📊 Volume: {format(hacim_usdt, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
@@ -90,18 +73,19 @@ def bot_loop():
                                    f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n\n"
                                    f"${coin} #{coin}")
                             
-                            tg_photo(buf, msg)
+                            tg(msg)
                             son[s] = time.time()
-                            print(">>> PUMP GONDERILDI:", s, flush=True)
+                            sayac += 1
+                            print(">>> SINYAL GONDERILDI:", s, flush=True)
                             
-                    time.sleep(0.05)
+                    time.sleep(0.05) # API Ban Korumasi
                 except:
                     pass
                     
-            print("--- TARAMA BITTI ---", flush=True)
-            time.sleep(180)
+            print("--- 5. TARAMA BITTI - Sinyal:", sayac, "---", flush=True)
+            time.sleep(180) # 3 dakika bekle
         except Exception as e:
-            print("HATA:", e, flush=True)
+            print("--- LOOP HATASI:", e, "---", flush=True)
             time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
@@ -116,6 +100,7 @@ class Handler(BaseHTTPRequestHandler):
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), Handler)
+    print("WEB SUNUCUSU BASLADI - PORT:", port, flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
