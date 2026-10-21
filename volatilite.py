@@ -7,9 +7,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 
-# Türkiye Saati (UTC + 3 Saat)
 def tr_saat():
-    return (datetime.utcnow() + timedelta(hours=3)).strftime('%I:%M:%S %p')
+    return (datetime.utcnow() + timedelta(hours=3)).strftime('%H:%M:%S')
 
 def tg(m):
     try:
@@ -38,94 +37,110 @@ def calculate_rsi(prices, period=14):
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 def bot_loop():
-    print("--- HIZLI AZCRYPTO BOTU BASLADI ---", flush=True)
-    son = {}
+    print("--- PROFESYONEL SHORT BOTU BASLADI ---", flush=True)
+    son_sinyal = {}
 
     while True:
         try:
-            # 1. TEK İSTEKLE TÜM COINLERİN 24 SAATLİK VERİSİNİ ÇEK
+            print(f"[{tr_saat()}] TARAMA BASLIYOR...", flush=True)
+            
+            # 1. ÖN FİLTRE: Son 24 saatte %10+ artmış coinleri bul
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers: 
                 time.sleep(10)
                 continue
                 
-            # 2. ÖN FİLTRELEME: Sadece 24 saatte %3'ten fazla artanları al
             hedef_coinler = []
             for t in tickers:
                 if t["symbol"].endswith("USDT"):
-                    degisim24 = float(t["priceChangePercent"])
-                    if degisim24 >= 3.0:
+                    if float(t["priceChangePercent"]) >= 10.0:
                         hedef_coinler.append(t["symbol"])
 
-            print(f"[{tr_saat()}] TARAMA BASLIYOR | Potansiyel Coin: {len(hedef_coinler)}", flush=True)
+            print(f"[{tr_saat()}] Potansiyel Coin: {len(hedef_coinler)}", flush=True)
             sayac = 0
-            
-            # 3. SADECE SEÇİLEN COINLERİN DETAYINA BAK
+
+            # 2. DETAYLI ANALİZ
             for s in hedef_coinler:
                 try:
-                    k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=30")
-                    if not k or len(k) < 22: continue
+                    # 15 Dakikalık mumlar
+                    k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=15m&limit=30")
+                    if not k or len(k) < 25: continue
                     
                     kapanmis = k[:-1]
                     closes = [float(x[4]) for x in kapanmis]
+                    highs = [float(x[2]) for x in kapanmis]
                     
-                    son_mum = kapanmis[-1]
-                    fiyat_simdi = float(son_mum[4])
-                    fiyat_onceki = float(kapanmis[-2][4])
-                    hacim_usdt = float(son_mum[7])
-                    
-                    fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
-                    
-                    onceki_20 = [float(x[7]) for x in kapanmis[-21:]]
-                    v_ort = sum(onceki_20) / 20
+                    canli_mum = k[-1]
+                    acilis = float(canli_mum[1])
+                    su_anki = float(canli_mum[4])
+                    hacim = float(canli_mum[7])
+                    zirve = float(canli_mum[2]) # Anlık en yüksek
+
+                    # ŞART 1: RSI > 70 (Aşırı Alım)
+                    rsi_deger = calculate_rsi(closes)
+                    if rsi_deger < 70: continue
+
+                    # ŞART 2: Olağandışı Hacim (Ortalamanın 2.5 katı)
+                    v_ort = sum(float(x[7]) for x in kapanmis[-20:]) / 20
                     if v_ort == 0: continue
-                    hacim_orani = hacim_usdt / v_ort
+                    hacim_orani = hacim / v_ort
+                    if hacim_orani < 2.5: continue
+
+                    # ŞART 3: Dönüş İşareti (Anlık mum kırmızıya dönmüş VE zirveden düşmüş)
+                    if su_anki > acilis: continue # Mum hala yeşilse bekle
+                    if (zirve - su_anki) < (zirve * 0.005): continue # Zirveden en az %0.5 düşmemişse bekle
+
+                    # ŞART 4: Futures Verisi (Funding Rate Aşırı Pozitif mi?)
+                    funding_data = gj(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={s}")
+                    funding_rate = float(funding_data["lastFundingRate"]) * 100 if funding_data else 0
+                    # Funding aşırı pozitif değilse (%0.01'den küçükse) shortlamak riskli olabilir
+                    if funding_rate < 0.01: continue
+
+                    # 3. STOP LOSS VE TAKE PROFIT HESABI (Risk / Ödül)
+                    giris = su_anki
+                    stop_loss = zirve * 1.005 # Zirvenin %0.5 üstü (Direnç kırılırsa çık)
+                    risk = stop_loss - giris
                     
-                    # Son kontrol: 15dk mumda da %3 artmış mı?
-                    if fiyat_degisim >= 3.0 and hacim_orani >= 2.0:
-                        if time.time() - son.get(s, 0) >= 1800:
-                            
-                            # Detay verileri çek
-                            t_info = next((t for t in tickers if t["symbol"] == s), None)
-                            if not t_info: continue
-                            h24 = float(t_info["highPrice"])
-                            l24 = float(t_info["lowPrice"])
-                            degisim24 = float(t_info["priceChangePercent"])
-                            hacim24 = float(t_info["quoteVolume"])
-                            
-                            taker_pct = 50
-                            taker = gj("https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=" + s + "&period=15m&limit=1")
-                            if taker and len(taker) > 0: taker_pct = float(taker[0]["buySellRatio"]) * 100
-                            
-                            rsi_deger = calculate_rsi(closes)
-                            
-                            # Format
-                            coin = s.replace("USDT", "")
-                            hacim_bari = "💰" * int(min(hacim_orani, 10))
-                            rsi_emoji = "🔴" if rsi_deger > 70 else "🟢" if rsi_deger < 30 else ""
-                            
-                            msg = (f"<b>#{s}</b> 💚 <b>Price +{format(fiyat_degisim, '.2f')}% Vol</b>\n"
-                                   f"❌ {format(hacim_orani, '.1f')} {hacim_bari} (M15 Futures)\n\n"
-                                   f"Total Vol {format(hacim_usdt, '.0f')} Taker {format(taker_pct, '.0f')}% Rsi/{format(rsi_deger, '.0f')}{rsi_emoji}\n"
-                                   f"────────────────\n\n"
-                                   f"🏷 Price: {format(fiyat_simdi, '.4f')} 🚀 pump ···\n"
-                                   f"🕐 24h: {format(degisim24, '+.2f')}% Vol {format(hacim24/1000000, '.2f')}M\n"
-                                   f"⬆ High: {format(h24, '.4f')} ({format(((h24 - fiyat_simdi)/fiyat_simdi)*100, '.2f')}%)\n"
-                                   f"⬇ Low: {format(l24, '.4f')} ({format(((fiyat_simdi - l24)/l24)*100, '+.2f')}%)\n\n"
-                                   f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n"
-                                   f"🕒 {tr_saat()}")
-                            
-                            tg(msg)
-                            son[s] = time.time()
-                            sayac += 1
-                            print(f">>> SINYAL GONDERILDI: {s}", flush=True)
-                            
+                    if risk <= 0: continue
+                    
+                    # Hedef: 1.5 Kat Risk (R:R = 1:1.5)
+                    take_profit = giris - (risk * 1.5)
+                    
+                    risk_pct = (risk / giris) * 100
+                    tp_pct = ((giris - take_profit) / giris) * 100
+
+                    # Cooldown kontrolü
+                    if time.time() - son_sinyal.get(s, 0) >= 3600: # 1 saat
+                        
+                        # GÖRSELDEKİ GİBİ SHORT FORMATI
+                        coin = s.replace("USDT", "")
+                        
+                        msg = (f"🔴 <b>SHORT SINYALI - {coin}</b>\n\n"
+                               f"🚨 <b>Neden Short?</b>\n"
+                               f"📈 Fiyat son 24s'de +%{format(float(next((t['priceChangePercent'] for t in tickers if t['symbol']==s), 0)), '.1f')}\n"
+                               f"🔥 RSI: {format(rsi_deger, '.1f')} (Aşırı Alım)\n"
+                               f"📊 Hacim: {format(hacim_orani, '.1f')}x (Patlama)\n"
+                               f"💰 Funding: %{format(funding_rate, '.3f')} (Long Sıkışması)\n"
+                               f"🔄 Dönüş: Zirveden reddedilme\n\n"
+                               f"🎯 <b>İşlem Planı:</b>\n"
+                               f"Entry: <code>{format(giris, '.5f')}</code>\n"
+                               f"Stop Loss: <code>{format(stop_loss, '.5f')}</code> (+%{format(risk_pct, '.2f')})\n"
+                               f"Take Profit: <code>{format(take_profit, '.5f')}</code> (-%{format(tp_pct, '.2f')})\n"
+                               f"⚖️ R:R Oranı: 1:1.5\n\n"
+                               f"🕒 {tr_saat()}\n"
+                               f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>")
+                        
+                        tg(msg)
+                        son_sinyal[s] = time.time()
+                        sayac += 1
+                        print(f">>> SHORT SINYALI GONDERILDI: {s}", flush=True)
+
                     time.sleep(0.1)
                 except:
                     pass
-                    
+            
             print(f"[{tr_saat()}] TARAMA BITTI - Sinyal: {sayac}", flush=True)
-            time.sleep(60)
+            time.sleep(60) # 1 dakika bekle
             
         except Exception as e:
             print("HATA:", e, flush=True)
