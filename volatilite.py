@@ -1,14 +1,15 @@
 import urllib.request, urllib.parse, json, time
 import os
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 
-# Türkiye Saati (UTC+3)
-TR_Saati = timezone(timedelta(hours=3))
+# Türkiye Saati (UTC + 3 Saat)
+def tr_saat():
+    return (datetime.utcnow() + timedelta(hours=3)).strftime('%I:%M:%S %p')
 
 def tg(m):
     try:
@@ -37,21 +38,30 @@ def calculate_rsi(prices, period=14):
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 def bot_loop():
-    print("--- AZCRYPTO TARZI BOT BASLADI ---", flush=True)
+    print("--- HIZLI AZCRYPTO BOTU BASLADI ---", flush=True)
     son = {}
 
     while True:
         try:
+            # 1. TEK İSTEKLE TÜM COINLERİN 24 SAATLİK VERİSİNİ ÇEK
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers: 
                 time.sleep(10)
                 continue
                 
-            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BASLIYOR | Coin: {len(all_coins)}", flush=True)
+            # 2. ÖN FİLTRELEME: Sadece 24 saatte %3'ten fazla artanları al
+            hedef_coinler = []
+            for t in tickers:
+                if t["symbol"].endswith("USDT"):
+                    degisim24 = float(t["priceChangePercent"])
+                    if degisim24 >= 3.0:
+                        hedef_coinler.append(t["symbol"])
+
+            print(f"[{tr_saat()}] TARAMA BASLIYOR | Potansiyel Coin: {len(hedef_coinler)}", flush=True)
             sayac = 0
             
-            for s in all_coins:
+            # 3. SADECE SEÇİLEN COINLERİN DETAYINA BAK
+            for s in hedef_coinler:
                 try:
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=15m&limit=30")
                     if not k or len(k) < 22: continue
@@ -71,10 +81,11 @@ def bot_loop():
                     if v_ort == 0: continue
                     hacim_orani = hacim_usdt / v_ort
                     
-                    # FİLTRE: Fiyat %3+ VE Hacim 2x+
+                    # Son kontrol: 15dk mumda da %3 artmış mı?
                     if fiyat_degisim >= 3.0 and hacim_orani >= 2.0:
                         if time.time() - son.get(s, 0) >= 1800:
                             
+                            # Detay verileri çek
                             t_info = next((t for t in tickers if t["symbol"] == s), None)
                             if not t_info: continue
                             h24 = float(t_info["highPrice"])
@@ -88,7 +99,7 @@ def bot_loop():
                             
                             rsi_deger = calculate_rsi(closes)
                             
-                            pair = s.replace("USDT", "/USDT")
+                            # Format
                             coin = s.replace("USDT", "")
                             hacim_bari = "💰" * int(min(hacim_orani, 10))
                             rsi_emoji = "🔴" if rsi_deger > 70 else "🟢" if rsi_deger < 30 else ""
@@ -101,19 +112,21 @@ def bot_loop():
                                    f"🕐 24h: {format(degisim24, '+.2f')}% Vol {format(hacim24/1000000, '.2f')}M\n"
                                    f"⬆ High: {format(h24, '.4f')} ({format(((h24 - fiyat_simdi)/fiyat_simdi)*100, '.2f')}%)\n"
                                    f"⬇ Low: {format(l24, '.4f')} ({format(((fiyat_simdi - l24)/l24)*100, '+.2f')}%)\n\n"
-                                   f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>")
+                                   f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n"
+                                   f"🕒 {tr_saat()}")
                             
                             tg(msg)
                             son[s] = time.time()
                             sayac += 1
                             print(f">>> SINYAL GONDERILDI: {s}", flush=True)
                             
-                    time.sleep(0.05)
+                    time.sleep(0.1)
                 except:
                     pass
                     
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BITTI - Sinyal: {sayac}", flush=True)
-            time.sleep(180)
+            print(f"[{tr_saat()}] TARAMA BITTI - Sinyal: {sayac}", flush=True)
+            time.sleep(60)
+            
         except Exception as e:
             print("HATA:", e, flush=True)
             time.sleep(10)
