@@ -2,9 +2,13 @@ import urllib.request, urllib.parse, json, time
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timedelta, timezone
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
+
+# Türkiye Saati (UTC+3)
+TR_Saati = timezone(timedelta(hours=3))
 
 def tg(m):
     try:
@@ -25,7 +29,7 @@ def bot_loop():
 
     while True:
         try:
-            print(f"[{time.strftime('%H:%M:%S')}] EN HACIMLI COINLER ARANIYOR...", flush=True)
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] EN HACIMLI COINLER ARANIYOR...", flush=True)
             
             # 1. HEM SPOT HEM FUTURES İÇİN EN HACİMLİLERİ TEK İSTEKLE ÇEK
             tickers_spot = gj("https://api.binance.com/api/v3/ticker/24hr")
@@ -47,7 +51,7 @@ def bot_loop():
                 for t in usdt_fut[:150]:
                     hedef_coinler.append({"symbol": t["symbol"], "type": "FUTURES"})
 
-            print(f"[{time.strftime('%H:%M:%S')}] TARANACAK COIN SAYISI: {len(hedef_coinler)}", flush=True)
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARANACAK COIN SAYISI: {len(hedef_coinler)}", flush=True)
             sayac = 0
 
             # 2. TARAMA BAŞLIYOR
@@ -96,7 +100,7 @@ def bot_loop():
                                    f"💰 Price: <code>{format(acilis, '.4f')}</code> ➜ <code>{format(su_anki, '.4f')}</code> (+{format(fiyat_degisim, '.1f')}%)\n"
                                    f"📊 Volume: {format(hacim, '.0f')} (+{format(hacim_artis_pct, '.0f')} %)\n"
                                    f"Volume increased by {format(hacim_artis, '.0f')} ⬆️\n"
-                                   f"Time: {time.strftime('%I:%M:%S %p', time.localtime())} 🕒\n\n"
+                                   f"Time: {datetime.now(TR_Saati).strftime('%I:%M:%S %p')} 🕒\n\n"
                                    f"🔗 <a href='https://www.binance.com/en/{'futures/' if tip == 'FUTURES' else 'trade/'}{s}'>Pair on Binance.</a>")
                             tg(msg)
                             son[s + tip] = time.time()
@@ -108,7 +112,7 @@ def bot_loop():
                 except Exception as e:
                     pass
             
-            print(f"[{time.strftime('%H:%M:%S')}] TARAMA BITTI - Sinyal: {sayac}", flush=True)
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BITTI - Sinyal: {sayac}", flush=True)
             time.sleep(60) # 1 dakika bekle
             
         except Exception as e:
