@@ -32,144 +32,106 @@ def calculate_rsi(prices, period=14):
     if avg_loss == 0: return 100
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-# ==========================================
-# BINANCE MOTORU
-# ==========================================
-def binance_loop():
-    print("--- BINANCE MOTORU BASLADI ---", flush=True)
+def kucoin_loop():
+    print("--- KUCOIN MOTORU BASLADI ---", flush=True)
     son = {}
+    
     while True:
         try:
-            tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
-            if tickers:
-                all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
-                print(f"[{time.strftime('%H:%M:%S')}] BINANCE TARANIYOR | Coin: {len(all_coins)}", flush=True)
-                for s in all_coins:
-                    try:
-                        # 1 dakikalık mumlar (Anlık yakalamak için)
-                        k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1m&limit=25")
-                       format if not k or len(k) < 22: continue
+            # Tüm KuCoin USDT paritelerini al
+            tickers = gj("https://api.kucoin.com/api/v1/market/allTickers")
+            if not tickers or tickers.get("code") != "200000":
+                print("KuCoin API yanit vermedi, bekleniyor...", flush=True)
+                time.sleep(10)
+                continue
+                
+            all_coins = [t["symbol"] for t in tickers["data"]["ticker"] if t["symbol"].endswith("-USDT")]
+            print(f"[{time.strftime('%H:%M:%S')}] KUCOIN TARANIYOR | Coin: {len(all_coins)}", flush=True)
+            
+            for sym in all_coins:
+                try:
+                    # 1 dakikalık mumlar (Anlık pump yakalamak için)
+                    k = gj(f"https://api.kucoin.com/api/v1/market/candles?type=1min&symbol={sym}&limit=25")
+                    if not k or k.get("code") != "200000" or len(k["data"]) < 22: 
+                        time.sleep(0.15)
+                        continue
+                    
+                    # KuCoin veriyi tersten verir (en yeni ilk sırada)
+                    k_list = k["data"]
+                    
+                    canli = k_list[0]
+                    acilis = float(canli[1])
+                    su_anki = float(canli[2])
+                    hacim = float(canli[5]) # Coin miktarı
+                    hacim_usdt = float(canli[6]) # USDT hacmi
+                    
+                    # Fiyat değişimi
+                    fiyat_degisim = ((su_anki - acilis) / acilis) * 100
+                    
+                    # Hacim Oranı (Son 20 mumun ortalamasına göre)
+                    v_ort = sum(float(x[6]) for x in k_list[2:22]) / 20
+                    if v_ort == 0: 
+                        time.sleep(0.15)
+                        continue
                         
-                        kapanmis = k[:-1]
-                        closes = [float(x[4]) for x in kapanmis]
-                        canli = k[-1]
-                        
-                        acilis = float(canli[1])
-                        su_anki = float(canli[4])
-                        hacim = float(canli[7])
-                        fiyat_degisim = ((su_anki - acilis) / acilis) * 100
-                        
-                        v_ort = sum(float(x[7]) for x in kapanmis[-20:]) / 20
-                        if v_ort == 0: continue
-                        hacim_orani = hacim / v_ort
-                        
-                        # Filtre: %3+ fiyat ve 2.5x+ hacim
-                        if fiyat_degisim >= 3.0 and hacim_orani >= 2.5:
-                            if time.time() - son.get(s, 0) >= 1800: # 30 dk
-                                ticker = gj("https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=" + s)
-                                if not ticker: continue
-                                
-                                taker_pct = 50
-                                taker = gj("https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=" + s + "&period=5m&limit=1")
-                                if taker and len(taker) > 0: taker_pct = float(taker[0]["buySellRatio"]) * 100
-                                
-                                h24 = float(ticker["highPrice"])
-                                l24 = float(ticker["lowPrice"])
-                                rsi = calculate_rsi(closes)
-                                
-                                pair = s.replace("USDT", "/USDT")
-                                coin = s.replace("USDT", "")
-                                hacim_bari = "💰" * int(min(hacim_orani, 10))
-                                rsi_emoji = "🔴" if rsi > 70 else "🟢" if rsi < 30 else ""
-                                
-                                msg = (f"<b>#{s}</b> 💚 <b>Price +{format(fiyat_degisim, '.2f')}% Vol</b>\n"
-                                       f"❌ {format(hacim_orani, '.1f')} {hacim_bari} (M5 Spot)\n\n"
-                                       f"Total Vol {format(hacim, '.0f')} Taker {format(taker_pct, '.0f')}% Rsi/{format(rsi, '.0f')}{rsi_emoji}\n"
-                                       f"────────────────\n\n"
-                                       f"🏷 Start Price: <code>{format(acilis, '.5f')}</code>\n"
-                                       f"🏷 Current Price: <code>{format(su_anki, '.5f')}</code> 🚀 pump\n"
-                                       f"🕐 24h: {format(float(ticker['priceChangePercent']), '+.2f')}% Vol {format(float(ticker['quoteVolume'])/1000000, '.2f')}M\n"
-                                       f"⬆ High: {format(h24, '.4f')} ({format(((h24 - su_anki)/su_anki)*100, '.2f')}%)\n"
-                                       f"⬇ Low: {format(l24, '.4f')} ({format(((su_anki - l24)/l24)*100, '+.2f')}%)\n\n"
-                                       f"🔗 <b>BINANCE</b>")
-                                tg(msg)
-                                son[s] = time.time()
-                                print(f">>> BINANCE SINYAL: {s}", flush=True)
-                        time.sleep(0.05)
-                    except: pass
-            time.sleep(60)
+                    hacim_orani = hacim_usdt / v_ort
+                    
+                    # Filtre: 1 dakikada %3+ fiyat ve 2.5x+ hacim
+                    if fiyat_degisim >= 3.0 and hacim_orani >= 2.5:
+                        if time.time() - son.get(sym, 0) >= 1800: # 30 dk cooldown
+                            
+                            # --- EK VERILER ---
+                            # 24s Yüksek/Düşük
+                            t_info = next((t for t in tickers["data"]["ticker"] if t["symbol"] == sym), None)
+                            if not t_info: continue
+                            
+                            h24 = float(t_info["high"])
+                            l24 = float(t_info["low"])
+                            degisim24 = float(t_info["changeRate"]) * 100
+                            
+                            # Taker Oranı (Son 100 işlem)
+                            trades_data = gj(f"https://api.kucoin.com/api/v1/market/histories?symbol={sym}")
+                            taker_pct = 50
+                            if trades_data and trades_data.get("code") == "200000":
+                                t_list = trades_data["data"][:100]
+                                buy_vol = sum(float(t["size"]) for t in t_list if t["side"] == "buy")
+                                total_vol = sum(float(t["size"]) for t in t_list)
+                                if total_vol > 0: taker_pct = (buy_vol / total_vol) * 100
+                            
+                            # RSI
+                            closes = [float(x[2]) for x in k_list[1:]]
+                            rsi_val = calculate_rsi(closes)
+                            
+                            # --- MESAJ FORMATI (Görseldeki gibi) ---
+                            coin = sym.replace("-USDT", "")
+                            pair = sym.replace("-", "/")
+                            hacim_bari = "💰" * int(min(hacim_orani, 10))
+                            rsi_emoji = "🔴" if rsi_val > 70 else "🟢" if rsi_val < 30 else ""
+                            
+                            msg = (f"<b>#{sym}</b> 💚 <b>Price +{format(fiyat_degisim, '.2f')}% Vol</b>\n"
+                                   f"❌ {format(hacim_orani, '.1f')} {hacim_bari} (M5 Spot)\n\n"
+                                   f"Total Vol {format(hacim, '.0f')} Taker {format(taker_pct, '.0f')}% Rsi/{format(rsi_val, '.0f')}{rsi_emoji}\n"
+                                   f"────────────────\n\n"
+                                   f"🏷 Start Price: <code>{format(acilis, '.5f')}</code>\n"
+                                   f"🏷 Current Price: <code>{format(su_anki, '.5f')}</code> 🚀 pump\n"
+                                   f"🕐 24h: {format(degisim24, '+.2f')}% Vol {format(float(t_info['volValue'])/1000000, '.2f')}M\n"
+                                   f"⬆ High: {format(h24, '.4f')} ({format(((h24 - su_anki)/su_anki)*100, '.2f')}%)\n"
+                                   f"⬇ Low: {format(l24, '.4f')} ({format(((su_anki - l24)/l24)*100, '+.2f')}%)\n\n"
+                                   f"🔗 <a href='https://www.kucoin.com/trade/{sym}'>Pair on KuCoin.</a>")
+                            tg(msg)
+                            son[sym] = time.time()
+                            print(f">>> KUCOIN SINYAL: {sym}", flush=True)
+                            
+                    time.sleep(0.15) # KuCoin API'sini yormamak icin bekle
+                except:
+                    pass
+            
+            print(f"[{time.strftime('%H:%M:%S')}] KUCOIN TARAMASI BITTI", flush=True)
+            time.sleep(60) # 1 dakika bekle ve tekrar tara
+            
         except Exception as e:
-            print("BINANCE HATA:", e, flush=True); time.sleep(10)
-
-# ==========================================
-# MEXC MOTORU
-# ==========================================
-def mexc_loop():
-    print("--- MEXC MOTORU BASLADI ---", flush=True)
-    son = {}
-    while True:
-        try:
-            tickers = gj("https://api.mexc.com/api/v3/ticker/24hr")
-            if tickers:
-                all_coins = [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
-                print(f"[{time.strftime('%H:%M:%S')}] MEXC TARANIYOR | Coin: {len(all_coins)}", flush=True)
-                for s in all_coins:
-                    try:
-                        k = gj(f"https://api.mexc.com/api/v3/klines?symbol={s}&interval=1m&limit=25")
-                        if not k or len(k) < 22: continue
-                        
-                        kapanmis = k[:-1]
-                        closes = [float(x[4]) for x in kapanmis]
-                        canli = k[-1]
-                        
-                        acilis = float(canli[1])
-                        su_anki = float(canli[4])
-                        hacim = float(canli[5])
-                        fiyat_degisim = ((su_anki - acilis) / acilis) * 100
-                        
-                        v_ort = sum(float(x[5]) for x in kapanmis[-20:]) / 20
-                        if v_ort == 0: continue
-                        hacim_orani = hacim / v_ort
-                        
-                        if fiyat_degisim >= 3.0 and hacim_orani >= 2.5:
-                            if time.time() - son.get(s, 0) >= 1800:
-                                ticker = gj(f"https://api.mexc.com/api/v3/ticker/24hr?symbol={s}")
-                                if not ticker: continue
-                                
-                                taker_pct = 50
-                                trades = gj(f"https://api.mexc.com/api/v3/trades?symbol={s}&limit=100")
-                                if trades and isinstance(trades, list):
-                                    buy_vol = sum(float(t["qty"]) for t in trades if t["isBuyerMaker"] == False)
-                                    total_vol = sum(float(t["qty"]) for t in trades)
-                                    if total_vol > 0: taker_pct = (buy_vol / total_vol) * 100
-                                
-                                h24 = float(ticker["highPrice"])
-                                l24 = float(ticker["lowPrice"])
-                                rsi = calculate_rsi(closes)
-                                
-                                pair = s.replace("USDT", "/USDT")
-                                coin = s.replace("USDT", "")
-                                hacim_bari = "💰" * int(min(hacim_orani, 10))
-                                rsi_emoji = "🔴" if rsi > 70 else "🟢" if rsi < 30 else ""
-                                
-                                msg = (f"<b>#{s}</b> 💚 <b>Price +{format(fiyat_degisim, '.2f')}% Vol</b>\n"
-                                       f"❌ {format(hacim_orani, '.1f')} {hacim_bari} (M5 Spot)\n\n"
-                                       f"Total Vol {(hacim, '.0f')} Taker {format(taker_pct, '.0f')}% Rsi/{format(rsi, '.0f')}{rsi_emoji}\n"
-                                       f"────────────────\n\n"
-                                       f"🏷 Start Price: <code>{format(acilis, '.5f')}</code>\n"
-                                       f"🏷 Current Price: <code>{format(su_anki, '.5f')}</code> 🚀 pump\n"
-                                       f"🕐 24h: {format(float(ticker['priceChangePercent']), '+.2f')}% Vol {format(float(ticker['quoteVolume'])/1000000, '.2f')}M\n"
-                                       f"⬆ High: {format(h24, '.4f')} ({format(((h24 - su_anki)/su_anki)*100, '.2f')}%)\n"
-                                       f"⬇ Low: {format(l24, '.4f')} ({format(((su_anki - l24)/l24)*100, '+.2f')}%)\n\n"
-                                       f"🔗 <b>MEXC</b>")
-                                tg(msg)
-                                son[s] = time.time()
-                                print(f">>> MEXC SINYAL: {s}", flush=True)
-                        time.sleep(0.2)
-                    except: pass
-            time.sleep(60)
-        except Exception as e:
-            print("MEXC HATA:", e, flush=True); time.sleep(10)
+            print("KUCOIN HATA:", e, flush=True)
+            time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -184,6 +146,5 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    threading.Thread(target=binance_loop, daemon=True).start()
-    threading.Thread(target=mexc_loop, daemon=True).start()
+    threading.Thread(target=kucoin_loop, daemon=True).start()
     run_web_server()
