@@ -19,74 +19,70 @@ def gj(u):
     except:
         return None
 
-def binance_loop():
-    print("--- SADECE BINANCE MOTORU BASLADI ---", flush=True)
+def kucoin_loop():
+    print("--- SADECE KUCOIN MOTORU BASLADI ---", flush=True)
     son = {}
     
-    # Başlangıçta tüm Binance Futures coinlerini al
+    # Başlangıçta tüm KuCoin USDT paritelerini al
     all_coins = []
     while not all_coins:
-        print("Binance coin listesi aliniyor...", flush=True)
-        tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
-        if tickers:
-            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
+        print("KuCoin coin listesi aliniyor...", flush=True)
+        tickers = gj("https://api.kucoin.com/api/v1/market/allTickers")
+        if tickers and tickers.get("code") == "200000":
+            all_coins = [t["symbol"] for t in tickers["data"]["ticker"] if t["symbol"].endswith("-USDT")]
         if not all_coins: time.sleep(10)
             
-    print(f"BINANCE COIN SAYISI: {len(all_coins)}", flush=True)
-    tg(f"🔥 <b>BINANCE MEGA PUMP BOTU AKTIF</b>\n{len(all_coins)} coin izleniyor.")
+    print(f"KUCOIN COIN SAYISI: {len(all_coins)}", flush=True)
+    tg(f"🔥 <b>KUCOIN DIKEY PUMP BOTU AKTIF</b>\n{len(all_coins)} coin izleniyor.")
 
     while True:
         try:
-            print(f"[{time.strftime('%H:%M:%S')}] BINANCE TARAMASI BASLIYOR", flush=True)
+            print(f"[{time.strftime('%H:%M:%S')}] KUCOIN TARAMASI BASLIYOR", flush=True)
             sayac = 0
             
-            for s in all_coins:
+            for sym in all_coins:
                 try:
-                    # 1 DAKIKALIK mumlar (Anlık DOODUSDT tarzı pump'ları yakalamak için)
-                    k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=1m&limit=25")
-                    if not k or len(k) < 22: 
-                        time.sleep(0.05)
+                    # 1 DAKIKALIK mumlar (DOODUSDT gibi dikey çubukları anında görmek için)
+                    k = gj(f"https://api.kucoin.com/api/v1/market/candles?type=1min&symbol={sym}&limit=25")
+                    if not k or k.get("code") != "200000" or len(k["data"]) < 22: 
+                        time.sleep(0.15)
                         continue
                     
-                    canli = k[-1] # Şu an oluşan mum
-                    acilis = float(canli[1])
-                    su_anki = float(canli[4])
-                    hacim = float(canli[7])
+                    # KuCoin veriyi tersten verir: [0] en son, [1] bir önceki...
+                    k_list = k["data"]
+                    canli = k_list[0]
                     
+                    acilis = float(canli[1])
+                    su_anki = float(canli[2])
+                    
+                    # Anlık fiyat değişimi (Mum açılışından bu yana)
                     fiyat_degisim = ((su_anki - acilis) / acilis) * 100
                     
-                    # Hacim Oranı
-                    v_ort = sum(float(x[7]) for x in k[:-1][-20:]) / 20
-                    if v_ort == 0: 
-                        time.sleep(0.05)
-                        continue
-                        
-                    hacim_orani = hacim / v_ort
-                    
-                    # FİLTRE: Sadece %10 ve üzeri artan devasa pump'lar (Görseldeki gibi)
-                    if fiyat_degisim >= 10.0 and hacim_orani >= 2.0:
-                        if time.time() - son.get(s, 0) >= 1800: # 30 dk cooldown
+                    # FİLTRE: DOODUSDT gibi büyük hareketler için %10 ve üzeri artış
+                    # (İstersen bu oranı düşürebiliriz ama görseldeki gibi %80'lik artışlar için 10 idealdir)
+                    if fiyat_degisim >= 10.0:
+                        if time.time() - son.get(sym, 0) >= 1800: # 30 dk cooldown
                             
-                            coin = s.replace("USDT", "")
+                            coin = sym.replace("-USDT", "")
                             
                             # GÖRSELDEKİ SADE FORMAT
                             msg = (f"🟢 <b>#{coin}: +{format(fiyat_degisim, '.2f')}%</b> 🔔\n"
-                                   f"<b>BINANCE</b>")
+                                   f"<b>KUCOIN</b>")
                             tg(msg)
-                            son[s] = time.time()
+                            son[sym] = time.time()
                             sayac += 1
-                            print(f">>> BINANCE MEGA PUMP: {s}", flush=True)
+                            print(f">>> KUCOIN DIKEY PUMP: {sym}", flush=True)
                     
-                    time.sleep(0.05) 
+                    time.sleep(0.15) # KuCoin API'sini yormamak icin bekle
                     
                 except:
                     pass
             
-            print(f"[{time.strftime('%H:%M:%S')}] BINANCE TARAMASI BITTI - Sinyal: {sayac}", flush=True)
+            print(f"[{time.strftime('%H:%M:%S')}] KUCOIN TARAMASI BITTI - Sinyal: {sayac}", flush=True)
             time.sleep(60) # 1 dakika bekle
             
         except Exception as e:
-            print("BINANCE HATA:", e, flush=True)
+            print("KUCOIN HATA:", e, flush=True)
             time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
@@ -105,5 +101,5 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    threading.Thread(target=binance_loop, daemon=True).start()
+    threading.Thread(target=kucoin_loop, daemon=True).start()
     run_web_server()
