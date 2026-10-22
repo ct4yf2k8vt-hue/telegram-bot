@@ -38,7 +38,7 @@ def calculate_rsi(prices, period=14):
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 def bot_loop():
-    print("--- PROFESYONEL BOT BASLADI (LONG + SHORT) ---", flush=True)
+    print("--- AGRESIF PRO BOT BASLADI (M5 LONG + SHORT) ---", flush=True)
     son_long = {}
     son_short = {}
 
@@ -51,11 +51,11 @@ def bot_loop():
                 time.sleep(10)
                 continue
                 
-            # Akıllı Ön Filtre: Sadece 24s'de %5+ hareket edenler (Sistemi yormaz)
+            # Ön Filtre: Son 24s'de %2'den fazla hareket edenler (Havuzu geniş tutuyoruz)
             hedef_coinler = []
             for t in tickers:
                 if t["symbol"].endswith("USDT"):
-                    if abs(float(t["priceChangePercent"])) >= 5.0:
+                    if abs(float(t["priceChangePercent"])) >= 2.0:
                         hedef_coinler.append(t["symbol"])
 
             print(f"[{tr_saat()}] Potansiyel Coin: {len(hedef_coinler)}", flush=True)
@@ -64,7 +64,8 @@ def bot_loop():
 
             for s in hedef_coinler:
                 try:
-                    k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=15m&limit=30")
+                    # 5 DAKİKALIK mumlar (Anlık pump'ları kaçırmamak için)
+                    k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=30")
                     if not k or len(k) < 25: continue
                     
                     kapanmis = k[:-1]
@@ -80,36 +81,52 @@ def bot_loop():
                     if v_ort == 0: continue
                     hacim_orani = hacim / v_ort
 
-                    # --- 1. LONG (PUMP) KONTROLÜ ---
+                    # --- 1. AGRESIF LONG (PUMP) KONTROLÜ ---
                     fiyat_degisim = ((su_anki - acilis) / acilis) * 100
-                    if fiyat_degisim >= 3.0 and hacim_orani >= 2.0:
-                        if time.time() - son_long.get(s, 0) >= 1800: # 30 dk cooldown
+                    if fiyat_degisim >= 2.0 and hacim_orani >= 2.0:
+                        if time.time() - son_long.get(s, 0) >= 300: # 5 DAKİKA COOLDOWN
                             t_info = next((t for t in tickers if t["symbol"] == s), None)
                             if t_info:
                                 h24 = float(t_info["highPrice"])
+                                l24 = float(t_info["lowPrice"])
+                                degisim24 = float(t_info["priceChangePercent"])
+                                hacim24 = float(t_info["quoteVolume"])
+                                
+                                taker_pct = 50
+                                taker = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={s}&period=5m&limit=1")
+                                if taker and len(taker) > 0: taker_pct = float(taker[0]["buySellRatio"]) * 100
+
+                                rsi_deger = calculate_rsi(closes)
+                                
                                 coin = s.replace("USDT", "")
                                 hacim_bari = "💰" * int(min(hacim_orani, 10))
+                                rsi_emoji = "🔴" if rsi_deger > 70 else "🟢" if rsi_deger < 30 else ""
                                 
-                                msg_long = (f"🚀 <b>LONG PUMP - {coin}</b>\n\n"
-                                            f"💰 Price: <code>{format(acilis, '.4f')}</code> ➜ <code>{format(su_anki, '.4f')}</code> (+{format(fiyat_degisim, '.2f')}%)\n"
-                                            f"📊 Volume: {format(hacim, '.0f')} (+{format((hacim_orani-1)*100, '.0f')}%) {hacim_bari}\n"
-                                            f"⬆ 24s High: <code>{format(h24, '.4f')}</code>\n"
-                                            f"🕒 {tr_saat()}\n\n"
-                                            f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>")
+                                msg_long = (f"<b>#{s}</b> 💚 <b>Price +{format(fiyat_degisim, '.2f')}% Vol</b>\n"
+                                            f"❌ {format(hacim_orani, '.1f')} {hacim_bari} (M5 Futures)\n\n"
+                                            f"Total Vol {format(hacim, '.0f')} Taker {format(taker_pct, '.0f')}% Rsi/{format(rsi_deger, '.0f')}{rsi_emoji}\n"
+                                            f"────────────────\n\n"
+                                            f"🏷 Price: {format(su_anki, '.4f')} 🚀 pump ···\n"
+                                            f"🕐 24h: {format(degisim24, '+.2f')}% Vol {format(hacim24/1000000, '.2f')}M\n"
+                                            f"⬆ High: {format(h24, '.4f')} ({format(((h24 - su_anki)/su_anki)*100, '.2f')}%)\n"
+                                            f"⬇ Low: {format(l24, '.4f')} ({format(((su_anki - l24)/l24)*100, '+.2f')}%)\n\n"
+                                            f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n"
+                                            f"🕒 {tr_saat()}")
                                 tg(msg_long)
                                 son_long[s] = time.time()
                                 long_sayac += 1
                                 print(f">>> LONG SINYAL: {s}", flush=True)
 
-                    # --- 2. SHORT (REVERSAL) KONTROLÜ ---
+                    # --- 2. AGRESIF SHORT (REVERSAL) KONTROLÜ ---
                     rsi_deger = calculate_rsi(closes)
-                    if rsi_deger >= 70 and hacim_orani >= 2.5 and su_anki < acilis:
-                        if (zirve - su_anki) >= (zirve * 0.005):
-                            funding_data = gj(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={s}")
-                            funding_rate = float(funding_data["lastFundingRate"]) * 100 if funding_data else 0
+                    # Short için eşikleri biraz esnettik (RSI 65 ve üzeri, mumun kırmızıya dönmesi)
+                    if rsi_deger >= 65 and hacim_orani >= 2.0 and su_anki < acilis:
+                        if (zirve - su_anki) >= (zirve * 0.003): # Zirveden %0.3 düşüş yeterli
+                            funding_data = gj(f"https://fapi.binance.com/fapi/v1/premium(fIndex?symbol={s}")
+                            funding_rate = floatunding_data["lastFundingRate"]) * 100 if funding_data else 0
                             
-                            if funding_rate >= 0.01:
-                                if time.time() - son_short.get(s, 0) >= 3600: # 1 saat cooldown
+                            if funding_rate >= 0.005: # Funding biraz pozitifse
+                                if time.time() - son_short.get(s, 0) >= 300: # 5 DAKİKA COOLDOWN
                                     
                                     giris = su_anki
                                     stop_loss = zirve * 1.005
@@ -124,7 +141,7 @@ def bot_loop():
                                                      f"🚨 <b>Neden Short?</b>\n"
                                                      f"🔥 RSI: {format(rsi_deger, '.1f')} (Aşırı Alım)\n"
                                                      f"📊 Hacim: {format(hacim_orani, '.1f')}x (Patlama)\n"
-                                                     f"💰 Funding: %{format(funding_rate, '.3f')} (Long Sıkışması)\n"
+                                                     f"💰 Funding: %{format(funding_rate, '.3f')}\n"
                                                      f"🔄 Dönüş: Zirveden reddedilme\n\n"
                                                      f"🎯 <b>İşlem Planı:</b>\n"
                                                      f"Entry: <code>{format(giris, '.5f')}</code>\n"
@@ -138,7 +155,7 @@ def bot_loop():
                                         short_sayac += 1
                                         print(f">>> SHORT SINYAL: {s}", flush=True)
 
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                 except:
                     pass
             
