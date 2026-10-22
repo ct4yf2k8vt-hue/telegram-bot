@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 
+# Türkiye Saati
 def tr_saat():
     return (datetime.utcnow() + timedelta(hours=3)).strftime('%H:%M:%S')
 
@@ -37,23 +38,24 @@ def calculate_rsi(prices, period=14):
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 def bot_loop():
-    print("--- TEST MODU BASLADI (DUSUK FILTRE) ---", flush=True)
+    print("--- PROFESYONEL BOT BASLADI (LONG + SHORT) ---", flush=True)
     son_long = {}
     son_short = {}
 
     while True:
         try:
             print(f"[{tr_saat()}] TARAMA BASLIYOR...", flush=True)
+            
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers: 
                 time.sleep(10)
                 continue
                 
+            # Akıllı Ön Filtre: Sadece 24s'de %5+ hareket edenler (Sistemi yormaz)
             hedef_coinler = []
             for t in tickers:
                 if t["symbol"].endswith("USDT"):
-                    # TEST İÇİN: 24s'de %1 hareket edenleri bile alıyoruz
-                    if abs(float(t["priceChangePercent"])) >= 1.0:
+                    if abs(float(t["priceChangePercent"])) >= 5.0:
                         hedef_coinler.append(t["symbol"])
 
             print(f"[{tr_saat()}] Potansiyel Coin: {len(hedef_coinler)}", flush=True)
@@ -67,6 +69,7 @@ def bot_loop():
                     
                     kapanmis = k[:-1]
                     closes = [float(x[4]) for x in kapanmis]
+                    
                     canli_mum = k[-1]
                     acilis = float(canli_mum[1])
                     su_anki = float(canli_mum[4])
@@ -77,39 +80,70 @@ def bot_loop():
                     if v_ort == 0: continue
                     hacim_orani = hacim / v_ort
 
-                    # --- TEST LONG FİLTRESİ (Çok Düşük) ---
+                    # --- 1. LONG (PUMP) KONTROLÜ ---
                     fiyat_degisim = ((su_anki - acilis) / acilis) * 100
-                    if fiyat_degisim >= 0.5 and hacim_orani >= 1.0: # Sadece %0.5 artış ve normal hacim yeter
-                        if time.time() - son_long.get(s, 0) >= 60: # 1 dk cooldown
+                    if fiyat_degisim >= 3.0 and hacim_orani >= 2.0:
+                        if time.time() - son_long.get(s, 0) >= 1800: # 30 dk cooldown
                             t_info = next((t for t in tickers if t["symbol"] == s), None)
                             if t_info:
-                                msg_long = (f"🧪 <b>TEST LONG - {s}</b>\n"
-                                            f"Fiyat: +{format(fiyat_degisim, '.2f')}% | Hacim: {format(hacim_orani, '.1f')}x\n"
-                                            f"Saat: {tr_saat()}")
+                                h24 = float(t_info["highPrice"])
+                                coin = s.replace("USDT", "")
+                                hacim_bari = "💰" * int(min(hacim_orani, 10))
+                                
+                                msg_long = (f"🚀 <b>LONG PUMP - {coin}</b>\n\n"
+                                            f"💰 Price: <code>{format(acilis, '.4f')}</code> ➜ <code>{format(su_anki, '.4f')}</code> (+{format(fiyat_degisim, '.2f')}%)\n"
+                                            f"📊 Volume: {format(hacim, '.0f')} (+{format((hacim_orani-1)*100, '.0f')}%) {hacim_bari}\n"
+                                            f"⬆ 24s High: <code>{format(h24, '.4f')}</code>\n"
+                                            f"🕒 {tr_saat()}\n\n"
+                                            f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>")
                                 tg(msg_long)
                                 son_long[s] = time.time()
                                 long_sayac += 1
-                                print(f">>> TEST LONG: {s}", flush=True)
+                                print(f">>> LONG SINYAL: {s}", flush=True)
 
-                    # --- TEST SHORT FİLTRESİ (Çok Düşük) ---
+                    # --- 2. SHORT (REVERSAL) KONTROLÜ ---
                     rsi_deger = calculate_rsi(closes)
-                    # RSI 45 üzeri ve fiyat kırmızıya dönerse hemen short at (Test için)
-                    if rsi_deger >= 45 and su_anki < acilis and hacim_orani >= 1.0:
-                        if time.time() - son_short.get(s, 0) >= 60:
-                            msg_short = (f"🧪 <b>TEST SHORT - {s}</b>\n"
-                                         f"RSI: {format(rsi_deger, '.1f')} | Hacim: {format(hacim_orani, '.1f')}x\n"
-                                         f"Saat: {tr_saat()}")
-                            tg(msg_short)
-                            son_short[s] = time.time()
-                            short_sayac += 1
-                            print(f">>> TEST SHORT: {s}", flush=True)
+                    if rsi_deger >= 70 and hacim_orani >= 2.5 and su_anki < acilis:
+                        if (zirve - su_anki) >= (zirve * 0.005):
+                            funding_data = gj(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={s}")
+                            funding_rate = float(funding_data["lastFundingRate"]) * 100 if funding_data else 0
+                            
+                            if funding_rate >= 0.01:
+                                if time.time() - son_short.get(s, 0) >= 3600: # 1 saat cooldown
+                                    
+                                    giris = su_anki
+                                    stop_loss = zirve * 1.005
+                                    risk = stop_loss - giris
+                                    if risk > 0:
+                                        take_profit = giris - (risk * 1.5)
+                                        risk_pct = (risk / giris) * 100
+                                        tp_pct = ((giris - take_profit) / giris) * 100
+                                        coin = s.replace("USDT", "")
+                                        
+                                        msg_short = (f"🔴 <b>SHORT REVERSAL - {coin}</b>\n\n"
+                                                     f"🚨 <b>Neden Short?</b>\n"
+                                                     f"🔥 RSI: {format(rsi_deger, '.1f')} (Aşırı Alım)\n"
+                                                     f"📊 Hacim: {format(hacim_orani, '.1f')}x (Patlama)\n"
+                                                     f"💰 Funding: %{format(funding_rate, '.3f')} (Long Sıkışması)\n"
+                                                     f"🔄 Dönüş: Zirveden reddedilme\n\n"
+                                                     f"🎯 <b>İşlem Planı:</b>\n"
+                                                     f"Entry: <code>{format(giris, '.5f')}</code>\n"
+                                                     f"Stop Loss: <code>{format(stop_loss, '.5f')}</code> (+%{format(risk_pct, '.2f')})\n"
+                                                     f"Take Profit: <code>{format(take_profit, '.5f')}</code> (-%{format(tp_pct, '.2f')})\n"
+                                                     f"⚖️ R:R Oranı: 1:1.5\n\n"
+                                                     f"🕒 {tr_saat()}\n"
+                                                     f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>")
+                                        tg(msg_short)
+                                        son_short[s] = time.time()
+                                        short_sayac += 1
+                                        print(f">>> SHORT SINYAL: {s}", flush=True)
 
                     time.sleep(0.1)
                 except:
                     pass
             
             print(f"[{tr_saat()}] TARAMA BITTI | Long: {long_sayac} | Short: {short_sayac}", flush=True)
-            time.sleep(30) # Test için 30 saniye bekle
+            time.sleep(60)
             
         except Exception as e:
             print("HATA:", e, flush=True)
