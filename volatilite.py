@@ -23,7 +23,7 @@ def gj(u):
         return None
 
 def bot_loop():
-    print("--- TÜREV VERİ ANALİZ BOTU BAŞLADI ---", flush=True)
+    print("--- IBMB TARZI PUMP ALERT BOTU BAŞLADI ---", flush=True)
     son = {}
 
     while True:
@@ -34,8 +34,8 @@ def bot_loop():
                 time.sleep(10)
                 continue
                 
-            # Sadece 24 saatlik hacmi 5 Milyon USDT üzeri olan likit coinleri tara
-            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT") and float(t.get("quoteVolume", 0)) > 5000000]
+            # Sadece 24 saatlik hacmi 1 Milyon USDT üzeri olanları al (API banını önler)
+            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT") and float(t.get("quoteVolume", 0)) > 1000000]
             toplam = len(all_coins)
             sayac = 0
             
@@ -44,60 +44,45 @@ def bot_loop():
                     if (i + 1) % 50 == 0:
                         print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Taranıyor... ({i+1}/{toplam})", flush=True)
 
-                    # 1 saatlik periyotta son 24 mumu çek (son 2 kapanmış mumu kullanacağız)
-                    k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=1h&limit=24")
-                    if not k or len(k) < 24: continue
+                    # 15 dakikalık (15m) grafikte son 2 mumu çekiyoruz
+                    k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=15m&limit=2")
+                    if not k or len(k) < 2: continue
                     
-                    kapanmis = k[:-1]  # Kapanmamış anlık mumu hariç tut
-                    simdiki_mum = kapanmis[-1]
-                    onceki_mum = kapanmis[-2]
+                    onceki_mum = k[0]
+                    simdiki_mum = k[1]
                     
-                    # Mum verileri: [0]=Açılış Zamanı, [4]=Kapanış Fiyatı, [7]=USDT Hacmi, [8]=İşlem Sayısı
+                    # Mum verileri: [4]=Kapanış Fiyatı, [7]=USDT Hacmi
                     simdiki_fiyat = float(simdiki_mum[4])
                     onceki_fiyat = float(onceki_mum[4])
                     simdiki_hacim = float(simdiki_mum[7])
                     onceki_hacim = float(onceki_mum[7])
-                    simdiki_trades = int(simdiki_mum[8])
-                    onceki_trades = int(onceki_mum[8])
                     
                     if onceki_fiyat == 0 or onceki_hacim == 0: continue
                     
+                    # Hesaplamalar
                     fiyat_degisim = ((simdiki_fiyat - onceki_fiyat) / onceki_fiyat) * 100
-                    hacim_degisim_pct = ((simdiki_hacim - onceki_hacim) / onceki_hacim) * 100
-                    trades_degisim_pct = ((simdiki_trades - onceki_trades) / onceki_trades) * 100 if onceki_trades > 0 else 0
+                    hacim_farki = simdiki_hacim - onceki_hacim
+                    hacim_degisim_pct = (hacim_farki / onceki_hacim) * 100
                     
-                    # TETİKLEYİCİ: Sadece 1 saatlik fiyat artışı %5 ve üzeri ise (Pump)
-                    if fiyat_degisim >= 5.0:
-                        if time.time() - son.get(s, 0) >= 3600:  # Aynı coin için 1 saat bekle
-                            
-                            # --- TÜREV VERİLERİNİ ÇEK ---
-                            # Açık Pozisyon (Open Interest) - Anlık ve 1 saat önceki
-                            oi_simdi_data = gj(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={s}")
-                            oi_simdi = float(oi_simdi_data['openInterest']) if oi_simdi_data else 0
-                            
-                            # Long/Short Oranı (LSR) - Son 1 saatlik
-                            lsr_data = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={s}&period=1h&limit=2")
-                            lsr_deger = 0.0
-                            lsr_degisim = 0.0
-                            if lsr_data and len(lsr_data) >= 2:
-                                lsr_deger = float(lsr_data[-1]['longShortRatio'])
-                                lsr_onceki = float(lsr_data[-2]['longShortRatio'])
-                                lsr_degisim = ((lsr_deger - lsr_onceki) / lsr_onceki) * 100 if lsr_onceki > 0 else 0
-                            
-                            # OI Değişimini hesapla (basitleştirilmiş: anlık OI'yi önceki mumun hacmine oranla)
-                            oi_degisim = hacim_degisim_pct * 0.1  # Tahmini bir değer (gerçek OI geçmişi için ekstra API gerekir)
+                    # TETİKLEYİCİ FİLTRE: Görseldeki gibi sert hareketler
+                    # Fiyat en az %3 artmış VE Hacim en az %20 artmış VE Hacim farkı 10.000$'dan büyükse
+                    if fiyat_degisim >= 3.0 and hacim_degisim_pct >= 20.0 and hacim_farki > 10000:
+                        if time.time() - son.get(s, 0) >= 1800: # 30 dk bekleme
                             
                             coin = s.replace("USDT", "")
-                            saat_simdi = datetime.now(TR_Saati).strftime('%Y-%m-%d %H:%M:%S UTC')
+                            saat_simdi = datetime.now(TR_Saati).strftime('%H:%M:%S')
                             
-                            # GÖRSELDEKİ TAM FORMATTA MESAJ
+                            # Hacimleri K (Bin) formatına çevirme
+                            hacim_str = f"${simdiki_hacim/1000:.2f}K"
+                            hacim_farki_str = f"${hacim_farki/1000:.2f}K"
+                            
+                            # GÖRSELDEKİ BİREBİR FORMAT
                             msg = (f"🚀 <b>Pump - {coin}/USDT [Binance]</b>\n"
-                                   f"💲 <b>Price:</b> {format(simdiki_fiyat, '.4f')} | <b>{format(fiyat_degisim, '+.1f')}%</b>\n"
-                                   f"📊 <b>Vol:</b> +${format(simdiki_hacim/1000000, '.1f')}M | <b>{format(hacim_degisim_pct, '+.1f')}%</b>\n"
-                                   f"📈 <b>OI:</b> +${format(oi_simdi, '.0f')} | <b>{format(oi_degisim, '+.1f')}%</b>\n"
-                                   f"⚖️ <b>LSR:</b> {format(lsr_deger, '.2f')} | <b>{format(lsr_degisim, '+.1f')}%</b>\n"
-                                   f"🤝 <b>Trades:</b> {format(simdiki_trades/1000, '.1f')}K | <b>{format(trades_degisim_pct, '+.1f')}%</b>\n"
-                                   f"🕐 <b>Time:</b> {saat_simdi} 🕐\n\n"
+                                   f"Pump Activity on {coin}/USDT 🟢 🟢\n"
+                                   f"💰 <b>Price:</b> ${format(onceki_fiyat, '.2f')} ➔ ${format(simdiki_fiyat, '.2f')} (<b>{format(fiyat_degisim, '+.2f')}%</b>)\n"
+                                   f"📊 <b>Volume:</b> {hacim_str} (<b>{format(hacim_degisim_pct, '+.2f')}%</b>)\n"
+                                   f"Volume increased by {hacim_farki_str} ⬆️\n\n"
+                                   f"⏰ {saat_simdi}\n"
                                    f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n"
                                    f"<b>${coin} #{coin}</b>")
                             
@@ -106,12 +91,12 @@ def bot_loop():
                             sayac += 1
                             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] >>> SİNYAL GÖNDERİLDİ: {s}", flush=True)
                             
-                    time.sleep(0.2)  # API limitini korumak için
+                    time.sleep(0.2) # API limitini korumak için
                 except Exception as e:
                     pass
                     
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BİTTİ | Gönderilen Sinyal: {sayac}", flush=True)
-            print(f"--- 15 Saniye Bekleniyor (Yeni Tur İçin) ---", flush=True)
+            print(f"--- 15 Saniye Bekleniyor ---", flush=True)
             time.sleep(15) 
             
         except Exception as e:
