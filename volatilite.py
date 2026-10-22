@@ -22,36 +22,48 @@ def gj(u):
     except:
         return None
 
+def get_all_symbols():
+    """Binance'teki TÜM Spot ve Futures paritelerini tek seferde çeker."""
+    symbols = []
+    # Spot pariteleri
+    spot_info = gj("https://api.binance.com/api/v3/exchangeInfo")
+    if spot_info and 'symbols' in spot_info:
+        for s in spot_info['symbols']:
+            if s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT':
+                symbols.append(('SPOT', s['symbol'], 'https://api.binance.com'))
+                
+    # Futures pariteleri
+    fut_info = gj("https://fapi.binance.com/fapi/v1/exchangeInfo")
+    if fut_info and 'symbols' in fut_info:
+        for s in fut_info['symbols']:
+            if s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT':
+                symbols.append(('FUTURES', s['symbol'], 'https://fapi.binance.com'))
+    return symbols
+
 def bot_loop():
-    print("--- IBMB TARZI PUMP ALERT BOTU BAŞLADI ---", flush=True)
+    print("--- ABNORMAL VOLATILITY BOTU (SPOT + FUTURES) BAŞLADI ---", flush=True)
     son = {}
+    all_symbols = get_all_symbols()
+    toplam = len(all_symbols)
+    print(f"Taranacak Toplam Parite: {toplam}", flush=True)
 
     while True:
         try:
-            print(f"\n[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BAŞLIYOR...", flush=True)
-            tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
-            if not tickers: 
-                time.sleep(10)
-                continue
-                
-            # Sadece 24 saatlik hacmi 1 Milyon USDT üzeri olanları al (API banını önler)
-            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT") and float(t.get("quoteVolume", 0)) > 1000000]
-            toplam = len(all_coins)
+            print(f"\n[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] YENİ TUR BAŞLIYOR ({toplam} Parite)...", flush=True)
             sayac = 0
             
-            for i, s in enumerate(all_coins):
+            for i, (market, symbol, base_url) in enumerate(all_symbols):
                 try:
                     if (i + 1) % 50 == 0:
                         print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Taranıyor... ({i+1}/{toplam})", flush=True)
 
-                    # 15 dakikalık (15m) grafikte son 2 mumu çekiyoruz
-                    k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=15m&limit=2")
+                    # 15 dakikalık grafikte son 2 mumu çek
+                    k = gj(f"{base_url}/api/v3/klines?symbol={symbol}&interval=15m&limit=2" if market == 'SPOT' else f"{base_url}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=2")
                     if not k or len(k) < 2: continue
                     
                     onceki_mum = k[0]
                     simdiki_mum = k[1]
                     
-                    # Mum verileri: [4]=Kapanış Fiyatı, [7]=USDT Hacmi
                     simdiki_fiyat = float(simdiki_mum[4])
                     onceki_fiyat = float(onceki_mum[4])
                     simdiki_hacim = float(simdiki_mum[7])
@@ -59,45 +71,38 @@ def bot_loop():
                     
                     if onceki_fiyat == 0 or onceki_hacim == 0: continue
                     
-                    # Hesaplamalar
                     fiyat_degisim = ((simdiki_fiyat - onceki_fiyat) / onceki_fiyat) * 100
-                    hacim_farki = simdiki_hacim - onceki_hacim
-                    hacim_degisim_pct = (hacim_farki / onceki_hacim) * 100
+                    hacim_degisim_pct = ((simdiki_hacim - onceki_hacim) / onceki_hacim) * 100
                     
-                    # TETİKLEYİCİ FİLTRE: Görseldeki gibi sert hareketler
-                    # Fiyat en az %3 artmış VE Hacim en az %20 artmış VE Hacim farkı 10.000$'dan büyükse
-                    if fiyat_degisim >= 3.0 and hacim_degisim_pct >= 20.0 and hacim_farki > 10000:
-                        if time.time() - son.get(s, 0) >= 1800: # 30 dk bekleme
+                    # --- ABNORMAL VOLATILITY MANTIĞI ---
+                    # Fiyat en az %5 değişmiş VE Hacim en az %50 artmışsa
+                    if abs(fiyat_degisim) >= 5.0 and hacim_degisim_pct >= 50.0:
+                        if time.time() - son.get(symbol, 0) >= 1800: # 30 dk bekleme
                             
-                            coin = s.replace("USDT", "")
+                            coin = symbol.replace("USDT", "")
                             saat_simdi = datetime.now(TR_Saati).strftime('%H:%M:%S')
                             
-                            # Hacimleri K (Bin) formatına çevirme
-                            hacim_str = f"${simdiki_hacim/1000:.2f}K"
-                            hacim_farki_str = f"${hacim_farki/1000:.2f}K"
-                            
-                            # GÖRSELDEKİ BİREBİR FORMAT
-                            msg = (f"🚀 <b>Pump - {coin}/USDT [Binance]</b>\n"
-                                   f"Pump Activity on {coin}/USDT 🟢 🟢\n"
-                                   f"💰 <b>Price:</b> ${format(onceki_fiyat, '.2f')} ➔ ${format(simdiki_fiyat, '.2f')} (<b>{format(fiyat_degisim, '+.2f')}%</b>)\n"
-                                   f"📊 <b>Volume:</b> {hacim_str} (<b>{format(hacim_degisim_pct, '+.2f')}%</b>)\n"
-                                   f"Volume increased by {hacim_farki_str} ⬆️\n\n"
-                                   f"⏰ {saat_simdi}\n"
-                                   f"🔗 <a href='https://www.binance.com/en/futures/{s}'>Pair on Binance.</a>\n"
+                            # GÖRSELDEKİ FORMAT (100eyes tarzı)
+                            msg = (f"📊 <b>[{symbol}] Abnormal Volatility Alert (15m)</b>\n"
+                                   f"Market: <b>{market}</b>\n"
+                                   f"💰 Price: ${format(simdiki_fiyat, '.4f')} (<b>{format(fiyat_degisim, '+.2f')}%</b>)\n"
+                                   f"📊 Volume: ${format(simdiki_hacim/1000, '.2f')}K (<b>{format(hacim_degisim_pct, '+.2f')}%</b>)\n\n"
+                                   f"🔗 <a href='https://www.binance.com/en/trade/{symbol}?type=spot'>Spot Grafiği</a> | "
+                                   f"<a href='https://www.binance.com/en/futures/{symbol}'>Futures Grafiği</a>\n"
                                    f"<b>${coin} #{coin}</b>")
                             
                             tg(msg)
-                            son[s] = time.time()
+                            son[symbol] = time.time()
                             sayac += 1
-                            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] >>> SİNYAL GÖNDERİLDİ: {s}", flush=True)
+                            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] >>> SİNYAL GÖNDERİLDİ: {symbol} ({market})", flush=True)
                             
-                    time.sleep(0.2) # API limitini korumak için
+                    time.sleep(0.1) # API limitini korumak için minimum bekleme
                 except Exception as e:
                     pass
                     
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BİTTİ | Gönderilen Sinyal: {sayac}", flush=True)
-            print(f"--- 15 Saniye Bekleniyor ---", flush=True)
-            time.sleep(15) 
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TUR BİTTİ | Sinyal: {sayac}", flush=True)
+            print(f"--- 30 Saniye Bekleniyor ---", flush=True)
+            time.sleep(30) 
             
         except Exception as e:
             print(f"ANA DÖNGÜ HATASI: {e} - 10 sn sonra devam edecek.", flush=True)
