@@ -15,13 +15,16 @@ def tg(m):
     try:
         d = urllib.parse.urlencode({"chat_id": C, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
         urllib.request.urlopen("https://api.telegram.org/bot" + T + "/sendMessage", d, timeout=10).read()
-    except:
-        pass
+    except Exception as e:
+        print("TELEGRAM HATASI:", e, flush=True)
 
 def gj(u):
     try:
-        return json.loads(urllib.request.urlopen(u, timeout=10).read().decode())
-    except:
+        req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+        return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+    except Exception as e:
+        # API hatasını loga bas (Kodun çökmesini engeller)
+        print(f"API HATASI ({u[:40]}...): {e}", flush=True)
         return None
 
 def calculate_rsi(prices, period=14):
@@ -38,7 +41,7 @@ def calculate_rsi(prices, period=14):
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 def bot_loop():
-    print("--- AGRESIF PRO BOT BASLADI (M5 LONG + SHORT) ---", flush=True)
+    print("--- DUZELTILMIS AGRESIF BOT BASLADI (M5) ---", flush=True)
     son_long = {}
     son_short = {}
 
@@ -48,10 +51,11 @@ def bot_loop():
             
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers: 
+                print("Ticker verisi alinamadi, 10 sn bekleniyor...", flush=True)
                 time.sleep(10)
                 continue
                 
-            # Ön Filtre: Son 24s'de %2'den fazla hareket edenler (Havuzu geniş tutuyoruz)
+            # Havuzu geniş tutuyoruz (Hareket eden potansiyel coinler)
             hedef_coinler = []
             for t in tickers:
                 if t["symbol"].endswith("USDT"):
@@ -64,9 +68,11 @@ def bot_loop():
 
             for s in hedef_coinler:
                 try:
-                    # 5 DAKİKALIK mumlar (Anlık pump'ları kaçırmamak için)
+                    # 5 DAKİKALIK mumlar
                     k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=30")
-                    if not k or len(k) < 25: continue
+                    if not k or len(k) < 25: 
+                        time.sleep(0.2)
+                        continue
                     
                     kapanmis = k[:-1]
                     closes = [float(x[4]) for x in kapanmis]
@@ -78,7 +84,9 @@ def bot_loop():
                     hacim = float(canli_mum[7])
 
                     v_ort = sum(float(x[7]) for x in kapanmis[-20:]) / 20
-                    if v_ort == 0: continue
+                    if v_ort == 0: 
+                        time.sleep(0.2)
+                        continue
                     hacim_orani = hacim / v_ort
 
                     # --- 1. AGRESIF LONG (PUMP) KONTROLÜ ---
@@ -94,7 +102,9 @@ def bot_loop():
                                 
                                 taker_pct = 50
                                 taker = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={s}&period=5m&limit=1")
-                                if taker and len(taker) > 0: taker_pct = float(taker[0]["buySellRatio"]) * 100
+                                if taker and len(taker) > 0: 
+                                    try: taker_pct = float(taker[0]["buySellRatio"]) * 100
+                                    except: pass
 
                                 rsi_deger = calculate_rsi(closes)
                                 
@@ -115,17 +125,16 @@ def bot_loop():
                                 tg(msg_long)
                                 son_long[s] = time.time()
                                 long_sayac += 1
-                                print(f">>> LONG SINYAL: {s}", flush=True)
+                                print(f">>> LONG SINYAL GONDERILDI: {s}", flush=True)
 
                     # --- 2. AGRESIF SHORT (REVERSAL) KONTROLÜ ---
                     rsi_deger = calculate_rsi(closes)
-                    # Short için eşikleri biraz esnettik (RSI 65 ve üzeri, mumun kırmızıya dönmesi)
                     if rsi_deger >= 65 and hacim_orani >= 2.0 and su_anki < acilis:
-                        if (zirve - su_anki) >= (zirve * 0.003): # Zirveden %0.3 düşüş yeterli
-                            funding_data = gj(f"https://fapi.binance.com/fapi/v1/premium(fIndex?symbol={s}")
-                            funding_rate = floatunding_data["lastFundingRate"]) * 100 if funding_data else 0
+                        if (zirve - su_anki) >= (zirve * 0.003): 
+                            funding_data = gj(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={s}")
+                            funding_rate = float(funding_data["lastFundingRate"]) * 100 if funding_data else 0
                             
-                            if funding_rate >= 0.005: # Funding biraz pozitifse
+                            if funding_rate >= 0.005: 
                                 if time.time() - son_short.get(s, 0) >= 300: # 5 DAKİKA COOLDOWN
                                     
                                     giris = su_anki
@@ -153,17 +162,19 @@ def bot_loop():
                                         tg(msg_short)
                                         son_short[s] = time.time()
                                         short_sayac += 1
-                                        print(f">>> SHORT SINYAL: {s}", flush=True)
+                                        print(f">>> SHORT SINYAL GONDERILDI: {s}", flush=True)
 
-                    time.sleep(0.05)
-                except:
-                    pass
+                    # API BAN YEMEMEK ICIN HER COIN ARASINDA 0.2 SANIYE BEKLE
+                    time.sleep(0.2)
+                except Exception as e:
+                    print(f"Coin Analiz Hatasi ({s}): {e}", flush=True)
+                    time.sleep(0.2)
             
             print(f"[{tr_saat()}] TARAMA BITTI | Long: {long_sayac} | Short: {short_sayac}", flush=True)
             time.sleep(60)
             
         except Exception as e:
-            print("HATA:", e, flush=True)
+            print("ANA DONGU HATASI:", e, flush=True)
             time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
