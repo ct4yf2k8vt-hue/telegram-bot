@@ -22,8 +22,15 @@ def gj(u):
     try:
         req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
         return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 418:
+            print("BINANCE API BANI (418): 60 saniye bekleniyor...", flush=True)
+            time.sleep(60) # Ban yediğinde 60 saniye bekle
+            return None
+        else:
+            print(f"API HATASI ({u[:40]}...): {e}", flush=True)
+            return None
     except Exception as e:
-        # API hatasını loga bas (Kodun çökmesini engeller)
         print(f"API HATASI ({u[:40]}...): {e}", flush=True)
         return None
 
@@ -41,7 +48,7 @@ def calculate_rsi(prices, period=14):
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 def bot_loop():
-    print("--- DUZELTILMIS AGRESIF BOT BASLADI (M5) ---", flush=True)
+    print("--- DUZELTILMIS BOT BASLADI (BAN KORUMALI) ---", flush=True)
     son_long = {}
     son_short = {}
 
