@@ -1,82 +1,83 @@
 import ccxt
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import time
 
-# Borsa Bağlantısı (Örnek: Binance. Kendi borsanı yazabilirsin)
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    # 'apiKey': 'SENIN_API_KEY', # Sadece veri çekmek için gerek yok, işlem yapmak için gerekli
-    # 'secret': 'SENIN_SECRET_KEY',
-})
+# Binance Spot ve Futures borsalarını başlat
+spot_exchange = ccxt.binance({'enableRateLimit': True})
+futures_exchange = ccxt.binanceusdm({'enableRateLimit': True})
 
-def analyze_coin(symbol):
+def get_all_symbols(exchange, market_type):
+    """Borsadaki tüm USDT paritelerini çeker ve likidite filtresinden geçirir."""
+    markets = exchange.load_markets()
+    symbols = []
+    for sym in markets:
+        if markets[sym]['quote'] == 'USDT' and markets[sym]['active']:
+            # 24 saatlik hacim kontrolü (Likidite Filtresi)
+            ticker = exchange.fetch_ticker(sym)
+            if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000: # 5 Milyon USDT altını tarama
+                symbols.append(sym)
+    return symbols
+
+def detect_pump(exchange, symbol):
     try:
-        # 1. 15 Dakikalık (m15) Mum Verilerini Çek (Son 200 mum)
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=200)
+        # Son 20 mumu çek (Hacim ortalaması için)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # 2. İndikatörleri Hesapla
-        # MA 20 ve MA 200
-        df['MA20'] = ta.sma(df['close'], length=20)
-        df['MA200'] = ta.sma(df['close'], length=200)
+        # Son mumun hacmi ve fiyat değişimi
+        current_vol = df['volume'].iloc[-1]
+        prev_vol_avg = df['volume'].iloc[:-1].mean() # Son 19 mumun ortalaması
         
-        # RSI (14)
-        df['RSI'] = ta.rsi(df['close'], length=14)
-        
-        # MACD (12, 26, 9)
-        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        df['MACD'] = macd['MACD_12_26_9']
-        
-        # Anlık Fiyat ve Değişim (Delta)
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[-2]
-        delta = ((current_price - prev_price) / prev_price) * 100
+        price_change_pct = ((current_price - prev_price) / prev_price) * 100
         
-        # MA'lara olan uzaklık (%)
-        dist_ma20 = ((current_price - df['MA20'].iloc[-1]) / df['MA20'].iloc[-1]) * 100
-        dist_ma200 = ((current_price - df['MA200'].iloc[-1]) / df['MA200'].iloc[-1]) * 100
+        # --- SİNYAL MANTIĞI (Gelişmiş) ---
+        # 1. Hacim patlaması: Anlık hacim, ortalamanın en az 3 katı mı? (Dinamik eşik)
+        volume_spike = current_vol > (prev_vol_avg * 3)
         
-        current_rsi = df['RSI'].iloc[-1]
-        current_macd = df['MACD'].iloc[-1]
+        # 2. Fiyat ivmesi: Fiyat en az %1.5 artmış mı?
+        price_momentum = price_change_pct > 1.5
         
-        # 3. EXHAUSTION (Tükenmişlik) Mantığı
-        # Botun mantığı: RSI aşırı alım (70 üstü) veya aşırı satım (30 altı) ise VE fiyat MA20'den çok uzaksa tükenmiştir.
-        exhaustion = "NO"
-        if current_rsi > 70 and dist_ma20 > 5:
-            exhaustion = "YES 🔥"
-        elif current_rsi < 30 and dist_ma20 < -5:
-            exhaustion = "YES 🔥"
-            
-        # 4. Rapor Formatını Yazdır (Görseldeki gibi)
-        print(f"# {symbol}:")
-        print(f"m15 Delta: {delta:.2f} %")
-        print(f"Exhaustion: {exhaustion}")
-        print(f"+{dist_ma20:.2f}% to 20 MA")
-        print(f"+{dist_ma200:.2f}% to 200 MA")
-        print(f"RSI: {current_rsi:.1f}")
-        print(f"$ {current_price} ({delta:.1f}%)")
-        print(f"MACD: {current_macd:.5f}")
-        print("-" * 30)
+        # 3. Z-Skoru (İstatistiksel anormallik): Hacim gerçekten sıra dışı mı?
+        vol_std = df['volume'].iloc[:-1].std()
+        z_score = (current_vol - prev_vol_avg) / vol_std if vol_std > 0 else 0
+        is_anomaly = z_score > 2.5 # Ortalamadan 2.5 standart sapma uzaksa gerçek bir anormalidir
         
-        # Likidite Bölgesi / Direnç (Basitleştirilmiş Destek-Direnç)
-        # Son 50 mumun en yükseği ve en düşüğü
-        resistance = df['high'].rolling(window=50).max().iloc[-1]
-        liquidity_zone = df['low'].rolling(window=50).min().iloc[-1]
-        print(f"1D RESISTANCE: ${resistance:.5f}")
-        print(f"LIQUIDITY ZONE: ${liquidity_zone:.5f}")
-        print("=" * 40)
-
+        if volume_spike and price_momentum and is_anomaly:
+            return {
+                "symbol": symbol,
+                "price": current_price,
+                "change": price_change_pct,
+                "volume": current_vol,
+                "vol_mult": current_vol / prev_vol_avg,
+                "z_score": z_score
+            }
     except Exception as e:
-        print(f"Hata oluştu ({symbol}): {e}")
+        pass # API hatası durumunda sessizce geç
+    return None
 
-# Test etmek istediğin coinler
-coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-
-print("Bot Başlatıldı, Piyasa Taranıyor...\n")
-while True:
-    for coin in coins:
-        analyze_coin(coin)
+# --- ANA DÖNGÜ ---
+if __name__ == "__main__":
+    print("Bot başlatıldı. Spot ve Futures piyasaları taranıyor...")
     
-    print("15 saniye bekleniyor...")
-    time.sleep(15) # Sürekli tarama yapmaması için bekleme süresi
+    # Başlangıçta sembol listelerini al
+    spot_symbols = get_all_symbols(spot_exchange, 'spot')
+    futures_symbols = get_all_symbols(futures_exchange, 'futures')
+    
+    while True:
+        # SPOT Taraması
+        for sym in spot_symbols:
+            signal = detect_pump(spot_exchange, sym)
+            if signal:
+                print(f"🚀 SPOT PUMP: {signal['symbol']} | Fiyat: {signal['price']:.5f} | Değişim: %{signal['change']:.2f} | Hacim Katı: {signal['vol_mult']:.1f}x | Z-Skor: {signal['z_score']:.2f}")
+        
+        # FUTURES Taraması
+        for sym in futures_symbols:
+            signal = detect_pump(futures_exchange, sym)
+            if signal:
+                print(f"🔥 FUTURES PUMP: {signal['symbol']} | Fiyat: {signal['price']:.5f} | Değişim: %{signal['change']:.2f} | Hacim Katı: {signal['vol_mult']:.1f}x | Z-Skor: {signal['z_score']:.2f}")
+        
+        print("Tarama tamamlandı, 10 saniye bekleniyor...\n")
+        time.sleep(10) # API limitlerini aşmamak için bekle
