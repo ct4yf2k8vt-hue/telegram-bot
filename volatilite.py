@@ -19,7 +19,9 @@ def tg(m):
 
 def gj(u):
     try:
-        return json.loads(urllib.request.urlopen(u, timeout=10).read().decode())
+        # Binance'in botları engellememesi için normal tarayıcı gibi görünüyoruz
+        req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
     except:
         return None
 
@@ -29,52 +31,57 @@ def bot_loop():
 
     while True:
         try:
-            # Tüm USDT paritelerini tek seferde çek
+            # Tüm USDT paritelerini çek
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers: 
+                print("Ticker verisi alinamadi, 10 sn bekleniyor...", flush=True)
                 time.sleep(10)
                 continue
                 
-            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
+            # FİLTRE: Sadece 24 saatlik hacmi 1.000.000 USDT üzeri olanları al (API banını önler)
+            all_coins = []
+            for t in tickers:
+                if t["symbol"].endswith("USDT"):
+                    try:
+                        hacim24 = float(t["quoteVolume"])
+                        if hacim24 > 1000000: # 1 Milyon USDT üzeri
+                            all_coins.append(t["symbol"])
+                    except:
+                        pass
+                        
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BASLIYOR | Coin: {len(all_coins)}", flush=True)
             sayac = 0
             
             for s in all_coins:
                 try:
-                    # Görseldeki gibi 5 dakikalık grafik (5m) kullanıyoruz. Son 3 mum yeterli.
+                    # Görseldeki gibi 5 dakikalık grafik (5m). Son 3 mum yeterli.
                     k = gj("https://fapi.binance.com/fapi/v1/klines?symbol=" + s + "&interval=5m&limit=3")
                     if not k or len(k) < 3: continue
                     
-                    # Kapanmış son mumu ve bir önceki mumu alıyoruz
                     son_mum = k[-2] 
                     onceki_mum = k[-3]
                     
-                    # Verileri float'a çevir
                     simdiki_fiyat = float(son_mum[4])
                     onceki_fiyat = float(onceki_mum[4])
                     simdiki_hacim = float(son_mum[7]) # USDT hacmi
                     onceki_hacim = float(onceki_mum[7])
                     
-                    # Değişim hesaplamaları
                     if onceki_fiyat == 0 or onceki_hacim == 0: continue
                     
                     fiyat_degisim = ((simdiki_fiyat - onceki_fiyat) / onceki_fiyat) * 100
                     hacim_farki = simdiki_hacim - onceki_hacim
                     hacim_degisim_pct = (hacim_farki / onceki_hacim) * 100
                     
-                    # GÖRSELDEKİ FİLTRE MANTIĞI:
-                    # Fiyat aniden %2'den fazla artmış VE Hacim bir önceki muma göre en az 2 katına (%100 artmış) çıkmışsa
+                    # FİLTRE: Fiyat %2+ VE Hacim %100+ (2 katı) artmışsa
                     if fiyat_degisim >= 2.0 and hacim_degisim_pct >= 100.0:
-                        # Aynı coin için 30 dakika içinde tekrar bildirim atmasını engelle
-                        if time.time() - son.get(s, 0) >= 1800:
+                        if time.time() - son.get(s, 0) >= 1800: # 30 dk bekleme
                             
-                            # Saat formatı: 10:48:26 AM şeklinde
                             saat_simdi = datetime.now(TR_Saati).strftime('%I:%M:%S %p')
                             coin = s.replace("USDT", "")
                             
-                            # GÖRSELDEKİ TAM FORMAT
+                            # GÖRSELDEKİ TAM FORMAT (Yazım hatası düzeltildi)
                             msg = (f"🚀 <b>Pump - {coin}/USDT [Binance]</b>\n"
-                                   f"💲 <b>Price:</b> {format(onceki_fiyat, '.5f')} ➔ {format(sim Renderdiki'd_fiyat, '.5f')} (<b>{format(fiyat_degisim, '+.1f')}%</b>)\n"
+                                   f"💲 <b>Price:</b> {format(onceki_fiyat, '.5f')} ➔ {format(simdiki_fiyat, '.5f')} (<b>{format(fiyat_degisim, '+.1f')}%</b>)\n"
                                    f"📊 <b>Volume:</b> {format(simdiki_hacim, '.0f')} (<b>{format(hacim_degisim_pct, '+.0f')} %</b>)\n"
                                    f"Volume increased by {format(hacim_farki, '.0f')} ⬆️\n"
                                    f"Time: {saat_simdi} 🕐\n\n"
@@ -86,12 +93,12 @@ def bot_loop():
                             sayac += 1
                             print(f">>> PUMP SINYALI GONDERILDI: {s}", flush=True)
                             
-                    time.sleep(0.05) # API'yi yormamak için
+                    time.sleep(0.2) # API BANINI ÖNLEMEK İÇİN HIZI YAVAŞLATTIK (Saniyede 5 istek)
                 except:
                     pass
                     
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TARAMA BITTI - Sinyal: {sayac}", flush=True)
-            time.sleep(30) # 5m grafikler için 30 saniyede bir tarama yeterli ve hızlıdır.
+            time.sleep(30) 
         except Exception as e:
             print("HATA:", e, flush=True)
             time.sleep(10)
