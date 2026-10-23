@@ -12,78 +12,82 @@ def tg(m):
     try:
         d = urllib.parse.urlencode({"chat_id": C, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
         urllib.request.urlopen("https://api.telegram.org/bot" + T + "/sendMessage", d, timeout=10).read()
-    except:
-        pass
+    except Exception as e:
+        print(f"Telegram Hatası: {e}", flush=True)
 
 def gj(u):
     try:
         req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
         return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
-    except:
+    except Exception as e:
+        print(f"API Hatası ({u}): {e}", flush=True)
         return None
 
 def bot_loop():
-    print("--- SADECE SPOT: 5M GERÇEK PATLAMA BOTU BAŞLADI ---", flush=True)
+    print("--- SADECE SPOT: DEBUG MODUNDA BAŞLADI ---", flush=True)
     son = {}
 
     while True:
         try:
-            # 1. ADIM: Tek istekle Spot piyasanın 24 saatlik özetini al
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Spot piyasa özeti çekiliyor...", flush=True)
+            print(f"\n[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] 1. ADIM: Binance'e bağlanılıyor...", flush=True)
             
             spot_tickers = gj("https://api.binance.com/api/v3/ticker/24hr")
             
             if not spot_tickers:
-                print("Binance API yanıt vermedi, 3 saniye bekleniyor...", flush=True)
-                time.sleep(3)
+                print("HATA: Binance'den veri çekilemedi! (API engeli veya internet sorunu)", flush=True)
+                time.sleep(5)
                 continue
 
-            adaylar = []
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] 2. ADIM: Veri çekildi. {len(spot_tickers)} adet coin filtreleniyor...", flush=True)
 
-            # FİLTRE 1: Sadece USDT pariteleri, 24s değişimi %3'ten fazla VE 24s Hacmi 5 Milyon Dolar'dan büyük olanlar
+            adaylar = []
             for t in spot_tickers:
                 if t['symbol'].endswith('USDT'):
-                    degisim = float(t['priceChangePercent'])
-                    hacim24 = float(t['quoteVolume'])
-                    
-                    if abs(degisim) >= 3.0 and hacim24 >= 5000000: # En az 5 Milyon Dolar Hacim (Ölü coinleri engeller)
-                        adaylar.append(t['symbol'])
+                    try:
+                        degisim = float(t['priceChangePercent'])
+                        hacim24 = float(t['quoteVolume'])
+                        
+                        # Filtre: 24s'de %3+ değişen ve 5 Milyon Dolar üzeri hacmi olanlar
+                        if abs(degisim) >= 3.0 and hacim24 >= 5000000: 
+                            adaylar.append(t['symbol'])
+                    except:
+                        pass
 
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Ön filtre: {len(adaylar)} hacimli coin bulundu. 5m mumları inceleniyor...", flush=True)
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] 3. ADIM: Filtreden {len(adaylar)} adet aday geçti. Mumlar kontrol ediliyor...", flush=True)
+
+            if len(adaylar) == 0:
+                print("-> Şu an piyasada 24s'de %3'ten fazla hareket eden büyük hacimli coin yok. Bekleniyor...", flush=True)
+            else:
+                print(f"-> Taranacak Adaylar: {adaylar}", flush=True)
 
             sayac = 0
             for symbol in adaylar:
                 try:
-                    # 2. ADIM: 5 Dakikalık (5m) grafikte son 2 kapanmış mumu çek
+                    # 5 dakikalık mumu çek
                     k = gj(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=3")
                     if not k or len(k) < 3: continue
                     
-                    # k[-1] = Şu an oluşan anlık mum (KULLANMIYORUZ)
-                    # k[-2] = YENİ KAPANAN MUM (Görseldeki gibi)
                     kapanan_mum = k[-2]
                     onceki_mum = k[-3]
                     
                     simdiki_fiyat = float(kapanan_mum[4])
                     onceki_fiyat = float(onceki_mum[4])
-                    simdiki_hacim = float(kapanan_mum[7]) # USDT Hacmi
+                    simdiki_hacim = float(kapanan_mum[7])
                     onceki_hacim = float(onceki_mum[7])
                     
                     if onceki_fiyat == 0 or onceki_hacim == 0: continue
                     
-                    # Hesaplamalar (Görseldeki mantık)
                     fiyat_degisim = ((simdiki_fiyat - onceki_fiyat) / onceki_fiyat) * 100
                     hacim_farki = simdiki_hacim - onceki_hacim
-                    hacim_degisim_pct = (hacim_farki / onceki_hacim) * 100
+                    hacim_degisim_pct = (hacim_farki / onceki_hacim) * 100 if onceki_hacim > 0 else 0
                     
-                    # --- 3. ADIM: DEVASA PATLAMA FİLTRESİ (Görseldeki gibi) ---
-                    # Fiyat en az %3 artmış VE Hacim en az %500 (5 Kat) artmışsa
+                    # Kontrol: Fiyat %3+ ve Hacim %500+ (5 Kat)
                     if fiyat_degisim >= 3.0 and hacim_degisim_pct >= 500.0:
-                        if time.time() - son.get(symbol, 0) >= 1800: # Aynı coini 30 dk'da 1 kez bildir
+                        if time.time() - son.get(symbol, 0) >= 1800: 
                             
                             coin = symbol.replace("USDT", "")
                             saat_simdi = datetime.now(TR_Saati).strftime('%I:%M:%S %p')
                             
-                            # GÖRSELDEKİ BİREBİR FORMAT (SOPH/USDT gibi)
                             msg = (f"🚀 <b>Pump - {coin}/USDT [Binance]</b>\n"
                                    f"💰 <b>Price:</b> {format(onceki_fiyat, '.5f')} ➔ {format(simdiki_fiyat, '.5f')} (<b>{format(fiyat_degisim, '+.1f')}%</b>)\n"
                                    f"📊 <b>Volume:</b> {format(simdiki_hacim, '.0f')} (<b>{format(hacim_degisim_pct, '+.0f')} %</b>)\n"
@@ -95,17 +99,21 @@ def bot_loop():
                             tg(msg)
                             son[symbol] = time.time()
                             sayac += 1
-                            print(f"🔥 DEV PATLAMA: {symbol} | Hacim: +%{hacim_degisim_pct:.0f} | Fiyat: +%{fiyat_degisim:.1f}", flush=True)
+                            print(f">>> BİNG! SİNYAL GÖNDERİLDİ: {symbol}", flush=True)
+                    else:
+                        # Sinyal olmasa bile ne kadar hacim/fiyat değişimi olduğunu loga basalım (Debug için)
+                        if hacim_degisim_pct > 100: # Sadece hacmi en az 2 katına çıkanları loga basalım ki ekran dolsun
+                            print(f"    Kontrol: {symbol} - Fiyat: %{fiyat_degisim:.1f}, Hacim: %{hacim_degisim_pct:.0f} (Kriteri karşılamadı)", flush=True)
                             
                 except Exception as e:
-                    pass
+                    print(f"Coin İşleme Hatası ({symbol}): {e}", flush=True)
                     
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur tamamlandı. Sinyal: {sayac}. Yeni tur başlıyor...\n", flush=True)
-            time.sleep(2) 
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] TUR BİTTİ | Sinyal: {sayac}. 5 sn sonra tekrar taranacak...", flush=True)
+            time.sleep(5) 
             
         except Exception as e:
-            print(f"HATA: {e}", flush=True)
-            time.sleep(2)
+            print(f"ANA DÖNGÜ HATASI: {e}", flush=True)
+            time.sleep(5)
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
