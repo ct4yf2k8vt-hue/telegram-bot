@@ -2,7 +2,7 @@ import urllib.request, urllib.parse, json, time
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer # DEĞİŞTİ
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
@@ -22,7 +22,6 @@ def gj(u):
     except:
         return None
 
-# Sayıları M (Milyon) ve K (Bin) formatına çeviren yardımcı fonksiyon
 def format_number(num):
     if abs(num) >= 1000000:
         return f"{num/1000000:.1f}M"
@@ -44,7 +43,6 @@ def bot_loop():
                 time.sleep(3)
                 continue
 
-            # Sadece USDT pariteleri ve 5 Milyon Dolar üzeri hacmi olanlar
             adaylar = []
             for t in tickers:
                 if t['symbol'].endswith('USDT'):
@@ -60,9 +58,7 @@ def bot_loop():
             sayac = 0
             for s in adaylar:
                 try:
-                    # 1. ADIM: 1 Saatlik (1h) gra_responsefik(te son 2 kapanmış mumu200 çek
-                    k = gj(f"https)
-://fapi.binance.com/f       api/v1/klines?symbol={s}&interval=1h&limit=3")
+                    k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=1h&limit=3")
                     if not k or len(k) < 3: continue
                     
                     kapanan_mum = k[-2]
@@ -81,12 +77,9 @@ def bot_loop():
                     hacim_degisim = ((hacim_simdi - hacim_onceki) / hacim_onceki) * 100
                     trade_degisim = ((trade_simdi - trade_onceki) / trade_onceki) * 100
                     
-                    # TETİKLEYİCİ: Sadece 1 saatte %5'ten fazla düşen veya çıkanlar (Pump veya Dump)
                     if abs(fiyat_degisim) >= 5.0:
-                        if time.time() - son.get(s, 0) >= 3600: # Aynı coini 1 saatte sadece 1 kez bildir
+                        if time.time() - son.get(s, 0) >= 3600: 
                             
-                            # 2. ADIM: Türev Verilerini Çek (Sadece sinyal geldiğinde)
-                            # Open Interest (Açık Pozisyon)
                             oi_hist = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={s}&period=1h&limit=2")
                             oi_fark = 0.0
                             oi_degisim = 0.0
@@ -96,7 +89,6 @@ def bot_loop():
                                 oi_fark = oi_simdi - oi_onceki
                                 oi_degisim = ((oi_simdi - oi_onceki) / oi_onceki) * 100 if oi_onceki > 0 else 0
                             
-                            # Long/Short Ratio (LSR)
                             lsr_hist = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={s}&period=1h&limit=2")
                             lsr_deger = 0.0
                             lsr_degisim = 0.0
@@ -105,7 +97,6 @@ def bot_loop():
                                 lsr_onceki = float(lsr_hist[-2]['longShortRatio'])
                                 lsr_degisim = lsr_deger - lsr_onceki
                                 
-                            # Görseldeki yönü belirle
                             if fiyat_degisim < 0:
                                 emoji = "💀"
                                 yon_text = "Price Dump"
@@ -116,7 +107,6 @@ def bot_loop():
                             saat_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
                             coin = s.replace("USDT", "")
                             
-                            # 3. ADIM: GÖRSELDEKİ BİREBİR FORMAT
                             msg = (f"🚨 <b>{s}</b>\n"
                                    f"{emoji} <b>{yon_text} {format(fiyat_degisim, '.1f')}% (1h)</b>\n"
                                    f"⏱ {saat_utc}\n\n"
@@ -135,7 +125,7 @@ def bot_loop():
                             sayac += 1
                             print(f"🔥 SİNYAL ({yon_text}): {s} | Değişim: %{fiyat_degisim:.1f}", flush=True)
                             
-                    time.sleep(0.1) # API limitini korumak için
+                    time.sleep(0.1)
                 except Exception as e:
                     pass
                     
@@ -146,7 +136,6 @@ def bot_loop():
             print(f"ANA DÖNGÜ HATASI: {e} - 5 sn sonra devam edilecek.", flush=True)
             time.sleep(5)
 
-# Bekçi fonksiyonu: Bot çökerse yeniden başlatır
 def thread_manager():
     while True:
         try:
@@ -165,17 +154,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is running!")
     def do_HEAD(self):
-        self.send self.end_headers()
+        self.send_response(200)
+        self.end_headers()
 
 def run_web_server():
+    # Render'ın hata vermemesi için portu hemen bağlıyoruz
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    print("WEB SUNUCUSU BAŞLADI - PORT:", port, flush=True)
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"WEB SUNUCUSU BAŞLADI - PORT: {port}", flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
+    # Önce web sunucusunu başlat (Render'ın port hatasını çözer)
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    # Sonra botları başlat
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.name = "BotThread"
     bot_thread.start()
+    
+    # Bekçiyi başlat
     threading.Thread(target=thread_manager, daemon=True).start()
-    run_web_server()
+    
+    # Ana thread'i açık tut
+    while True:
+        time.sleep(10)
