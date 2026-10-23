@@ -2,11 +2,15 @@ import urllib.request, urllib.parse, json, time
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer # DEĞİŞTİ
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 TR_Saati = timezone(timedelta(hours=3))
+
+# --- WATCHDOG (BEKÇİ) İÇİN GLOBAL DEĞİŞKENLER ---
+LAST_PING = time.time()
+WATCHDOG_LIMIT = 120 # 2 dakika boyunca log gelmezse botu yeniden başlat
 
 def tg(m):
     try:
@@ -31,7 +35,8 @@ def format_number(num):
         return f"{num:.0f}"
 
 def bot_loop():
-    print("--- XDECOW TARZI TÜREV ANALİZ BOTU BAŞLADI ---", flush=True)
+    global LAST_PING
+    print("--- XDECOW TARZI TÜREV ANALİZ BOTU BAŞLADI (WATCHDOG AKTİF) ---", flush=True)
     son = {}
 
     while True:
@@ -56,8 +61,12 @@ def bot_loop():
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] {len(adaylar)} likit coin bulundu. 1H mumları inceleniyor...", flush=True)
 
             sayac = 0
-            for s in adaylar:
+            for i, s in enumerate(adaylar):
                 try:
+                    # LOGLARIN SÜREKLİ AKMASI İÇİN HER 20 COİNDE BİR EKRANA YAZ
+                    if (i + 1) % 20 == 0:
+                        print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Taranıyor... ({i+1}/{len(adaylar)})", flush=True)
+
                     k = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=1h&limit=3")
                     if not k or len(k) < 3: continue
                     
@@ -105,7 +114,6 @@ def bot_loop():
                                 yon_text = "Price Pump"
                                 
                             saat_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                            coin = s.replace("USDT", "")
                             
                             msg = (f"🚨 <b>{s}</b>\n"
                                    f"{emoji} <b>{yon_text} {format(fiyat_degisim, '.1f')}% (1h)</b>\n"
@@ -130,23 +138,23 @@ def bot_loop():
                     pass
                     
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur Bitti. Sinyal: {sayac}. 5 sn sonra yeni tur...\n", flush=True)
+            
+            # TUR BAŞARIYLA BİTTİ, BEKÇİYİ BESLE
+            LAST_PING = time.time()
             time.sleep(5) 
             
         except Exception as e:
             print(f"ANA DÖNGÜ HATASI: {e} - 5 sn sonra devam edilecek.", flush=True)
             time.sleep(5)
 
-def thread_manager():
+# --- WATCHDOG (BEKÇİ) FONKSİYONU ---
+def watchdog():
+    global LAST_PING
     while True:
-        try:
-            if not any(t.name == "BotThread" and t.is_alive() for t in threading.enumerate()):
-                print("!!! TARAMA MOTORU DURDU, YENİDEN BAŞLATILIYOR !!!", flush=True)
-                bot_thread = threading.Thread(target=bot_loop, daemon=True)
-                bot_thread.name = "BotThread"
-                bot_thread.start()
-        except Exception as e:
-            pass
-        time.sleep(15)
+        time.sleep(10) # Her 10 saniyede bir kontrol et
+        if time.time() - LAST_PING > WATCHDOG_LIMIT:
+            print(f"\n!!! BOT {WATCHDOG_LIMIT} SANİYEDİR YANIT VERMİYOR. ZORLA YENİDEN BAŞLATILIYOR !!!", flush=True)
+            os._exit(1) # Programı tamamen kapat (Render otomatik açacak)
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -158,23 +166,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 def run_web_server():
-    # Render'ın hata vermemesi için portu hemen bağlıyoruz
     port = int(os.environ.get("PORT", 10000))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"WEB SUNUCUSU BAŞLADI - PORT: {port}", flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Önce web sunucusunu başlat (Render'ın port hatasını çözer)
+    # 1. Web sunucusunu başlat
     threading.Thread(target=run_web_server, daemon=True).start()
     
-    # Sonra botları başlat
+    # 2. Bekçiyi (Watchdog) başlat
+    threading.Thread(target=watchdog, daemon=True).start()
+    
+    # 3. Tarama motorunu başlat
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.name = "BotThread"
     bot_thread.start()
-    
-    # Bekçiyi başlat
-    threading.Thread(target=thread_manager, daemon=True).start()
     
     # Ana thread'i açık tut
     while True:
