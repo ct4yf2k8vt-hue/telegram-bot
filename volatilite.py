@@ -18,41 +18,48 @@ def tg(m):
 def gj(u):
     try:
         req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        return json.loads(urllib.request.urlopen(req, timeout=15).read().decode()) # Timeout süresini 15 yaptık
+        # Timeout süresini 5 saniyeye düşürdük ki takılırsa hemen hataya düşsün
+        return json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
     except:
         return None
 
 def bot_loop():
-    print("--- BINANCE SPOT 5M PUMP ALARM (ÖLÜMSÜZ MOD) BAŞLADI ---", flush=True)
+    print("--- BINANCE SPOT HIZLI TARAMA BAŞLADI (API DOSTU) ---", flush=True)
     son = {}
 
     while True:
         try:
-            # 1. ADIM: Binance Spot piyasanın anlık özetini çek
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Piyasa özeti çekiliyor...", flush=True)
+            
+            # 1. ADIM: TÜM PİYASAYI TEK İSTEKLE ÇEK
             tickers = gj("https://api.binance.com/api/v3/ticker/24hr")
             
-            # Eğer API çökerse veya boş dönerse döngüye devam et, asla takılma
-            if not tickers: 
-                print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] API yanıt vermedi. 3 saniye sonra tekrar denenecek...", flush=True)
+            if not tickers:
+                print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] API yanıt vermedi. 3 sn bekleniyor...", flush=True)
                 time.sleep(3)
                 continue
-                
-            # 2. ADIM: Sadece USDT pariteleri ve 24s hacmi 2 Milyon Dolar üzeri olanlar
-            all_coins = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT") and float(t.get("quoteVolume", 0)) > 2000000]
-            
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tarama Başladı. ({len(all_coins)} coin kontrol edilecek)", flush=True)
+
+            # 2. ADIM: SADECE HAREKETLİ OLANLARI FİLTRELE (Hız için)
+            adaylar = []
+            for t in tickers:
+                if t['symbol'].endswith('USDT'):
+                    try:
+                        degisim = float(t['priceChangePercent'])
+                        hacim = float(t['quoteVolume'])
+                        # 24s'de %3+ değişen ve hacmi 2M üzeri olanları al
+                        if abs(degisim) >= 3.0 and hacim > 2000000:
+                            adaylar.append(t['symbol'])
+                    except:
+                        pass
+
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Ön filtre: {len(adaylar)} aday bulundu. Mumlar kontrol ediliyor...", flush=True)
+
             sayac = 0
-
-            for i, s in enumerate(all_coins):
+            # 3. ADIM: SADECE ADAYLARIN MUM VERİSİNİ ÇEK (Genelde 10-20 coindir, çok hızlıdır)
+            for s in adaylar:
                 try:
-                    # Her 20 coinde bir log at ki Render ekranı sürekli aksın
-                    if (i + 1) % 20 == 0:
-                        print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Taranıyor... ({i+1}/{len(all_coins)})", flush=True)
-
-                    # 3. ADIM: 5 Dakikalık grafikte son 3 mumu çek
                     k = gj(f"https://api.binance.com/api/v3/klines?symbol={s}&interval=5m&limit=3")
-                    if not k or len(k) < 3: 
-                        continue # Mum verisi gelmezse sıradaki coine geç
+                    if not k or len(k) < 3: continue
                     
                     kapanan_mum = k[-2]
                     onceki_mum = k[-3]
@@ -68,7 +75,7 @@ def bot_loop():
                     hacim_farki = hacim_simdi - hacim_onceki
                     hacim_degisim_pct = (hacim_farki / hacim_onceki) * 100 if hacim_onceki > 0 else 0
                     
-                    # 4. ADIM: TETİKLEYİCİ (%6+ Fiyat Artışı)
+                    # 4. ADIM: SİNYAL FİLTRESİ (%6+ Artış)
                     if fiyat_degisim >= 6.0:
                         if time.time() - son.get(s, 0) >= 1800: 
                             
@@ -88,32 +95,29 @@ def bot_loop():
                             sayac += 1
                             print(f"🔥 SİNYAL GÖNDERİLDİ: {s} | Fiyat: +%{fiyat_degisim:.1f}", flush=True)
                             
-                    time.sleep(0.05) # Hafif bekleme
-                except Exception as e:
-                    # Tek bir coin hata verse bile döngüyü bozmadan devam et
+                    time.sleep(0.05) 
+                except:
                     pass
                     
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur Bitti. Sinyal: {sayac}. 3 sn sonra yeni tur...\n", flush=True)
-            time.sleep(3) 
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur Bitti. Sinyal: {sayac}. 5 sn sonra yeni tur...\n", flush=True)
+            time.sleep(5) 
             
         except Exception as e:
-            # Ana döngüde bir şey çökerse ekrana yaz ve devam et
             print(f"ANA DÖNGÜ HATASI: {e} - 5 sn sonra devam edilecek.", flush=True)
             time.sleep(5)
 
-# Thread'in ölüp ölmediğini kontrol eden ve gerekirse yeniden başlatan fonksiyon
+# Bekçi fonksiyonu: Bot çökerse yeniden başlatır
 def thread_manager():
     while True:
         try:
-            # bot_loop thread'i canlı mı diye kontrol et
             if not any(t.name == "BotThread" and t.is_alive() for t in threading.enumerate()):
                 print("!!! TARAMA MOTORU DURDU, YENİDEN BAŞLATILIYOR !!!", flush=True)
                 bot_thread = threading.Thread(target=bot_loop, daemon=True)
                 bot_thread.name = "BotThread"
                 bot_thread.start()
         except Exception as e:
-            print(f"Thread Manager Hatası: {e}", flush=True)
-        time.sleep(30) # Her 30 saniyede bir kontrol et
+            pass
+        time.sleep(10) # Her 10 saniyede bir kontrol et
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -131,13 +135,8 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # 1. Tarama motorunu başlat
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.name = "BotThread"
     bot_thread.start()
-    
-    # 2. Motoru denetleyen Bekçi (Manager) thread'ini başlat
     threading.Thread(target=thread_manager, daemon=True).start()
-    
-    # 3. Web sunucusunu başlat
     run_web_server()
