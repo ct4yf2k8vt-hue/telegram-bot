@@ -23,7 +23,7 @@ def gj(u):
         return None
 
 def bot_loop():
-    print("--- SADECE SPOT: GERÇEK PATLAMA (ANORMAL VOLATİLİTE) BOTU BAŞLADI ---", flush=True)
+    print("--- SADECE SPOT: DEV HACİMLİ GERÇEK PATLAMA BOTU BAŞLADI ---", flush=True)
     son = {}
 
     while True:
@@ -40,55 +40,56 @@ def bot_loop():
 
             adaylar = []
 
-            # Sadece USDT paritelerini ve 24s değişimi %5'ten fazla olanları ön filtreye al (Hız için)
+            # FİLTRE 1: Sadece USDT pariteleri, 24s değişimi %3'ten fazla VE 24s Hacmi 10 Milyon Dolar'dan büyük olanlar
             for t in spot_tickers:
                 if t['symbol'].endswith('USDT'):
                     degisim = float(t['priceChangePercent'])
-                    if abs(degisim) >= 5.0:
+                    hacim24 = float(t['quoteVolume'])
+                    
+                    if abs(degisim) >= 3.0 and hacim24 >= 10000000: # 10 Milyon Dolar Hacim Şartı
                         adaylar.append(t['symbol'])
 
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Ön filtre: {len(adaylar)} hareketli coin bulundu. Mumlar inceleniyor...", flush=True)
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Ön filtre: {len(adaylar)} dev hacimli hareketli coin bulundu. Mumlar inceleniyor...", flush=True)
 
             sayac = 0
             for symbol in adaylar:
                 try:
-                    # 2. ADIM: Son 20 mumu çek (Ortalama hacim hesaplamak için)
+                    # 2. ADIM: Son 21 mumu çek. (En son mum henüz kapanmadığı için onu değil, ondan önceki bitmiş mumu kullanacağız)
                     k = gj(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=15m&limit=21")
                     if not k or len(k) < 21: continue
                     
-                    onceki_mumlar = k[:-1] # Son 20 mum
-                    son_mum = k[-1]        # Şu anki (kapanmak üzere olan veya yeni kapanan) mum
+                    # k[-1] = Şu an oluşan anlık mum (KULLANMIYORUZ)
+                    # k[-2] = YENİ KAPANAN MUM (Sinyal için bunu kullanıyoruz)
+                    kapanan_mum = k[-2]
+                    onceki_mumlar = k[:-2] # Son 20 kapanmış mum
                     
                     # Hacim Hesaplamaları
-                    guncel_hacim = float(son_mum[7])
-                    son_20_mum_hacimleri = [float(m[7]) for m in onceki_mumlar]
+                    guncel_hacim = float(kapanan_mum[7])
+                    son_20_mum_hacimleri = [float(m[7]) for m in onceki_mumlar[-20:]]
                     ortalama_hacim = sum(son_20_mum_hacimleri) / 20
                     
                     if ortalama_hacim == 0: continue
                     
-                    # Hacim kaç katına çıktı? (Örn: 5.4x)
                     hacim_kati = guncel_hacim / ortalama_hacim
                     
                     # Fiyat ve Mum Gövdesi Hesaplamaları
-                    acilis = float(son_mum[1])
-                    kapanis = float(son_mum[4])
+                    acilis = float(kapanan_mum[1])
+                    kapanis = float(kapanan_mum[4])
                     
                     if acilis == 0: continue
                     
-                    # Mum gövdesi yüzdesi (Açılış ve kapanış arasındaki fark)
                     mum_govdesi_pct = abs(kapanis - acilis) / acilis * 100
                     
-                    # --- 3. ADIM: GERÇEK ANORMAL VOLATİLİTE FİLTRESİ ---
-                    # Hacim en az 4 katı olacak VE mum gövdesi en az %3 olacak
-                    if hacim_kati >= 4.0 and mum_govdesi_pct >= 3.0:
-                        if time.time() - son.get(symbol, 0) >= 1800: # 30 dk bekleme
+                    # --- FİLTRE 2: GERÇEK ANORMAL VOLATİLİTE ---
+                    # Hacim en az 5 katı olacak VE mum gövdesi en az %3 olacak
+                    if hacim_kati >= 5.0 and mum_govdesi_pct >= 3.0:
+                        if time.time() - son.get(symbol, 0) >= 3600: # Aynı coini 1 saatte 1 kez bildir
                             
                             coin = symbol.replace("USDT", "")
                             saat_simdi = datetime.now(TR_Saati).strftime('%H:%M:%S')
                             yon_emoji = "🟢" if kapanis > acilis else "🔴"
                             yon_text = "PUMP" if kapanis > acilis else "DUMP"
                             
-                            # GÖRSELDEKİ GİBİ DEVASA MUM FORMATI
                             msg = (f"📊 <b>[{symbol}] Abnormal Volatility Alert (15m)</b>\n"
                                    f"Market: <b>SPOT</b> | Tip: <b>{yon_text} {yon_emoji}</b>\n"
                                    f"💰 Price: ${format(kapanis, '.4f')} (<b>{format(mum_govdesi_pct, '+.2f') if kapanis > acilis else format(-mum_govdesi_pct, '+.2f')}%</b>)\n"
@@ -105,7 +106,7 @@ def bot_loop():
                     pass
                     
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur tamamlandı. Sinyal: {sayac}. Yeni tur başlıyor...\n", flush=True)
-            time.sleep(2) # Loglar akmaya devam etsin
+            time.sleep(2) 
             
         except Exception as e:
             print(f"HATA: {e}", flush=True)
