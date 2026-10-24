@@ -5,16 +5,18 @@ import http.server
 import socketserver
 import threading
 
-# AĞ SEVİYESİNDE KİLİTLENMEYİ ÖNLE (İstekler asla 10 saniyeden fazla beklemez)
 socket.setdefaulttimeout(10)
-
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 TR_Saati = timezone(timedelta(hours=3))
 
 son_sinyaller = {}
-COOLDOWN = 900 # 15 Dakika
-SON_RAPOR = time.time()
+COOLDOWN = 900
+
+# --- RİSK YÖNETİMİ PARAMETRELERİ ---
+TAKE_PROFIT_PCT = 3.0   # %3 Kâr Al
+STOP_LOSS_PCT = 1.5     # %1.5 Zarar Durdur
+RISK_REWARD_RATIO = TAKE_PROFIT_PCT / STOP_LOSS_PCT # 2.0 R/R Oranı
 
 def tg(m):
     try:
@@ -37,30 +39,16 @@ def format_number(num):
     elif abs(num) >= 1_000: return f"{num/1_000:.2f}K"
     else: return f"{num:.2f}"
 
-# --- ANA BOT DÖNGÜSÜ ---
 def bot_loop():
-    global SON_RAPOR
+    tg(f"🚀 <b>Kâr Odaklı Bot Başladı!</b>\nRisk/Ödül Oranı: 1:{RISK_REWARD_RATIO:.1f}\nHedef: %{TAKE_PROFIT_PCT} Kâr / %{STOP_LOSS_PCT} Zarar")
     
-    # Başladığında Telegram'a haber ver
-    tg("🚀 <b>Bot Başlatıldı!</b> Log ekranı donarsa Telegram'a bakın, raporlar oraya gelecek.")
-
     while True:
         try:
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Yeni tarama başlıyor...", flush=True)
-
-            # 1. HER 30 DAKİKADA BİR TELEGRAM'A DURUM RAPORU GÖNDER
-            if time.time() - SON_RAPOR > 1800:
-                tg(f"🤖 <b>Durum Raporu:</b> Bot sorunsuz çalışıyor.\n⏰ {datetime.now(TR_Saati).strftime('%H:%M')}")
-                SON_RAPOR = time.time()
-
-            # 2. PİYASA VERİSİNİ ÇEK
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers:
-                print("Borsa verisi alinamadi, 5 saniye bekleniyor...", flush=True)
                 time.sleep(5)
                 continue
 
-            # 3. FİLTRELE
             adaylar = []
             for t in tickers:
                 if t['symbol'].endswith('USDT'):
@@ -72,15 +60,8 @@ def bot_loop():
                     except:
                         pass
             
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] {len(adaylar)} aday bulundu. Mumlar inceleniyor...", flush=True)
-
-            # 4. KONTROL ET
             for symbol, chg in adaylar:
-                # Her aday kontrol edilirken ekrana yaz (logların akması için)
-                print(f"  -> Kontrol ediliyor: {symbol}", flush=True)
-
                 if symbol in son_sinyaller and (time.time() - son_sinyaller[symbol] < COOLDOWN):
-                    print(f"     {symbol} 15 dk bekleme suresinde. Atlandi.", flush=True)
                     continue
 
                 klines = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=3")
@@ -93,59 +74,39 @@ def bot_loop():
                 if prev_close == 0 or prev_vol == 0: continue
                 
                 price_change_15m = ((curr_close - prev_close) / prev_close) * 100
-                vol_change_15m = ((curr_vol - prev_vol) / prev_vol) * 100
                 
                 if abs(price_change_15m) < 3.0: continue 
                 
-                # Türev verileri
-                oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=15m&limit=2")
-                oi_change_pct, oi_curr = 0, 0
-                if oi_data and len(oi_data) >= 2:
-                    oi_curr = float(oi_data[-1]['sumOpenInterestValue'])
-                    oi_prev = float(oi_data[-2]['sumOpenInterestValue'])
-                    if oi_prev > 0: oi_change_pct = ((oi_curr - oi_prev) / oi_prev) * 100
-                
-                funding_data = gj(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}")
-                funding_rate = float(funding_data['lastFundingRate']) if funding_data else 0
-                
-                depth = gj(f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=100")
-                bids, asks = 0, 0
-                if depth:
-                    bids = sum(float(b[1]) for b in depth['bids'])
-                    asks = sum(float(a[1]) for a in depth['asks'])
-                
+                # --- RİSK YÖNETİMLİ SİNYAL ---
                 is_dump = price_change_15m < 0
-                emoji = "💀" if is_dump else "🚀"
-                action = "Dumping" if is_dump else "Pumping"
+                action = "SHORT" if is_dump else "LONG"
+                emoji = "📉" if is_dump else "📈"
                 
-                msg = (f"{emoji} <b>{symbol} is {action} on Binance-Futures!</b>\n"
-                       f"💵 <b>Price:</b> {format(curr_close, '.4f')} USDT ({format(price_change_15m, '+.2f')}%)\n"
-                       f"📊 <b>24h Vol:</b> {format_number(curr_vol)} USDT\n"
-                       f"📉 <b>Last Vol:</b> {format_number(curr_vol)} ({format(vol_change_15m, '+.2f')}%)\n"
-                       f"⬇️ <b>Price:</b> {format(prev_close, '.4f')} USDT\n"
-                       f"🔴 <b>24h%:</b> {format(chg, '+.2f')}%\n"
-                       f"📥 <b>Vol:</b> {format_number(curr_vol - prev_vol)} USDT\n"
-                       f"💰 <b>OI:</b> {format_number(oi_curr)} ({format(oi_change_pct, '+.2f')}%)\n"
-                       f"🏦 <b>Funding:</b> {format(funding_rate, '+.4f')}%\n\n"
-                       f"<b>Bids & Asks in 20% Range</b>\n"
-                       f"🟢 <b>Bids:</b> {format_number(bids)} USDT\n"
-                       f"🔴 <b>Asks:</b> {format_number(asks)} USDT\n\n"
-                       f"🔗 <a href='https://www.binance.com/en/futures/{symbol}'>Trade {symbol}</a>")
+                entry_price = curr_close
+                if action == "LONG":
+                    tp_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
+                    sl_price = entry_price * (1 - STOP_LOSS_PCT / 100)
+                else:
+                    tp_price = entry_price * (1 - TAKE_PROFIT_PCT / 100)
+                    sl_price = entry_price * (1 + STOP_LOSS_PCT / 100)
+                
+                msg = (f"{emoji} <b>{action} SİNYALİ: {symbol}</b>\n"
+                       f"💰 <b>Giriş Fiyatı:</b> {format(entry_price, '.4f')} USDT\n"
+                       f"🎯 <b>Kâr Al (TP):</b> {format(tp_price, '.4f')} (+%{TAKE_PROFIT_PCT})\n"
+                       f"🛑 <b>Zarar Durdur (SL):</b> {format(sl_price, '.4f')} (-%{STOP_LOSS_PCT})\n"
+                       f"⚖️ <b>Risk/Ödül:</b> 1:{RISK_REWARD_RATIO:.1f}\n\n"
+                       f"<i>Not: Bu bir yatırım tavsiyesi değildir. Kaldıraç kullanmayın.</i>\n"
+                       f"🔗 <a href='https://www.binance.com/en/futures/{symbol}'>Grafiği Aç</a>")
                 
                 tg(msg)
                 son_sinyaller[symbol] = time.time()
-                print(f"     !!! SİNYAL GÖNDERİLDİ: {symbol} !!!", flush=True)
-                
                 time.sleep(1) 
 
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tarama bitti. 15 saniye bekleniyor...\n", flush=True)
             time.sleep(15)
 
         except Exception as e:
-            print(f"Beklenmeyen Hata: {e} - 10 saniye sonra devam edilecek.", flush=True)
             time.sleep(10)
 
-# --- RENDER'IN PORT İSTEĞİNİ KARŞILAMAK İÇİN BASİT SUNUCU ---
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     Handler = http.server.SimpleHTTPRequestHandler
@@ -153,8 +114,5 @@ def run_dummy_server():
         httpd.serve_forever()
 
 if __name__ == "__main__":
-    # Sunucuyu arka planda çalıştır (Cronjob ping atsın diye)
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    
-    # Botu çalıştır
     bot_loop()
