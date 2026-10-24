@@ -26,7 +26,6 @@ def gj(u):
     except:
         return None
 
-# Hacimleri Görseldeki gibi K ve M formatına çevirme
 def format_volume(vol):
     if vol >= 1000000:
         return f"${vol/1000000:.2f}M"
@@ -37,7 +36,7 @@ def format_volume(vol):
 
 def bot_loop():
     global LAST_PING
-    print("--- IBMB TARZI 15M PUMP ALARM (ÖLÜMSÜZ MOD) BAŞLADI ---", flush=True)
+    print("--- SAHTE SİNYAL ENGELLEYİCİ: 15M PUMP ALARM BAŞLADI ---", flush=True)
     son = {}
 
     while True:
@@ -49,29 +48,28 @@ def bot_loop():
                 time.sleep(3)
                 continue
 
-            # 1. Filtre: Sadece USDT pariteleri ve 24s Hacmi 1 Milyon Dolar üzeri olanlar
+            # 1. DEVASA FİLTRE: Sadece USDT pariteleri ve 24s Hacmi 10 Milyon Dolar üzeri olanlar
             adaylar = []
             for t in tickers:
                 if t['symbol'].endswith('USDT'):
                     try:
                         hacim = float(t['quoteVolume'])
-                        if hacim > 1000000:
+                        if hacim > 10000000: # 10 MİLYON DOLAR BARAJI
                             adaylar.append(t['symbol'])
                     except:
                         pass
 
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] {len(adaylar)} coin bulundu. 15m mumları inceleniyor...", flush=True)
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] {len(adaylar)} dev hacimli coin bulundu. 15m mumları inceleniyor...", flush=True)
 
             sayac = 0
             for i, s in enumerate(adaylar):
                 try:
-                    # Log ekranı canlı kalsın diye her 20 coinde bir yazdır
                     if (i + 1) % 20 == 0:
                         print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Taranıyor... ({i+1}/{len(adaylar)})", flush=True)
 
-                    # 2. Adım: 15 Dakikalık grafikte son 3 mumu çek
-                    k = gj(f"https://api.binance.com/api/v3/klines?symbol={s}&interval=15m&limit=3")
-                    if not k or len(k) < 3: continue
+                    # 2. ADIM: 15 Dakikalık grafikte son 21 mumu çek (Hacim ortalaması için)
+                    k = gj(f"https://api.binance.com/api/v3/klines?symbol={s}&interval=15m&limit=21")
+                    if not k or len(k) < 21: continue
                     
                     kapanan_mum = k[-2] # Tamamlanmış son 15m mumu
                     onceki_mum = k[-3]
@@ -81,14 +79,21 @@ def bot_loop():
                     hacim_simdi = float(kapanan_mum[7])
                     hacim_onceki = float(onceki_mum[7])
                     
-                    if fiyat_onceki == 0 or hacim_onceki == 0: continue
+                    # 3. ADIM: Son 20 mumun ortalama hacmini hesapla
+                    son_20_mum_hacimleri = [float(m[7]) for m in k[:-1]]
+                    ortalama_hacim = sum(son_20_mum_hacimleri) / 20
+                    
+                    if fiyat_onceki == 0 or ortalama_hacim == 0: continue
                     
                     fiyat_degisim = ((fiyat_simdi - fiyat_onceki) / fiyat_onceki) * 100
                     hacim_farki = hacim_simdi - hacim_onceki
                     hacim_degisim_pct = (hacim_farki / hacim_onceki) * 100 if hacim_onceki > 0 else 0
                     
-                    # 3. Adım: TETİKLEYİCİ (Fiyat %5+ artmış ve hacim pozitifse)
-                    if fiyat_degisim >= 5.0 and hacim_farki > 0:
+                    # Hacim, son 20 mumun ortalamasının kaç katı?
+                    hacim_kati = hacim_simdi / ortalama_hacim
+                    
+                    # 4. ADIM: TETİKLEYİCİ (Fiyat %5+ VE Hacim Ortalamanın En Az 3 Katı)
+                    if fiyat_degisim >= 5.0 and hacim_kati >= 3.0:
                         if time.time() - son.get(s, 0) >= 1800: # 30 dk bekleme
                             
                             coin = s.replace("USDT", "")
@@ -97,15 +102,15 @@ def bot_loop():
                             # GÖRSELDEKİ BİREBİR FORMAT
                             msg = (f"🚀 <b>Pump - {coin}/USDT [Binance]</b>\n"
                                    f"Pump Activity on {coin}/USDT 🟢 🟢\n"
-                                   f"💰 <b>Price:</b> ${format(fiyat_onceki, '.2f')} ➔ ${format(fiyat_simdi, '.2f')} (<b>{format(fiyat_degisim, '+.2f')}%</b>)\n"
+                                   f"💰 <b>Price:</b> ${format(fiyat_onceki, '.4f')} ➔ ${format(fiyat_simdi, '.4f')} (<b>{format(fiyat_degisim, '+.2f')}%</b>)\n"
                                    f"📊 <b>Volume:</b> {format_volume(hacim_simdi)} (<b>{format(hacim_degisim_pct, '+.2f')}%</b>)\n"
-                                   f"Volume increased by {format_volume(hacim_farki)} ⬆️\n\n"
+                                   f"Volume increased by {format_volume(hacim_farki)} ⬆️ (Ortalamanın {hacim_kati:.1f} katı)\n\n"
                                    f"⏰ {saat_simdi}")
                             
                             tg(msg)
                             son[s] = time.time()
                             sayac += 1
-                            print(f"🔥 SİNYAL GÖNDERİLDİ: {s} | Fiyat: +%{fiyat_degisim:.2f}", flush=True)
+                            print(f"🔥 GERÇEK SİNYAL: {s} | Fiyat: +%{fiyat_degisim:.2f} | Hacim Katı: {hacim_kati:.1f}x", flush=True)
                             
                     time.sleep(0.05) # API limitini korumak için
                 except Exception as e:
@@ -113,7 +118,6 @@ def bot_loop():
                     
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur Bitti. Sinyal: {sayac}. 5 sn sonra yeni tur...\n", flush=True)
             
-            # Tur başarıyla bitti, Watchdog'u besle
             LAST_PING = time.time()
             time.sleep(5) 
             
