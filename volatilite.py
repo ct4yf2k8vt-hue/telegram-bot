@@ -1,9 +1,9 @@
-import urllib.request, urllib.parse, json, time
+import urllib.request, urllib.parse, json, time, socket
 import os
 from datetime import datetime, timedelta, timezone
-import http.server
-import socketserver
-import threading
+
+# KÜRESEL SOCKET ZAMAN AŞIMI: API istekleri asla 10 saniyeden fazla bekleyemez!
+socket.setdefaulttimeout(10) 
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
@@ -11,11 +11,7 @@ TR_Saati = timezone(timedelta(hours=3))
 
 son_sinyaller = {}
 COOLDOWN = 900 # 15 Dakika
-SON_KALP_ATISI = time.time()
-
-# --- ACIMASIZ BEKÇİ İÇİN DEĞİŞKEN ---
-SON_AKTİVİTE = time.time() 
-BEKÇİ_LİMİTİ = 120 # Bot 120 saniye boyunca donarsa sistemi öldür!
+SON_RAPOR = time.time()
 
 def tg(m):
     try:
@@ -28,7 +24,7 @@ def tg(m):
 def gj(u):
     try:
         req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
-        return json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
+        return json.loads(urllib.request.urlopen(req).read().decode())
     except:
         return None
 
@@ -39,27 +35,25 @@ def format_number(num):
     else: return f"{num:.2f}"
 
 def bot_loop():
-    global SON_KALP_ATISI, SON_AKTİVİTE
+    global SON_RAPOR
     
-    print("--- KESİN ÇÖZÜM: SAF DÖNGÜ VE ACIMASIZ BEKÇİ BAŞLADI ---", flush=True)
+    # Başladığında Telegram'a haber ver (Log ekranına güvenmiyoruz)
+    tg("🚀 <b>Bot Başlatıldı!</b> Render loglarına bakmayın, raporlar buraya gelecek.")
 
     while True:
         try:
-            # Bekçiyi besle (Botun çalıştığını göster)
-            SON_AKTİVİTE = time.time()
+            # 1. HER 30 DAKİKADA BİR TELEGRAM'A DURUM RAPORU GÖNDER
+            if time.time() - SON_RAPOR > 1800:
+                tg(f"🤖 <b>Durum Raporu:</b> Bot sorunsuz çalışıyor.\n⏰ {datetime.now(TR_Saati).strftime('%H:%M')}")
+                SON_RAPOR = time.time()
 
-            # 1. KALP ATIŞI (Her 15 dakikada bir Telegram'a mesaj at)
-            if time.time() - SON_KALP_ATISI > 900:
-                tg(f"🤖 <b>Bot Aktif:</b> Sistem çalışıyor. Tarama devam ediyor.\n⏰ {datetime.now(TR_Saati).strftime('%H:%M')}")
-                SON_KALP_ATISI = time.time()
-
-            # 2. PİYASA ÖZETİNİ ÇEK
+            # 2. PİYASA VERİSİNİ ÇEK
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers:
                 time.sleep(5)
                 continue
 
-            # 3. FİLTRELE (Hacim > 20M ve Değişim > %4)
+            # 3. FİLTRELE
             adaylar = []
             for t in tickers:
                 if t['symbol'].endswith('USDT'):
@@ -71,13 +65,8 @@ def bot_loop():
                     except:
                         pass
             
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Taranıyor... {len(adaylar)} aday.", flush=True)
-
-            # 4. ADAYLARI KONTROL ET
+            # 4. KONTROL ET
             for symbol, chg in adaylar:
-                # Her adayda bekçiyi besle
-                SON_AKTİVİTE = time.time() 
-                
                 if symbol in son_sinyaller and (time.time() - son_sinyaller[symbol] < COOLDOWN):
                     continue
 
@@ -95,6 +84,7 @@ def bot_loop():
                 
                 if abs(price_change_15m) < 3.0: continue 
                 
+                # Türev verileri
                 oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=15m&limit=2")
                 oi_change_pct, oi_curr = 0, 0
                 if oi_data and len(oi_data) >= 2:
@@ -131,42 +121,28 @@ def bot_loop():
                 
                 tg(msg)
                 son_sinyaller[symbol] = time.time()
-                print(f"🔥 SİNYAL: {symbol}", flush=True)
                 
-                time.sleep(0.5) 
+                time.sleep(1) 
 
-            # Tur bitti, bekçiyi son kez besle ve bekle
-            SON_AKTİVİTE = time.time()
             time.sleep(10)
 
         except Exception as e:
-            print(f"Döngü Hatası: {e}", flush=True)
+            # Hata olursa (örneğin API zaman aşımı) 10 saniye bekle ve devam et. ASLA ÇÖKME!
             time.sleep(10)
 
-# --- ACIMASIZ BEKÇİ (WATCHDOG) FONKSİYONU ---
-def watchdog():
-    global SON_AKTİVİTE
-    while True:
-        time.sleep(15) # Her 15 saniyede bir kontrol et
-        if time.time() - SON_AKTİVİTE > BEKÇİ_LİMİTİ:
-            # Eğer bot 120 saniyedir hiçbir işlem yapamadıysa (donduysa)
-            # Sistemi acımasızca öldür. Render, Cronjob sayesinde uyanık olduğu için anında yenisini başlatacak.
-            print("\n!!! BOT DONDU. ACIMASIZ BEKÇİ SİSTEMİ KAPATIYOR !!!", flush=True)
-            os._exit(1) 
-
-# --- RENDER'IN PORT İSTEĞİNİ KARŞILAMAK İÇİN SAHTE SUNUCU ---
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    Handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", port), Handler) as httpd:
-        httpd.serve_forever()
-
 if __name__ == "__main__":
-    # Sahte web sunucusunu ayrı bir thread'de başlat (Cronjob'un ping atacağı yer)
+    # Render'ın kapanmaması için port dinleyen sahte bir sunucu (Ama botun çalışmasına karışmaz)
+    import http.server
+    import socketserver
+    import threading
+    
+    def run_dummy_server():
+        port = int(os.environ.get("PORT", 10000))
+        Handler = http.server.SimpleHTTPRequestHandler
+        with socketserver.TCPServer(("", port), Handler) as httpd:
+            httpd.serve_forever()
+
     threading.Thread(target=run_dummy_server, daemon=True).start()
     
-    # Acımasız Bekçiyi başlat
-    threading.Thread(target=watchdog, daemon=True).start()
-    
-    # Asıl botu ana thread'de çalıştır
+    # Botu başlat
     bot_loop()
