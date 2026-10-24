@@ -9,10 +9,6 @@ T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 TR_Saati = timezone(timedelta(hours=3))
 
-# --- SİNYAL HAFIZASI (COOLDOWN İÇİN) ---
-son_sinyaller = {} # Hangi coin ne zaman sinyal verdi?
-COOLDOWN_SURESI = 900 # 15 DAKİKA (900 saniye)
-
 def tg(m):
     try:
         d = urllib.parse.urlencode({"chat_id": C, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
@@ -34,26 +30,18 @@ def format_number(num):
     elif abs(num) >= 1_000: return f"{num/1_000:.2f}K"
     else: return f"{num:.2f}"
 
-# --- ZAMAN AŞIMI SİNYALİ (DONMAYI ÖNLER) ---
+# --- ZAMAN AŞIMI SİNYALİ (KESİN ÇÖZÜM) ---
 class TimeoutException(Exception): pass
 def timeout_handler(signum, frame):
     raise TimeoutException("İşlem 120 saniyeyi aştı, zorla kapatılıyor!")
 
 def heartbeat():
-    """Telegram'a 'Çalışıyorum' mesajı atar."""
+    """Telegram'a 'Çalışıyorum' mesajı atar. Log ekranı donsa bile buradan görürsün."""
     while True:
         time.sleep(900) # 15 dakika
         tg(f"🤖 <b>Bot Aktif:</b> Log ekranı donmuş olabilir ama ben çalışıyorum.\n⏰ {datetime.now(TR_Saati).strftime('%H:%M:%S')}")
 
 def check_signal(symbol, price_change_24h):
-    global son_sinyaller
-    
-    # COOLDOWN KONTROLÜ: Eğer son 15 dakika içinde bu coin için sinyal verildiyse, es geç!
-    if symbol in son_sinyaller:
-        gecen_sure = time.time() - son_sinyaller[symbol]
-        if gecen_sure < COOLDOWN_SURESI:
-            return # Sinyal gönderme, sessizce çık.
-
     try:
         klines = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=3")
         if not klines or len(klines) < 3: return
@@ -102,26 +90,22 @@ def check_signal(symbol, price_change_24h):
                f"🟢 <b>Bids:</b> {format_number(bids_total)} USDT\n"
                f"🔴 <b>Asks:</b> {format_number(asks_total)} USDT\n\n"
                f"🔗 <a href='https://www.binance.com/en/futures/{symbol}'>Trade {symbol}</a>")
-        
         tg(msg)
-        
-        # SİNYAL BAŞARIYLA GÖNDERİLDİ, HAFIZAYA KAYDET (15 dakika sustur)
-        son_sinyaller[symbol] = time.time()
-        print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] SİNYAL GÖNDERİLDİ: {symbol} (15 Dk Susturuldu)", flush=True)
-        
     except:
         pass
 
 def bot_loop():
+    # ZAMAN AŞIMI SİNYALİNİ AYARLA (120 saniye)
     signal.signal(signal.SIGALRM, timeout_handler)
     
     while True:
         try:
-            signal.alarm(120) # 120 saniye donma koruması
+            # Her turda çalar saati kur. 120 saniye sonra çalarsa TimeoutException fırlatır!
+            signal.alarm(120) 
             
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers:
-                signal.alarm(0)
+                signal.alarm(0) # Alarmı kapat
                 time.sleep(5)
                 continue
             
@@ -131,7 +115,6 @@ def bot_loop():
                     try:
                         vol = float(t['quoteVolume'])
                         chg = float(t['priceChangePercent'])
-                        # 24s Hacim > 20M ve 24s Değişim > %4
                         if vol > 20_000_000 and abs(chg) >= 4.0:
                             candidates.append((t['symbol'], chg))
                     except:
@@ -143,13 +126,14 @@ def bot_loop():
                 check_signal(symbol, chg)
                 time.sleep(0.2) 
                 
-            signal.alarm(0) # Tur bitti, korumayı kapat
+            # Her şey bittiyse çalar saatini kapat (İptal et)
+            signal.alarm(0) 
             print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur bitti. 10sn bekleniyor...", flush=True)
             time.sleep(10)
             
         except TimeoutException:
             print("\n!!! BOT 120 SANİYEDİR DONDU. İŞLEM ZORLA KESİLİYOR !!!", flush=True)
-            os._exit(1) 
+            os._exit(1) # Render'ı zorla yeniden başlat
         except Exception as e:
             signal.alarm(0)
             time.sleep(5)
