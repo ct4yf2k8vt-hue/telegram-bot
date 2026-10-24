@@ -1,9 +1,12 @@
 import urllib.request, urllib.parse, json, time, socket
 import os
 from datetime import datetime, timedelta, timezone
+import http.server
+import socketserver
+import threading
 
-# KÜRESEL SOCKET ZAMAN AŞIMI: API istekleri asla 10 saniyeden fazla bekleyemez!
-socket.setdefaulttimeout(10) 
+# AĞ SEVİYESİNDE KİLİTLENMEYİ ÖNLE (İstekler asla 10 saniyeden fazla beklemez)
+socket.setdefaulttimeout(10)
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
@@ -17,7 +20,7 @@ def tg(m):
     try:
         d = urllib.parse.urlencode({"chat_id": C, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
         req = urllib.request.Request("https://api.telegram.org/bot" + T + "/sendMessage", data=d)
-        urllib.request.urlopen(req, timeout=10).read()
+        urllib.request.urlopen(req).read()
     except:
         pass
 
@@ -34,14 +37,17 @@ def format_number(num):
     elif abs(num) >= 1_000: return f"{num/1_000:.2f}K"
     else: return f"{num:.2f}"
 
+# --- ANA BOT DÖNGÜSÜ ---
 def bot_loop():
     global SON_RAPOR
     
-    # Başladığında Telegram'a haber ver (Log ekranına güvenmiyoruz)
-    tg("🚀 <b>Bot Başlatıldı!</b> Render loglarına bakmayın, raporlar buraya gelecek.")
+    # Başladığında Telegram'a haber ver
+    tg("🚀 <b>Bot Başlatıldı!</b> Log ekranı donarsa Telegram'a bakın, raporlar oraya gelecek.")
 
     while True:
         try:
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Yeni tarama başlıyor...", flush=True)
+
             # 1. HER 30 DAKİKADA BİR TELEGRAM'A DURUM RAPORU GÖNDER
             if time.time() - SON_RAPOR > 1800:
                 tg(f"🤖 <b>Durum Raporu:</b> Bot sorunsuz çalışıyor.\n⏰ {datetime.now(TR_Saati).strftime('%H:%M')}")
@@ -50,6 +56,7 @@ def bot_loop():
             # 2. PİYASA VERİSİNİ ÇEK
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers:
+                print("Borsa verisi alinamadi, 5 saniye bekleniyor...", flush=True)
                 time.sleep(5)
                 continue
 
@@ -65,9 +72,15 @@ def bot_loop():
                     except:
                         pass
             
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] {len(adaylar)} aday bulundu. Mumlar inceleniyor...", flush=True)
+
             # 4. KONTROL ET
             for symbol, chg in adaylar:
+                # Her aday kontrol edilirken ekrana yaz (logların akması için)
+                print(f"  -> Kontrol ediliyor: {symbol}", flush=True)
+
                 if symbol in son_sinyaller and (time.time() - son_sinyaller[symbol] < COOLDOWN):
+                    print(f"     {symbol} 15 dk bekleme suresinde. Atlandi.", flush=True)
                     continue
 
                 klines = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=3")
@@ -121,28 +134,27 @@ def bot_loop():
                 
                 tg(msg)
                 son_sinyaller[symbol] = time.time()
+                print(f"     !!! SİNYAL GÖNDERİLDİ: {symbol} !!!", flush=True)
                 
                 time.sleep(1) 
 
-            time.sleep(10)
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tarama bitti. 15 saniye bekleniyor...\n", flush=True)
+            time.sleep(15)
 
         except Exception as e:
-            # Hata olursa (örneğin API zaman aşımı) 10 saniye bekle ve devam et. ASLA ÇÖKME!
+            print(f"Beklenmeyen Hata: {e} - 10 saniye sonra devam edilecek.", flush=True)
             time.sleep(10)
 
-if __name__ == "__main__":
-    # Render'ın kapanmaması için port dinleyen sahte bir sunucu (Ama botun çalışmasına karışmaz)
-    import http.server
-    import socketserver
-    import threading
-    
-    def run_dummy_server():
-        port = int(os.environ.get("PORT", 10000))
-        Handler = http.server.SimpleHTTPRequestHandler
-        with socketserver.TCPServer(("", port), Handler) as httpd:
-            httpd.serve_forever()
+# --- RENDER'IN PORT İSTEĞİNİ KARŞILAMAK İÇİN BASİT SUNUCU ---
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    Handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), Handler) as httpd:
+        httpd.serve_forever()
 
+if __name__ == "__main__":
+    # Sunucuyu arka planda çalıştır (Cronjob ping atsın diye)
     threading.Thread(target=run_dummy_server, daemon=True).start()
     
-    # Botu başlat
+    # Botu çalıştır
     bot_loop()
