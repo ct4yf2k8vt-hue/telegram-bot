@@ -1,17 +1,21 @@
 import urllib.request, urllib.parse, json, time
 import os
-import threading
-import signal
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import http.server
+import socketserver
+import threading
 
 T = os.environ.get("BOT_TOKEN")
 C = "1623907197"
 TR_Saati = timezone(timedelta(hours=3))
 
-# --- SİNYAL HAFIZASI (COOLDOWN İÇİN) ---
-son_sinyaller = {} # Hangi coin ne zaman sinyal verdi?
-COOLDOWN_SURESI = 900 # 15 DAKİKA (900 saniye)
+son_sinyaller = {}
+COOLDOWN = 900 # 15 Dakika
+SON_KALP_ATISI = time.time()
+
+# --- ACIMASIZ BEKÇİ İÇİN DEĞİŞKEN ---
+SON_AKTİVİTE = time.time() 
+BEKÇİ_LİMİTİ = 120 # Bot 120 saniye boyunca donarsa sistemi öldür!
 
 def tg(m):
     try:
@@ -34,144 +38,135 @@ def format_number(num):
     elif abs(num) >= 1_000: return f"{num/1_000:.2f}K"
     else: return f"{num:.2f}"
 
-# --- ZAMAN AŞIMI SİNYALİ (DONMAYI ÖNLER) ---
-class TimeoutException(Exception): pass
-def timeout_handler(signum, frame):
-    raise TimeoutException("İşlem 120 saniyeyi aştı, zorla kapatılıyor!")
-
-def heartbeat():
-    """Telegram'a 'Çalışıyorum' mesajı atar."""
-    while True:
-        time.sleep(900) # 15 dakika
-        tg(f"🤖 <b>Bot Aktif:</b> Log ekranı donmuş olabilir ama ben çalışıyorum.\n⏰ {datetime.now(TR_Saati).strftime('%H:%M:%S')}")
-
-def check_signal(symbol, price_change_24h):
-    global son_sinyaller
-    
-    # COOLDOWN KONTROLÜ: Eğer son 15 dakika içinde bu coin için sinyal verildiyse, es geç!
-    if symbol in son_sinyaller:
-        gecen_sure = time.time() - son_sinyaller[symbol]
-        if gecen_sure < COOLDOWN_SURESI:
-            return # Sinyal gönderme, sessizce çık.
-
-    try:
-        klines = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=3")
-        if not klines or len(klines) < 3: return
-        
-        curr_k, prev_k = klines[-2], klines[-3]
-        curr_close, prev_close = float(curr_k[4]), float(prev_k[4])
-        curr_vol, prev_vol = float(curr_k[7]), float(prev_k[7])
-        
-        if prev_close == 0 or prev_vol == 0: return
-        
-        price_change_15m = ((curr_close - prev_close) / prev_close) * 100
-        vol_change_15m = ((curr_vol - prev_vol) / prev_vol) * 100
-        
-        if abs(price_change_15m) < 3.0: return 
-        
-        oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=15m&limit=2")
-        oi_change_pct, oi_curr = 0, 0
-        if oi_data and len(oi_data) >= 2:
-            oi_curr = float(oi_data[-1]['sumOpenInterestValue'])
-            oi_prev = float(oi_data[-2]['sumOpenInterestValue'])
-            if oi_prev > 0: oi_change_pct = ((oi_curr - oi_prev) / oi_prev) * 100
-        
-        funding_data = gj(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}")
-        funding_rate = float(funding_data['lastFundingRate']) if funding_data else 0
-        
-        depth = gj(f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=100")
-        bids_total, asks_total = 0, 0
-        if depth:
-            bids_total = sum(float(b[1]) for b in depth['bids'])
-            asks_total = sum(float(a[1]) for a in depth['asks'])
-        
-        is_dump = price_change_15m < 0
-        emoji = "💀" if is_dump else "🚀"
-        action = "Dumping" if is_dump else "Pumping"
-        
-        msg = (f"{emoji} <b>{symbol} is {action} on Binance-Futures!</b>\n"
-               f"💵 <b>Price:</b> {format(curr_close, '.4f')} USDT ({format(price_change_15m, '+.2f')}%)\n"
-               f"📊 <b>24h Vol:</b> {format_number(curr_vol)} USDT\n"
-               f"📉 <b>Last Vol:</b> {format_number(curr_vol)} ({format(vol_change_15m, '+.2f')}%)\n"
-               f"⬇️ <b>Price:</b> {format(prev_close, '.4f')} USDT\n"
-               f"🔴 <b>24h%:</b> {format(price_change_24h, '+.2f')}%\n"
-               f"📥 <b>Vol:</b> {format_number(curr_vol - prev_vol)} USDT\n"
-               f"💰 <b>OI:</b> {format_number(oi_curr)} ({format(oi_change_pct, '+.2f')}%)\n"
-               f"🏦 <b>Funding:</b> {format(funding_rate, '+.4f')}%\n\n"
-               f"<b>Bids & Asks in 20% Range</b>\n"
-               f"🟢 <b>Bids:</b> {format_number(bids_total)} USDT\n"
-               f"🔴 <b>Asks:</b> {format_number(asks_total)} USDT\n\n"
-               f"🔗 <a href='https://www.binance.com/en/futures/{symbol}'>Trade {symbol}</a>")
-        
-        tg(msg)
-        
-        # SİNYAL BAŞARIYLA GÖNDERİLDİ, HAFIZAYA KAYDET (15 dakika sustur)
-        son_sinyaller[symbol] = time.time()
-        print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] SİNYAL GÖNDERİLDİ: {symbol} (15 Dk Susturuldu)", flush=True)
-        
-    except:
-        pass
-
 def bot_loop():
-    signal.signal(signal.SIGALRM, timeout_handler)
+    global SON_KALP_ATISI, SON_AKTİVİTE
     
+    print("--- KESİN ÇÖZÜM: SAF DÖNGÜ VE ACIMASIZ BEKÇİ BAŞLADI ---", flush=True)
+
     while True:
         try:
-            signal.alarm(120) # 120 saniye donma koruması
-            
+            # Bekçiyi besle (Botun çalıştığını göster)
+            SON_AKTİVİTE = time.time()
+
+            # 1. KALP ATIŞI (Her 15 dakikada bir Telegram'a mesaj at)
+            if time.time() - SON_KALP_ATISI > 900:
+                tg(f"🤖 <b>Bot Aktif:</b> Sistem çalışıyor. Tarama devam ediyor.\n⏰ {datetime.now(TR_Saati).strftime('%H:%M')}")
+                SON_KALP_ATISI = time.time()
+
+            # 2. PİYASA ÖZETİNİ ÇEK
             tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
             if not tickers:
-                signal.alarm(0)
                 time.sleep(5)
                 continue
-            
-            candidates = []
+
+            # 3. FİLTRELE (Hacim > 20M ve Değişim > %4)
+            adaylar = []
             for t in tickers:
                 if t['symbol'].endswith('USDT'):
                     try:
                         vol = float(t['quoteVolume'])
                         chg = float(t['priceChangePercent'])
-                        # 24s Hacim > 20M ve 24s Değişim > %4
                         if vol > 20_000_000 and abs(chg) >= 4.0:
-                            candidates.append((t['symbol'], chg))
+                            adaylar.append((t['symbol'], chg))
                     except:
                         pass
             
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] {len(candidates)} aday bulundu. Taranıyor...", flush=True)
-            
-            for symbol, chg in candidates:
-                check_signal(symbol, chg)
-                time.sleep(0.2) 
+            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Taranıyor... {len(adaylar)} aday.", flush=True)
+
+            # 4. ADAYLARI KONTROL ET
+            for symbol, chg in adaylar:
+                # Her adayda bekçiyi besle
+                SON_AKTİVİTE = time.time() 
                 
-            signal.alarm(0) # Tur bitti, korumayı kapat
-            print(f"[{datetime.now(TR_Saati).strftime('%H:%M:%S')}] Tur bitti. 10sn bekleniyor...", flush=True)
+                if symbol in son_sinyaller and (time.time() - son_sinyaller[symbol] < COOLDOWN):
+                    continue
+
+                klines = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=3")
+                if not klines or len(klines) < 3: continue
+                
+                curr_k, prev_k = klines[-2], klines[-3]
+                curr_close, prev_close = float(curr_k[4]), float(prev_k[4])
+                curr_vol, prev_vol = float(curr_k[7]), float(prev_k[7])
+                
+                if prev_close == 0 or prev_vol == 0: continue
+                
+                price_change_15m = ((curr_close - prev_close) / prev_close) * 100
+                vol_change_15m = ((curr_vol - prev_vol) / prev_vol) * 100
+                
+                if abs(price_change_15m) < 3.0: continue 
+                
+                oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=15m&limit=2")
+                oi_change_pct, oi_curr = 0, 0
+                if oi_data and len(oi_data) >= 2:
+                    oi_curr = float(oi_data[-1]['sumOpenInterestValue'])
+                    oi_prev = float(oi_data[-2]['sumOpenInterestValue'])
+                    if oi_prev > 0: oi_change_pct = ((oi_curr - oi_prev) / oi_prev) * 100
+                
+                funding_data = gj(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}")
+                funding_rate = float(funding_data['lastFundingRate']) if funding_data else 0
+                
+                depth = gj(f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=100")
+                bids, asks = 0, 0
+                if depth:
+                    bids = sum(float(b[1]) for b in depth['bids'])
+                    asks = sum(float(a[1]) for a in depth['asks'])
+                
+                is_dump = price_change_15m < 0
+                emoji = "💀" if is_dump else "🚀"
+                action = "Dumping" if is_dump else "Pumping"
+                
+                msg = (f"{emoji} <b>{symbol} is {action} on Binance-Futures!</b>\n"
+                       f"💵 <b>Price:</b> {format(curr_close, '.4f')} USDT ({format(price_change_15m, '+.2f')}%)\n"
+                       f"📊 <b>24h Vol:</b> {format_number(curr_vol)} USDT\n"
+                       f"📉 <b>Last Vol:</b> {format_number(curr_vol)} ({format(vol_change_15m, '+.2f')}%)\n"
+                       f"⬇️ <b>Price:</b> {format(prev_close, '.4f')} USDT\n"
+                       f"🔴 <b>24h%:</b> {format(chg, '+.2f')}%\n"
+                       f"📥 <b>Vol:</b> {format_number(curr_vol - prev_vol)} USDT\n"
+                       f"💰 <b>OI:</b> {format_number(oi_curr)} ({format(oi_change_pct, '+.2f')}%)\n"
+                       f"🏦 <b>Funding:</b> {format(funding_rate, '+.4f')}%\n\n"
+                       f"<b>Bids & Asks in 20% Range</b>\n"
+                       f"🟢 <b>Bids:</b> {format_number(bids)} USDT\n"
+                       f"🔴 <b>Asks:</b> {format_number(asks)} USDT\n\n"
+                       f"🔗 <a href='https://www.binance.com/en/futures/{symbol}'>Trade {symbol}</a>")
+                
+                tg(msg)
+                son_sinyaller[symbol] = time.time()
+                print(f"🔥 SİNYAL: {symbol}", flush=True)
+                
+                time.sleep(0.5) 
+
+            # Tur bitti, bekçiyi son kez besle ve bekle
+            SON_AKTİVİTE = time.time()
             time.sleep(10)
-            
-        except TimeoutException:
-            print("\n!!! BOT 120 SANİYEDİR DONDU. İŞLEM ZORLA KESİLİYOR !!!", flush=True)
-            os._exit(1) 
+
         except Exception as e:
-            signal.alarm(0)
-            time.sleep(5)
+            print(f"Döngü Hatası: {e}", flush=True)
+            time.sleep(10)
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+# --- ACIMASIZ BEKÇİ (WATCHDOG) FONKSİYONU ---
+def watchdog():
+    global SON_AKTİVİTE
+    while True:
+        time.sleep(15) # Her 15 saniyede bir kontrol et
+        if time.time() - SON_AKTİVİTE > BEKÇİ_LİMİTİ:
+            # Eğer bot 120 saniyedir hiçbir işlem yapamadıysa (donduysa)
+            # Sistemi acımasızca öldür. Render, Cronjob sayesinde uyanık olduğu için anında yenisini başlatacak.
+            print("\n!!! BOT DONDU. ACIMASIZ BEKÇİ SİSTEMİ KAPATIYOR !!!", flush=True)
+            os._exit(1) 
 
-def run_web_server():
+# --- RENDER'IN PORT İSTEĞİNİ KARŞILAMAK İÇİN SAHTE SUNUCU ---
+def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+    Handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), Handler) as httpd:
+        httpd.serve_forever()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_web_server, daemon=True).start()
-    threading.Thread(target=heartbeat, daemon=True).start()
-    threading.Thread(target=bot_loop, daemon=True).start()
+    # Sahte web sunucusunu ayrı bir thread'de başlat (Cronjob'un ping atacağı yer)
+    threading.Thread(target=run_dummy_server, daemon=True).start()
     
-    while True:
-        time.sleep(10)
+    # Acımasız Bekçiyi başlat
+    threading.Thread(target=watchdog, daemon=True).start()
+    
+    # Asıl botu ana thread'de çalıştır
+    bot_loop()
