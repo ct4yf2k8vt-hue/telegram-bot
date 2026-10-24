@@ -2,21 +2,19 @@ import urllib.request, urllib.parse, json, time, socket
 import os
 from datetime import datetime, timedelta, timezone
 
-# Ağ donmalarını engellemek için istek zaman aşımı süresi
+# Ağ donmalarını engellemek için istek zaman aşımı
 socket.setdefaulttimeout(10)
 
 T = os.environ.get("BOT_TOKEN")
-C = os.environ.get("CHAT_ID", "1623907197")
 TR_Saati = timezone(timedelta(hours=3))
 
-# Daha önce sinyal gönderilen semboller (tekrar sinyal engelleme)
-son_sinyaller = {}
-COOLDOWN = 900  # 15 dakika
+# Son işlenen mesaj ID'si (Aynı mesajı tekrar cevaplamamak için)
+last_update_id = 0
 
-def tg(m):
+def tg(chat_id, m):
     try:
         d = urllib.parse.urlencode({
-            "chat_id": C,
+            "chat_id": chat_id,
             "text": m,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
@@ -33,80 +31,78 @@ def gj(u):
     except:
         return None
 
-def format_number(num):
-    if abs(num) >= 1_000_000: return f"{num/1_000_000:.2f}M"
-    elif abs(num) >= 1_000: return f"{num/1_000:.2f}K"
-    else: return f"{num:.2f}"
-
-def bot_loop():
-    tg("🚀 <b>MPB ALGOS NEW 2.0 (SHORT) BOTU BAŞLATILDI!</b>\n"
-       f"🎯 Sadece Binance Futures piyasasında çalışır.")
-
+def command_listener():
+    global last_update_id
+    print("Sadece /ratio komut dinleyicisi başladı...", flush=True)
+    
     while True:
         try:
-            tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
-            if not tickers:
-                time.sleep(5)
-                continue
-
-            adaylar = []
-            for t in tickers:
-                if t['symbol'].endswith('USDT'):
-                    try:
-                        vol = float(t['quoteVolume'])
-                        chg = float(t['priceChangePercent'])
-                        # Likit ve günlük düşüşte olanları aday olarak seç
-                        if vol > 10_000_000 and chg <= -3.0:
-                            adaylar.append(t['symbol'])
-                    except:
-                        pass
-
-            for symbol in adaylar:
-                if symbol in son_sinyaller and (time.time() - son_sinyaller[symbol] < COOLDOWN):
-                    continue
-
-                # 5 dakikalık mum verisini çek
-                klines = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=20")
-                if not klines or len(klines) < 20: continue
-
-                # Son 20 mumun en yükseğini bul (direnç / kırılım bölgesi)
-                high_20 = max(float(k[2]) for k in klines)
-                curr_close = float(klines[-1][4])
-                curr_vol = float(klines[-1][7])
-                
-                # Hacim ortalaması
-                avg_vol = sum(float(k[7]) for k in klines[:-1]) / 19
-
-                # Sinyal Şartı: Fiyat 20 mumluk zirvenin belirgin altına sarkmış ve hacim artmışsa
-                if curr_close < (high_20 * 0.97) and curr_vol > (avg_vol * 1.5):
+            # Telegram'dan gelen son mesajları çek
+            updates = gj(f"https://api.telegram.org/bot{T}/getUpdates?offset={last_update_id + 1}&timeout=10")
+            
+            if updates and updates.get("ok"):
+                for u in updates["result"]:
+                    last_update_id = u["update_id"]
                     
-                    # Kâr Al ve Zarar Durdur (Kullanıcının istediği gibi %3 / %1.5)
-                    tp_price = curr_close * 0.97
-                    sl_price = curr_close * 1.015
-
-                    msg = (f"📊 MPB ALGOS NEW 2.0\n"
-                           f"🎯 #{symbol}\n"
-                           f"🔴 SHORT\n"
-                           f"📉 PRECIO: {curr_close:.5f}\n\n"
-                           f"🎯 <b>Hedef (TP):</b> {tp_price:.5f} (-%3.0)\n"
-                           f"🛑 <b>Zarar Durdur (SL):</b> {sl_price:.5f} (+%1.5)\n"
-                           f"⏰ {datetime.now(TR_Saati).strftime('%H:%M')}")
-
-                    tg(msg)
-                    son_sinyaller[symbol] = time.time()
-
-            time.sleep(15)
-
+                    if "message" in u and "text" in u["message"]:
+                        text = u["message"]["text"]
+                        chat_id = u["message"]["chat"]["id"]
+                        
+                        # Eğer mesaj /ratio ile başlıyorsa
+                        if text.startswith("/ratio"):
+                            parts = text.split()
+                            
+                            # Parametre kontrolü
+                            if len(parts) < 2:
+                                tg(chat_id, "⚠️ <b>Hatalı Format!</b>\nKullanım:\n<code>/ratio btcusdt</code>\n<code>/ratio ethusdt 4h</code>")
+                                continue
+                            
+                            symbol = parts[1].upper()
+                            if not symbol.endswith("USDT"):
+                                symbol += "USDT"
+                                
+                            # Zaman dilimi (varsayılan 1h)
+                            period = parts[2].lower() if len(parts) > 2 else "1h"
+                            
+                            # Binance Futures'tan Long/Short verisini çek
+                            url = f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={period}&limit=1"
+                            data = gj(url)
+                            
+                            if data and len(data) > 0:
+                                d = data[0]
+                                long_pct = float(d['longAccount']) * 100
+                                short_pct = float(d['shortAccount']) * 100
+                                ratio = float(d['longShortRatio'])
+                                
+                                # Görseldeki birebir format
+                                msg = (f"Long/Short Ratio📊\n"
+                                       f"Binance - {symbol}\n"
+                                       f"⏳ <b>Timeframe:</b> {period}\n"
+                                       f"📈 <b>Long:</b> {long_pct:.2f}%\n"
+                                       f"📉 <b>Short:</b> {short_pct:.2f}%\n"
+                                       f"⚖️ <b>Ratio:</b> {ratio:.2f}\n\n"
+                                       f"<i>Last Updated: {datetime.now(TR_Saati).strftime('%H:%M')} (TR)</i>")
+                                tg(chat_id, msg)
+                            else:
+                                tg(chat_id, f"❌ <b>{symbol}</b> için veri bulunamadı. Sembolü veya zaman dilimini kontrol edin.")
+                                
         except Exception as e:
-            time.sleep(10)
+            pass
+        time.sleep(2)
+
+# --- RENDER'IN PORT İSTEĞİNİ KARŞILAMAK İÇİN (Kapanmayı önler) ---
+def run_dummy_server():
+    import http.server
+    import socketserver
+    port = int(os.environ.get("PORT", 10000))
+    Handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), Handler) as httpd:
+        httpd.serve_forever()
 
 if __name__ == "__main__":
-    import http.server, socketserver, threading
-    def run_dummy():
-        port = int(os.environ.get("PORT", 10000))
-        Handler = http.server.SimpleHTTPRequestHandler
-        with socketserver.TCPServer(("", port), Handler) as httpd:
-            httpd.serve_forever()
-
-    threading.Thread(target=run_dummy, daemon=True).start()
-    bot_loop()
+    import threading
+    # Render'ın botu kapatmaması için sahte sunucuyu başlat
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    # Sadece komut dinleyiciyi çalıştır. Tarama falan YOK.
+    command_listener()
