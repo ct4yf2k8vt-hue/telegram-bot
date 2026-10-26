@@ -1,748 +1,960 @@
-
 import os
 import time
 import json
 import urllib.request
 import urllib.parse
 import urllib.error
-import threading
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict, deque
 
-# =====================================================
-# BINANCE FUTURES SHORT BOT
-# =====================================================
+# ============================================================
+# BINANCE PUMP & DUMP TELEGRAM BOT
+# GitHub + Render
+# ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-BASE = "https://fapi.binance.com"
+BINANCE_BASE = os.getenv(
+    "BINANCE_BASE",
+    "https://api.binance.com"
+).rstrip("/")
 
-TR = timezone(timedelta(hours=3))
+CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "10"))
 
-SCAN_INTERVAL = 180
-TOP_SYMBOLS = 100
-CANDLE_SYMBOLS = 20
+WINDOW_SECONDS = int(
+    os.getenv("WINDOW_SECONDS", "300")
+)
 
-MIN_VOLUME = 5_000_000
-MIN_PUMP = 3.0
+PUMP_PERCENT = float(
+    os.getenv("PUMP_PERCENT", "5.0")
+)
 
-SIGNAL_COOLDOWN = 1800
+DUMP_PERCENT = float(
+    os.getenv("DUMP_PERCENT", "5.0")
+)
 
-BINANCE_COOLDOWN = 0
+VOLUME_INCREASE_PERCENT = float(
+    os.getenv("VOLUME_INCREASE_PERCENT", "20")
+)
 
-LAST_SIGNAL = {}
-LAST_SCAN = 0
+COOLDOWN_SECONDS = int(
+    os.getenv("COOLDOWN_SECONDS", "600")
+)
 
-# =====================================================
+MIN_QUOTE_VOLUME_USDT = float(
+    os.getenv("MIN_QUOTE_VOLUME_USDT", "500000")
+)
+
+MAX_SYMBOLS = int(
+    os.getenv("MAX_SYMBOLS", "0")
+)
+
+TURKEY_TZ = timezone(
+    timedelta(hours=3)
+)
+
+# ============================================================
+# BOT VERİLERİ
+# ============================================================
+
+price_history = defaultdict(deque)
+
+last_alert = {}
+
+last_volume = {}
+
+# ============================================================
 # LOG
-# =====================================================
+# ============================================================
 
 def log(message):
-    now = datetime.now(TR).strftime("%Y-%m-%d %H:%M:%S TR")
-    print(f"[{now}] {message}", flush=True)
+
+    now = datetime.now(
+        TURKEY_TZ
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    print(
+        f"[{now} TR] {message}",
+        flush=True
+    )
 
 
-# =====================================================
-# HTTP
-# =====================================================
+# ============================================================
+# BINANCE VERİ ÇEKME
+# ============================================================
 
-def request(url, timeout=15):
+def http_json(url, timeout=15):
 
-    global BINANCE_COOLDOWN
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "PumpDumpTelegramBot/1.0",
+            "Accept": "application/json"
+        }
+    )
 
-    if time.time() < BINANCE_COOLDOWN:
-        return None
+    with urllib.request.urlopen(
+        req,
+        timeout=timeout
+    ) as response:
 
-    try:
-
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json"
-            }
+        return json.loads(
+            response.read().decode("utf-8")
         )
 
-        with urllib.request.urlopen(req, timeout=timeout) as response:
 
-            return json.loads(
-                response.read().decode("utf-8")
-            )
+# ============================================================
+# TELEGRAM MESAJ GÖNDERME
+# ============================================================
 
-    except urllib.error.HTTPError as e:
-
-        if e.code in (418, 429):
-
-            wait = 3600
-
-            try:
-                retry = e.headers.get("Retry-After")
-
-                if retry:
-                    wait = max(int(retry), 60)
-
-            except Exception:
-                pass
-
-            BINANCE_COOLDOWN = time.time() + wait
-
-            log(
-                f"Binance HTTP {e.code}: "
-                f"{wait} saniye bekleme."
-            )
-
-        else:
-
-            log(f"Binance HTTP: {e.code}")
-
-        return None
-
-    except Exception as e:
-
-        log(f"Binance bağlantı hatası: {e}")
-
-        return None
-
-
-# =====================================================
-# TELEGRAM
-# =====================================================
-
-def telegram(message):
+def telegram_request(
+    method,
+    fields=None,
+    photo_path=None
+):
 
     if not BOT_TOKEN or not CHAT_ID:
 
-        log("BOT_TOKEN veya CHAT_ID eksik.")
+        log(
+            "BOT_TOKEN veya CHAT_ID eksik."
+        )
 
-        return False
+        return None
 
     url = (
-        f"https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/sendMessage"
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/{method}"
     )
 
-    data = urllib.parse.urlencode({
+    fields = fields or {}
 
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
+    if photo_path:
 
-    }).encode()
+        boundary = (
+            "----PumpDumpBoundary"
+            + str(int(time.time() * 1000))
+        )
 
-    try:
+        body = bytearray()
+
+        for key, value in fields.items():
+
+            body.extend(
+                f"--{boundary}\r\n".encode()
+            )
+
+            body.extend(
+                (
+                    f'Content-Disposition: form-data; '
+                    f'name="{key}"\r\n\r\n'
+                ).encode()
+            )
+
+            body.extend(
+                str(value).encode("utf-8")
+            )
+
+            body.extend(b"\r\n")
+
+        with open(
+            photo_path,
+            "rb"
+        ) as f:
+
+            photo = f.read()
+
+        body.extend(
+            f"--{boundary}\r\n".encode()
+        )
+
+        body.extend(
+            (
+                'Content-Disposition: form-data; '
+                'name="photo"; filename="chart.png"\r\n'
+            ).encode()
+        )
+
+        body.extend(
+            b"Content-Type: image/png\r\n\r\n"
+        )
+
+        body.extend(photo)
+
+        body.extend(b"\r\n")
+
+        body.extend(
+            f"--{boundary}--\r\n".encode()
+        )
+
+        req = urllib.request.Request(
+            url,
+            data=bytes(body),
+            headers={
+                "Content-Type":
+                f"multipart/form-data; boundary={boundary}"
+            },
+            method="POST"
+        )
+
+    else:
+
+        data = urllib.parse.urlencode(
+            fields
+        ).encode("utf-8")
 
         req = urllib.request.Request(
             url,
             data=data,
+            headers={
+                "Content-Type":
+                "application/x-www-form-urlencoded"
+            },
             method="POST"
         )
 
-        with urllib.request.urlopen(req, timeout=15) as response:
+    try:
+
+        with urllib.request.urlopen(
+            req,
+            timeout=25
+        ) as response:
 
             result = json.loads(
                 response.read().decode("utf-8")
             )
 
-            if result.get("ok"):
+        if not result.get("ok"):
 
-                log("Telegram mesajı gönderildi.")
+            log(
+                f"Telegram API hata: {result}"
+            )
 
-                return True
+        return result
 
-            log(f"Telegram hata: {result}")
+    except Exception as exc:
 
-            return False
+        log(
+            f"Telegram gönderim hatası: {exc}"
+        )
 
-    except Exception as e:
-
-        log(f"Telegram gönderim hatası: {e}")
-
-        return False
+        return None
 
 
-# =====================================================
-# FUTURES PARITIES
-# =====================================================
+# ============================================================
+# TELEGRAM YAZI MESAJI
+# ============================================================
 
-def get_symbols():
+def send_text(text):
 
-    data = request(
-        BASE + "/fapi/v1/ticker/24hr"
+    return telegram_request(
+        "sendMessage",
+        {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true"
+        }
     )
 
-    if not data:
 
-        return []
+# ============================================================
+# BINANCE USDT PARİTELERİ
+# ============================================================
 
-    symbols = []
+def get_symbols_and_tickers():
 
-    for item in data:
+    exchange = http_json(
+        f"{BINANCE_BASE}/api/v3/exchangeInfo"
+    )
 
-        symbol = item.get("symbol", "")
+    eligible = set()
 
-        if not symbol.endswith("USDT"):
-            continue
+    for item in exchange.get(
+        "symbols",
+        []
+    ):
 
-        if "_" in symbol:
+        if (
+            item.get("status") == "TRADING"
+            and item.get("quoteAsset") == "USDT"
+            and item.get(
+                "isSpotTradingAllowed",
+                True
+            )
+        ):
+
+            symbol = item.get(
+                "symbol",
+                ""
+            )
+
+            if not any(
+                symbol.endswith(x)
+                for x in (
+                    "UPUSDT",
+                    "DOWNUSDT",
+                    "BULLUSDT",
+                    "BEARUSDT"
+                )
+            ):
+
+                eligible.add(symbol)
+
+    tickers = http_json(
+        f"{BINANCE_BASE}/api/v3/ticker/24hr"
+    )
+
+    selected = []
+
+    for ticker in tickers:
+
+        symbol = ticker.get(
+            "symbol"
+        )
+
+        if symbol not in eligible:
+
             continue
 
         try:
 
-            price = float(item["lastPrice"])
+            quote_volume = float(
+                ticker.get(
+                    "quoteVolume",
+                0)
+            )
 
-            volume = float(item["quoteVolume"])
+            price = float(
+                ticker.get(
+                    "lastPrice",
+                0)
+            )
 
-            change = float(item["priceChangePercent"])
-
-            if price <= 0:
-                continue
-
-            if volume < MIN_VOLUME:
-                continue
-
-            if change < MIN_PUMP:
-                continue
-
-            symbols.append({
-
-                "symbol": symbol,
-                "price": price,
-                "volume": volume,
-                "change": change
-
-            })
-
-        except Exception:
+        except (
+            TypeError,
+            ValueError
+        ):
 
             continue
 
-    symbols.sort(
-        key=lambda x: x["volume"],
+        if (
+            price <= 0
+            or quote_volume < MIN_QUOTE_VOLUME_USDT
+        ):
+
+            continue
+
+        selected.append(
+            {
+                "symbol": symbol,
+                "price": price,
+                "quote_volume": quote_volume,
+                "change_24h": float(
+                    ticker.get(
+                        "priceChangePercent",
+                        0
+                    )
+                )
+            }
+        )
+
+    selected.sort(
+        key=lambda x: x["quote_volume"],
         reverse=True
     )
 
-    log(
-        f"Futures pariteleri yenilendi: {len(data)}"
-    )
+    if MAX_SYMBOLS > 0:
 
-    return symbols[:TOP_SYMBOLS]
+        selected = selected[
+            :MAX_SYMBOLS
+        ]
 
-
-# =====================================================
-# KLINES
-# =====================================================
-
-def get_klines(symbol):
-
-    url = (
-        BASE
-        + "/fapi/v1/klines?"
-        + urllib.parse.urlencode({
-
-            "symbol": symbol,
-            "interval": "1m",
-            "limit": 35
-
-        })
-    )
-
-    return request(url)
+    return selected
 
 
-# =====================================================
-# EMA
-# =====================================================
+# ============================================================
+# ESKİ FİYATLARI TEMİZLE
+# ============================================================
 
-def ema(values, period):
+def clean_history(
+    symbol,
+    now
+):
 
-    if len(values) < period:
-
-        return None
-
-    result = sum(values[:period]) / period
-
-    multiplier = 2 / (period + 1)
-
-    for value in values[period:]:
-
-        result = (
-            value * multiplier
-            + result * (1 - multiplier)
-        )
-
-    return result
-
-
-# =====================================================
-# RSI
-# =====================================================
-
-def rsi(values, period=14):
-
-    if len(values) <= period:
-
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-
-        change = values[i] - values[i - 1]
-
-        gains.append(max(change, 0))
-
-        losses.append(max(-change, 0))
-
-    avg_gain = sum(gains[-period:]) / period
-
-    avg_loss = sum(losses[-period:]) / period
-
-    if avg_loss == 0:
-
-        return 100
-
-    rs = avg_gain / avg_loss
-
-    return 100 - (100 / (1 + rs))
-
-
-# =====================================================
-# SIGNAL
-# =====================================================
-
-def analyze(symbol_data):
-
-    symbol = symbol_data["symbol"]
-
-    candles = get_klines(symbol)
-
-    if not candles:
-
-        return None
-
-    if len(candles) < 25:
-
-        return None
-
-    # Son kapanmış mumlar
-    closed = candles[:-1]
-
-    closes = [
-        float(c[4])
-        for c in closed
+    history = price_history[
+        symbol
     ]
 
-    highs = [
-        float(c[2])
-        for c in closed
-    ]
-
-    lows = [
-        float(c[3])
-        for c in closed
-    ]
-
-    volumes = [
-        float(c[5])
-        for c in closed
-    ]
-
-    last = closed[-1]
-
-    previous = closed[-2]
-
-    price = float(last[4])
-
-    open_price = float(last[1])
-
-    high = float(last[2])
-
-    low = float(last[3])
-
-    previous_close = float(previous[4])
-
-    if price <= 0:
-
-        return None
-
-    change_5 = (
-        (price - closes[-6])
-        / closes[-6]
-    ) * 100
-
-    change_15 = (
-        (price - closes[-16])
-        / closes[-16]
-    ) * 100
-
-    rsi_value = rsi(closes)
-
-    ema11 = ema(closes, 11)
-
-    ema21 = ema(closes, 21)
-
-    if rsi_value is None:
-
-        return None
-
-    if ema11 is None or ema21 is None:
-
-        return None
-
-    average_volume = (
-        sum(volumes[-21:-1]) / 20
+    cutoff = (
+        now
+        - WINDOW_SECONDS
+        - 30
     )
 
-    current_volume = volumes[-1]
+    while (
+        history
+        and history[0][0] < cutoff
+    ):
 
-    volume_ratio = (
-        current_volume / average_volume
-        if average_volume > 0
-        else 0
+        history.popleft()
+
+
+# ============================================================
+# REFERANS FİYAT
+# ============================================================
+
+def get_reference_price(
+    symbol,
+    now
+):
+
+    history = price_history[
+        symbol
+    ]
+
+    if not history:
+
+        return None
+
+    target = (
+        now
+        - WINDOW_SECONDS
     )
 
-    # Önceki mumların en düşük seviyesi
-    support = min(lows[-6:-1])
+    candidates = [
+        item
+        for item in history
+        if item[0] <= target
+    ]
 
-    # =================================================
-    # SHORT CONDITIONS
-    # =================================================
+    if candidates:
 
-    score = 0
+        return candidates[-1][1]
 
-    reasons = []
+    return history[0][1]
 
-    # RSI yüksek
-    if rsi_value >= 60:
 
-        score += 1
+# ============================================================
+# GRAFİK OLUŞTURMA
+# ============================================================
 
-        reasons.append(
-            f"RSI: {rsi_value:.1f}"
+def make_chart(
+    symbol,
+    direction,
+    current_price
+):
+
+    try:
+
+        import matplotlib
+
+        matplotlib.use(
+            "Agg"
         )
 
-    # Hacim artışı
-    if volume_ratio >= 1.5:
+        import matplotlib.pyplot as plt
 
-        score += 1
+        import matplotlib.dates as mdates
 
-        reasons.append(
-            f"Hacim: {volume_ratio:.1f}x"
+        raw = http_json(
+            (
+                f"{BINANCE_BASE}/api/v3/klines"
+                f"?symbol={urllib.parse.quote(symbol)}"
+                f"&interval=1m"
+                f"&limit=30"
+            )
         )
 
-    # EMA yukarı yönlü ama fiyat dönüş yapıyor
-    if ema11 >= ema21:
+        if not raw:
 
-        score += 1
+            return None
 
-        reasons.append(
-            "EMA11 >= EMA21"
+        times = [
+            datetime.fromtimestamp(
+                row[0] / 1000,
+                TURKEY_TZ
+            )
+            for row in raw
+        ]
+
+        closes = [
+            float(row[4])
+            for row in raw
+        ]
+
+        volumes = [
+            float(row[5])
+            for row in raw
+        ]
+
+        fig, (
+            ax_price,
+            ax_volume
+        ) = plt.subplots(
+            2,
+            1,
+            figsize=(10, 6),
+            sharex=True,
+            gridspec_kw={
+                "height_ratios": [3, 1]
+            }
         )
 
-    # Önceki hareket yükseliş
-    if change_5 >= 0.5:
-
-        score += 1
-
-        reasons.append(
-            f"5dk hareket: %{change_5:.2f}"
+        fig.patch.set_facecolor(
+            "#10131c"
         )
 
-    # Kırmızı mum
-    if price < open_price:
+        for ax in (
+            ax_price,
+            ax_volume
+        ):
 
-        score += 1
+            ax.set_facecolor(
+                "#171b26"
+            )
 
-        reasons.append(
-            "Kırmızı mum"
+            ax.tick_params(
+                colors="#d8dce6",
+                labelsize=8
+            )
+
+            ax.grid(
+                True,
+                alpha=0.18,
+                color="#9aa4b2"
+            )
+
+            for spine in ax.spines.values():
+
+                spine.set_color(
+                    "#444b5c"
+                )
+
+        if direction == "PUMP":
+
+            line_color = "#24c6a4"
+
+        else:
+
+            line_color = "#ff667a"
+
+        ax_price.plot(
+            times,
+            closes,
+            color=line_color,
+            linewidth=2
         )
 
-    # Destek kırılımı
-    if price < support:
-
-        score += 1
-
-        reasons.append(
-            "Destek kırılımı"
+        ax_price.axhline(
+            current_price,
+            color="#f2c14e",
+            linestyle="--",
+            linewidth=1
         )
 
-    # Minimum teyit
-    if score < 3:
-
-        return None
-
-    # Son mum yükseliyorsa SHORT verme
-    if price > open_price:
-
-        return None
-
-    # =================================================
-    # ENTRY / STOP / TP
-    # =================================================
-
-    entry = price
-
-    stop = high * 1.002
-
-    risk = stop - entry
-
-    if risk <= 0:
-
-        return None
-
-    tp1 = entry - risk
-
-    tp2 = entry - (risk * 2)
-
-    if tp1 <= 0 or tp2 <= 0:
-
-        return None
-
-    # =================================================
-    # COOLDOWN
-    # =================================================
-
-    now = time.time()
-
-    last_signal = LAST_SIGNAL.get(symbol, 0)
-
-    if now - last_signal < SIGNAL_COOLDOWN:
-
-        return None
-
-    LAST_SIGNAL[symbol] = now
-
-    # =================================================
-    # MESSAGE
-    # =================================================
-
-    message = (
-
-        "🔻 <b>SHORT ADAYI — CANLI TARAMA</b>\n"
-
-        f"#{symbol} · Binance USDT-M Futures\n"
-
-        f"⭐ Sinyal skoru: {score}/6\n\n"
-
-        f"🏷 Giriş referansı: {entry:.8f}\n"
-
-        f"🛑 Stop-loss: {stop:.8f}\n"
-
-        f"🎯 TP1 (1R): {tp1:.8f}\n"
-
-        f"🎯 TP2 (2R): {tp2:.8f}\n\n"
-
-        "⏱ Zaman dilimleri\n"
-
-        f"• 1dk: {change_5:.2f}%\n"
-
-        f"• 5dk: {change_5:.2f}%\n"
-
-        f"• 15dk: {change_15:.2f}%\n\n"
-
-        f"📉 EMA11: {ema11:.8f}\n"
-
-        f"📉 EMA21: {ema21:.8f}\n"
-
-        f"📊 RSI(1dk): {rsi_value:.1f}\n"
-
-        f"📊 Hacim: {volume_ratio:.1f}x\n\n"
-
-        f"📈 24s değişim: "
-        f"+{symbol_data['change']:.2f}%\n"
-
-        f"💹 24s hacim: "
-        f"{symbol_data['volume']/1000000:.2f}M USDT\n\n"
-
-        "🔎 Dönüş teyitleri\n"
-
-        + "\n".join(
-            f"• {reason}"
-            for reason in reasons
+        ax_price.set_title(
+            (
+                f"{symbol} | {direction} | "
+                f"Current: {current_price:g}"
+            ),
+            color="white",
+            fontsize=12,
+            pad=10
         )
 
-        + "\n\n"
-
-        + "🔗 Binance Futures paritesi\n"
-
-        + f"https://www.binance.com/en/futures/{symbol}\n\n"
-
-        + datetime.now(TR).strftime(
-            "🕒 %Y-%m-%d %H:%M:%S"
+        ax_price.set_ylabel(
+            "Price",
+            color="#d8dce6"
         )
 
-    )
-
-    return message
-
-
-# =====================================================
-# MAIN SCANNER
-# =====================================================
-
-def scan():
-
-    global LAST_SCAN
-
-    if time.time() < BINANCE_COOLDOWN:
-
-        remaining = int(
-            BINANCE_COOLDOWN - time.time()
+        ax_volume.bar(
+            times,
+            volumes,
+            width=0.0006,
+            color=line_color,
+            alpha=0.75
         )
+
+        ax_volume.set_ylabel(
+            "Volume",
+            color="#d8dce6"
+        )
+
+        ax_volume.xaxis.set_major_formatter(
+            mdates.DateFormatter(
+                "%H:%M",
+                tz=TURKEY_TZ
+            )
+        )
+
+        fig.autofmt_xdate()
+
+        plt.tight_layout()
+
+        path = (
+            f"/tmp/{symbol}_"
+            f"{int(time.time())}.png"
+        )
+
+        fig.savefig(
+            path,
+            dpi=130,
+            facecolor=fig.get_facecolor(),
+            bbox_inches="tight"
+        )
+
+        plt.close(fig)
+
+        return path
+
+    except Exception as exc:
 
         log(
-            f"Binance bekleme süresi: "
-            f"{remaining} saniye; tarama duraklatıldı."
+            f"Grafik oluşturulamadı "
+            f"({symbol}): {exc}"
         )
 
-        return
+        return None
 
-    symbols = get_symbols()
 
-    if not symbols:
+# ============================================================
+# FİYAT FORMAT
+# ============================================================
 
-        log("Parite listesi alınamadı.")
+def fmt_price(value):
 
-        return
+    if value >= 1000:
 
-    candidates = symbols[:CANDLE_SYMBOLS]
+        return f"{value:,.2f}"
 
-    alarms = 0
+    if value >= 1:
 
-    for item in candidates:
+        return (
+            f"{value:.4f}"
+            .rstrip("0")
+            .rstrip(".")
+        )
 
-        if time.time() < BINANCE_COOLDOWN:
+    return (
+        f"{value:.8f}"
+        .rstrip("0")
+        .rstrip(".")
+    )
 
-            log("Binance beklemesi başladı; tarama durdu.")
 
-            break
+# ============================================================
+# PUMP / DUMP TELEGRAM ALARMI
+# ============================================================
+
+def send_alert(
+    symbol,
+    direction,
+    start_price,
+    current_price,
+    change_pct,
+    quote_volume,
+    volume_change
+):
+
+    if direction == "PUMP":
+
+        arrow = "🚀"
+
+        title = "Pump Activity"
+
+        color_emoji = "🟢🟢"
+
+    else:
+
+        arrow = "🔻"
+
+        title = "Dump Activity"
+
+        color_emoji = "🔴🔴"
+
+    volume_line = (
+        f"📊 24s Hacim: "
+        f"<b>${quote_volume:,.0f}</b>"
+    )
+
+    if volume_change is not None:
+
+        volume_line += (
+            f" ({volume_change:+.2f}%)"
+        )
+
+    text = (
+
+        f"{arrow} "
+        f"<b>{direction} - {symbol} [Binance]</b>\n"
+
+        f"{title} on {symbol} "
+        f"{color_emoji}\n\n"
+
+        f"💰 Fiyat: "
+        f"<b>${fmt_price(start_price)} "
+        f"→ ${fmt_price(current_price)} "
+        f"({change_pct:+.2f}%)</b>\n"
+
+        f"{volume_line}\n"
+
+        f"⏱ Hareket: son "
+        f"{WINDOW_SECONDS // 60} dakika\n"
+
+        f"🕒 "
+        f"{datetime.now(TURKEY_TZ).strftime('%d.%m.%Y %H:%M:%S')} "
+        f"(Türkiye)"
+    )
+
+    chart_path = make_chart(
+        symbol,
+        direction,
+        current_price
+    )
+
+    if chart_path:
+
+        result = telegram_request(
+            "sendPhoto",
+            {
+                "chat_id": CHAT_ID,
+                "caption": text,
+                "parse_mode": "HTML"
+            },
+            photo_path=chart_path
+        )
 
         try:
 
-            message = analyze(item)
-
-            if message:
-
-                if telegram(message):
-
-                    alarms += 1
-
-                    log(
-                        f"SHORT alarm gönderildi: "
-                        f"{item['symbol']}"
-                    )
-
-        except Exception as e:
-
-            log(
-                f"{item['symbol']} analiz hatası: {e}"
+            os.remove(
+                chart_path
             )
 
-        # İstekleri kontrollü aralıkla gönder
-        time.sleep(1.2)
-
-    LAST_SCAN = time.time()
-
-    log(
-        f"Futures tarama: {len(candidates)} parite "
-        f"| {alarms} alarm"
-    )
-
-
-# =====================================================
-# RENDER HEALTH SERVER
-# =====================================================
-
-def health_server():
-
-    from http.server import (
-        BaseHTTPRequestHandler,
-        HTTPServer
-    )
-
-    class Handler(BaseHTTPRequestHandler):
-
-        def do_GET(self):
-
-            body = b"Futures bot running"
-
-            self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(body)
-
-        def log_message(self, *args):
+        except OSError:
 
             pass
 
-    port = int(
-        os.environ.get("PORT", "10000")
+        return result
+
+    return send_text(
+        text
     )
 
-    server = HTTPServer(
-        ("0.0.0.0", port),
-        Handler
+
+# ============================================================
+# BOT ÇALIŞTIRMA
+# ============================================================
+
+def run():
+
+    if not BOT_TOKEN or not CHAT_ID:
+
+        log(
+            "UYARI: BOT_TOKEN ve CHAT_ID "
+            "Render Environment Variables "
+            "içinde tanımlanmalı."
+        )
+
+    send_text(
+        "🤖 <b>Pump & Dump Alert Bot aktif</b>\n"
+
+        f"⏱ Kontrol: {CHECK_SECONDS} sn\n"
+
+        f"📈 Pump: +{PUMP_PERCENT:.1f}% "
+        f"/ 📉 Dump: -{DUMP_PERCENT:.1f}%\n"
+
+        f"🪟 Pencere: "
+        f"{WINDOW_SECONDS // 60} dk"
     )
-
-    log(
-        f"Health server port: {port}"
-    )
-
-    server.serve_forever()
-
-
-# =====================================================
-# START
-# =====================================================
-
-def main():
-
-    log("Binance Futures SHORT bot başlatılıyor.")
-
-    if not BOT_TOKEN:
-
-        log("BOT_TOKEN eksik.")
-
-    if not CHAT_ID:
-
-        log("CHAT_ID eksik.")
-
-    threading.Thread(
-        target=health_server,
-        daemon=True
-    ).start()
 
     while True:
 
+        loop_started = time.time()
+
         try:
 
-            scan()
+            now = time.time()
 
-        except Exception as e:
+            tickers = get_symbols_and_tickers()
 
-            log(f"Tarama hatası: {e}")
+            alert_count = 0
 
-        log(
-            f"Sonraki tarama "
-            f"{SCAN_INTERVAL} saniye sonra."
+            for ticker in tickers:
+
+                symbol = ticker[
+                    "symbol"
+                ]
+
+                price = ticker[
+                    "price"
+                ]
+
+                quote_volume = ticker[
+                    "quote_volume"
+                ]
+
+                history = price_history[
+                    symbol
+                ]
+
+                history.append(
+                    (
+                        now,
+                        price
+                    )
+                )
+
+                clean_history(
+                    symbol,
+                    now
+                )
+
+                reference = get_reference_price(
+                    symbol,
+                    now
+                )
+
+                if (
+                    reference is None
+                    or reference <= 0
+                ):
+
+                    last_volume[
+                        symbol
+                    ] = quote_volume
+
+                    continue
+
+                change_pct = (
+                    (price - reference)
+                    / reference
+                    * 100.0
+                )
+
+                previous_volume = last_volume.get(
+                    symbol
+                )
+
+                volume_change = None
+
+                if (
+                    previous_volume
+                    and previous_volume > 0
+                ):
+
+                    volume_change = (
+                        (
+                            quote_volume
+                            - previous_volume
+                        )
+                        / previous_volume
+                        * 100.0
+                    )
+
+                direction = None
+
+                if change_pct >= PUMP_PERCENT:
+
+                    direction = "PUMP"
+
+                elif change_pct <= -DUMP_PERCENT:
+
+                    direction = "DUMP"
+
+                cooldown_ok = (
+                    now
+                    - last_alert.get(
+                        symbol,
+                        0
+                    )
+                    >= COOLDOWN_SECONDS
+                )
+
+                volume_ok = (
+
+                    volume_change is None
+
+                    or volume_change
+                    >= VOLUME_INCREASE_PERCENT
+
+                    or abs(change_pct)
+                    >= (
+                        PUMP_PERCENT
+                        * 1.5
+                    )
+                )
+
+                if (
+                    direction
+                    and cooldown_ok
+                    and volume_ok
+                ):
+
+                    log(
+                        f"{direction} "
+                        f"{symbol}: "
+                        f"{change_pct:+.2f}%"
+                    )
+
+                    send_alert(
+                        symbol,
+                        direction,
+                        reference,
+                        price,
+                        change_pct,
+                        quote_volume,
+                        volume_change
+                    )
+
+                    last_alert[
+                        symbol
+                    ] = now
+
+                    alert_count += 1
+
+                last_volume[
+                    symbol
+            ] = quote_volume
+
+            log(
+                f"Tarama tamamlandı: "
+                f"{len(tickers)} parite "
+                f"| {alert_count} alarm"
+            )
+
+        except urllib.error.HTTPError as exc:
+
+            log(
+                f"Binance HTTP hata: "
+                f"{exc.code} {exc.reason}"
+            )
+
+        except Exception as exc:
+
+            log(
+                f"Tarama hatası: {exc}"
+            )
+
+        elapsed = (
+            time.time()
+            - loop_started
         )
 
-        time.sleep(SCAN_INTERVAL)
+        time.sleep(
+            max(
+                1,
+                CHECK_SECONDS - elapsed
+            )
+        )
 
+
+# ============================================================
+# BAŞLAT
+# ============================================================
 
 if __name__ == "__main__":
 
-    main()
+    run()
