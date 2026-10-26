@@ -1,777 +1,182 @@
-
-import urllib.request
-import urllib.parse
-import urllib.error
-import json
-import time
-import socket
+import urllib.request, urllib.parse, json, time, socket
 import os
+from datetime import datetime, timedelta, timezone
 import threading
 import http.server
 import socketserver
-import re
-from datetime import datetime, timedelta, timezone
 
+# Ağ kilitlenmelerini önlemek için istek zaman aşımı (10 saniye)
 socket.setdefaulttimeout(10)
 
-# =====================================================
-# AYARLAR
-# =====================================================
-
-T = os.environ.get("BOT_TOKEN", "").strip()
-C = os.environ.get("CHAT_ID", "1623907197").strip()
-
+T = os.environ.get("BOT_TOKEN")
+C = os.environ.get("CHAT_ID", "1623907197")
 TR_Saati = timezone(timedelta(hours=3))
-BASE = "https://fapi.binance.com"
 
-TARAMA_ARALIGI = 300
-COOLDOWN = 900
-MIN_24H_DEGISIM = 5.0
-MIN_24H_HACIM = 5_000_000
-MAX_ADAY = 5
-MIN_SKOR = 4
-
-COOLDOWN_FILE = "/tmp/binance_cooldown.json"
-
-BINANCE_BEKLEME_BITIS = 0
 son_sinyaller = {}
-son_gunluk_veriler = {}
-cooldown_lock = threading.Lock()
+COOLDOWN = 900 # 15 dakika
+last_update_id = 0
 
+def tg(chat_id, m):
+    try:
+        d = urllib.parse.urlencode({"chat_id": chat_id, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
+        req = urllib.request.Request("https://api.telegram.org/bot" + T + "/sendMessage", data=d)
+        urllib.request.urlopen(req).read()
+    except:
+        pass
 
-# =====================================================
-# ZAMAN / LOG
-# =====================================================
-
-def simdi():
-    return datetime.now(TR_Saati)
-
-
-def log(m):
-    print(
-        f"[{simdi().strftime('%Y-%m-%d %H:%M:%S')} TR] {m}",
-        flush=True
-    )
-
-
-def fiyat(v):
-    if v is None:
-        return "N/A"
-
-    v = float(v)
-
-    if v >= 1000:
-        return f"{v:.2f}"
-    if v >= 1:
-        return f"{v:.4f}"
-    if v >= 0.01:
-        return f"{v:.6f}"
-    return f"{v:.8f}"
-
+def gj(u):
+    try:
+        req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+        return json.loads(urllib.request.urlopen(req).read().decode())
+    except:
+        return None
 
 def format_vol(v):
-    v = float(v)
-    if v >= 1_000_000:
-        return f"{v / 1_000_000:.2f}M"
-    if v >= 1_000:
-        return f"{v / 1_000:.2f}K"
+    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
+    elif v >= 1_000: return f"{v/1_000:.2f}K"
     return f"{v:.2f}"
 
-
-# =====================================================
-# BINANCE BEKLEME SÜRESİ
-# =====================================================
-
-def beklemeyi_yukle():
-    global BINANCE_BEKLEME_BITIS
-
-    try:
-        with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        BINANCE_BEKLEME_BITIS = float(data.get("until", 0))
-
-        if BINANCE_BEKLEME_BITIS > time.time():
-            kalan = int(BINANCE_BEKLEME_BITIS - time.time())
-            log(f"Kayıtlı Binance beklemesi yüklendi: {kalan} saniye")
-
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        BINANCE_BEKLEME_BITIS = 0
-
-
-def binance_bekleme_ayarla(saniye, neden):
-    global BINANCE_BEKLEME_BITIS
-
-    saniye = max(60, int(saniye))
-
-    with cooldown_lock:
-        BINANCE_BEKLEME_BITIS = max(
-            BINANCE_BEKLEME_BITIS,
-            time.time() + saniye
-        )
-
-        bitis = BINANCE_BEKLEME_BITIS
-
-        try:
-            with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
-                json.dump({"until": bitis}, f)
-        except OSError as e:
-            log(f"Bekleme dosyası yazılamadı: {e}")
-
-    log(
-        f"{neden}: yaklaşık {int(bitis - time.time())} saniye. "
-        "Binance istekleri durduruldu."
-    )
-
-
-def binance_bekliyor():
-    return time.time() < BINANCE_BEKLEME_BITIS
-
-
-# =====================================================
-# TELEGRAM
-# =====================================================
-
-def tg(chat_id, message):
-    if not T or not chat_id:
-        log("Telegram gönderilemedi: BOT_TOKEN veya CHAT_ID eksik.")
-        return False
-
-    try:
-        data = urllib.parse.urlencode({
-            "chat_id": str(chat_id),
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true"
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{T}/sendMessage",
-            data=data
-        )
-
-        with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode("utf-8"))
-
-        if result.get("ok"):
-            return True
-
-        log(f"Telegram API hatası: {result}")
-        return False
-
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = ""
-
-        log(f"Telegram HTTP {e.code}: {detail[:200]}")
-        return False
-
-    except Exception as e:
-        log(f"Telegram bağlantı hatası: {e}")
-        return False
-
-
-# =====================================================
-# BINANCE API
-# =====================================================
-
-def gj(url):
-    if "fapi.binance.com" in url and binance_bekliyor():
-        return None
-
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-
-        with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode("utf-8"))
-
-        # Yanıt beklenirken başka istek 418 almış olabilir.
-        if "fapi.binance.com" in url and binance_bekliyor():
-            return None
-
-        return result
-
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            body = ""
-
-        if "fapi.binance.com" in url and e.code in (418, 429):
-            wait = None
-
-            retry = e.headers.get("Retry-After")
-            if retry:
-                try:
-                    wait = int(float(retry))
-                except (ValueError, TypeError):
-                    pass
-
-            match = re.search(r"banned until (\d+)", body, re.IGNORECASE)
-
-            if match:
-                try:
-                    stamp = int(match.group(1))
-                    if stamp > 10**12:
-                        stamp //= 1000
-
-                    wait = max(wait or 0, int(stamp - time.time()))
-                except (ValueError, TypeError):
-                    pass
-
-            if wait is None:
-                wait = 1800 if e.code == 418 else 300
-
-            binance_bekleme_ayarla(wait, f"Binance HTTP {e.code}")
-
-        else:
-            log(f"HTTP {e.code}: {body[:200]}")
-
-        return None
-
-    except Exception as e:
-        log(f"API bağlantı hatası: {e}")
-        return None
-
-
-def futures_api(path, params=None):
-    if binance_bekliyor():
-        return None
-
-    url = BASE + path
-
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-
-    return gj(url)
-
-
-# =====================================================
-# GÖSTERGELER
-# =====================================================
-
 def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return None
-
-    deltas = [
-        prices[i] - prices[i - 1]
-        for i in range(1, len(prices))
-    ]
-
-    gains = [max(d, 0) for d in deltas]
-    losses = [max(-d, 0) for d in deltas]
-
+    if len(prices) < period + 1: return 50
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-
     for i in range(period, len(deltas)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_ema(values, period):
-    if len(values) < period:
-        return None
-
-    result = sum(values[:period]) / period
-    multiplier = 2 / (period + 1)
-
-    for value in values[period:]:
-        result = value * multiplier + result * (1 - multiplier)
-
-    return result
-
-
-def get_candles(symbol, interval, limit=60):
-    data = futures_api(
-        "/fapi/v1/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit}
-    )
-
-    if binance_bekliyor():
-        return None
-
-    if not isinstance(data, list) or len(data) < 22:
-        return None
-
-    return data[:-1]
-
-
-def mum_yonu(candles):
-    if not candles or len(candles) < 2:
-        return "N/A"
-
-    a = float(candles[-2][4])
-    b = float(candles[-1][4])
-
-    if b > a:
-        return "Yukarı"
-    if b < a:
-        return "Aşağı"
-    return "Yatay"
-
-
-# =====================================================
-# GÜNLÜK HIGH / LOW — 12 SAAT ÖNBELLEK
-# =====================================================
-
-def get_daily_levels(symbol):
-    cached = son_gunluk_veriler.get(symbol)
-
-    if cached and time.time() - cached["time"] < 43200:
-        return cached["data"]
-
-    data = futures_api(
-        "/fapi/v1/klines",
-        {"symbol": symbol, "interval": "1d", "limit": 365}
-    )
-
-    if binance_bekliyor():
-        return None
-
-    if not isinstance(data, list) or not data:
-        return None
-
-    try:
-        highs = [float(x[2]) for x in data]
-        lows = [float(x[3]) for x in data]
-        n = min(30, len(data))
-
-        levels = {
-            "high30": max(highs[-n:]),
-            "low30": min(lows[-n:]),
-            "high365": max(highs),
-            "low365": min(lows)
-        }
-
-        son_gunluk_veriler[symbol] = {
-            "time": time.time(),
-            "data": levels
-        }
-
-        return levels
-
-    except (ValueError, TypeError, IndexError):
-        return None
-
-
-# =====================================================
-# FUTURES EK METRİKLERİ
-# =====================================================
-
-def get_oi_change(symbol):
-    data = futures_api(
-        "/futures/data/openInterestHist",
-        {"symbol": symbol, "period": "5m", "limit": 2}
-    )
-
-    if binance_bekliyor():
-        return None
-
-    if not isinstance(data, list) or len(data) < 2:
-        return None
-
-    try:
-        old = float(data[0]["sumOpenInterest"])
-        new = float(data[-1]["sumOpenInterest"])
-
-        if old == 0:
-            return None
-
-        return (new - old) / old * 100
-
-    except (ValueError, TypeError, KeyError):
-        return None
-
-
-def get_long_short(symbol):
-    data = futures_api(
-        "/futures/data/globalLongShortAccountRatio",
-        {"symbol": symbol, "period": "5m", "limit": 1}
-    )
-
-    if binance_bekliyor():
-        return None
-
-    if not isinstance(data, list) or not data:
-        return None
-
-    try:
-        return {
-            "ratio": float(data[-1]["longShortRatio"]),
-            "long": float(data[-1]["longAccount"]) * 100,
-            "short": float(data[-1]["shortAccount"]) * 100
-        }
-
-    except (ValueError, TypeError, KeyError):
-        return None
-
-
-# =====================================================
-# ADAY SEÇİMİ
-# =====================================================
-
-def get_candidates():
-    tickers = futures_api("/fapi/v1/ticker/24hr")
-
-    if binance_bekliyor():
-        return None
-
-    if not isinstance(tickers, list):
-        return None
-
-    candidates = []
-
-    for t in tickers:
-        try:
-            symbol = t["symbol"]
-
-            if not symbol.endswith("USDT"):
-                continue
-
-            if any(x in symbol for x in (
-                "UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"
-            )):
-                continue
-
-            change = float(t["priceChangePercent"])
-            volume = float(t["quoteVolume"])
-
-            if change < MIN_24H_DEGISIM:
-                continue
-
-            if volume < MIN_24H_HACIM:
-                continue
-
-            candidates.append(t)
-
-        except (ValueError, TypeError, KeyError):
-            continue
-
-    candidates.sort(
-        key=lambda x: float(x.get("quoteVolume", 0)),
-        reverse=True
-    )
-
-    return candidates[:MAX_ADAY]
-
-
-# =====================================================
-# SHORT DÖNÜŞ ANALİZİ
-# =====================================================
-
-def analyze_symbol(ticker):
-    symbol = ticker["symbol"]
-
-    one = get_candles(symbol, "1m", 60)
-    if not one or binance_bekliyor():
-        return None
-
-    five = get_candles(symbol, "5m", 30)
-    if not five or binance_bekliyor():
-        return None
-
-    fifteen = get_candles(symbol, "15m", 30)
-    if not fifteen or binance_bekliyor():
-        return None
-
-    try:
-        closes = [float(x[4]) for x in one]
-        opens = [float(x[1]) for x in one]
-        highs = [float(x[2]) for x in one]
-        lows = [float(x[3]) for x in one]
-        volumes = [float(x[7]) for x in one]
-
-        last = one[-1]
-        entry = float(last[4])
-        open_price = float(last[1])
-
-        if entry <= 0:
-            return None
-
-        start = float(one[-6][4])
-        move5 = (entry - start) / start * 100 if start else 0
-
-        rsi = calculate_rsi(closes)
-        ema11 = calculate_ema(closes, 11)
-        ema21 = calculate_ema(closes, 21)
-
-        previous_volumes = volumes[-21:-1]
-        average_volume = (
-            sum(previous_volumes) / len(previous_volumes)
-            if previous_volumes else 0
-        )
-
-        volume_ratio = (
-            volumes[-1] / average_volume if average_volume > 0 else 0
-        )
-
-        support = min(lows[-6:-1])
-        support_break = entry < support
-        red_candle = entry < open_price
-
-        score = 0
-        reasons = []
-
-        if move5 >= 1:
-            score += 1
-            reasons.append(f"Önceki 5 mum hareketi: %{move5:.2f}")
-
-        if rsi is not None and rsi >= 60:
-            score += 1
-            reasons.append(f"RSI: {rsi:.1f}")
-
-        if volume_ratio >= 1.5:
-            score += 1
-            reasons.append(f"Hacim: ortalamanın {volume_ratio:.1f} katı")
-
-        if ema11 is not None and ema21 is not None:
-            if ema11 >= ema21:
-                score += 1
-                ema_text = "EMA11 ≥ EMA21 (yukarı)"
-            else:
-                ema_text = "EMA11 < EMA21 (aşağı)"
-        else:
-            ema_text = "N/A"
-
-        if support_break:
-            score += 1
-            reasons.append("Destek kırılımı")
-
-        if red_candle:
-            score += 1
-            reasons.append("Kırmızı mum")
-
-        if score < MIN_SKOR or not support_break or not red_candle:
-            return None
-
-        stop = max(highs[-5:])
-
-        if stop <= entry:
-            stop = entry * 1.005
-
-        risk = stop - entry
-
-        if risk <= 0:
-            return None
-
-        risk_pct = risk / entry * 100
-
-        if risk_pct > 5:
-            return None
-
-        tp1 = entry - risk
-        tp2 = entry - 2 * risk
-
-        change24 = float(ticker["priceChangePercent"])
-        volume24 = float(ticker["quoteVolume"])
-
-        oi = get_oi_change(symbol)
-        if binance_bekliyor():
-            return None
-
-        ls = get_long_short(symbol)
-        if binance_bekliyor():
-            return None
-
-        levels = get_daily_levels(symbol)
-        if binance_bekliyor():
-            return None
-
-        oi_text = f"{oi:+.2f}% / 5dk" if oi is not None else "N/A"
-        ls_text = f"{ls['ratio']:.2f} (hesap oranı)" if ls else "N/A"
-
-        high30 = levels["high30"] if levels else None
-        low30 = levels["low30"] if levels else None
-        high365 = levels["high365"] if levels else None
-        low365 = levels["low365"] if levels else None
-
-        rsi_text = f"{rsi:.1f}" if rsi is not None else "N/A"
-        now_text = simdi().strftime("%Y-%m-%d %H:%M:%S")
-
-        message = (
-            f"🔻 <b>SHORT ADAYI — TEYİTLİ DÖNÜŞ</b>\n"
-            f"<b>#{symbol}</b> · Binance USDT-M Futures\n"
-            f"⭐ Sinyal skoru: {score}/6\n\n"
-            f"🏷 Giriş referansı: {fiyat(entry)}\n"
-            f"🛑 Stop-loss: {fiyat(stop)} (girişten +%{risk_pct:.2f})\n"
-            f"🎯 TP1 (1R): {fiyat(tp1)}\n"
-            f"🎯 TP2 (2R): {fiyat(tp2)}\n\n"
-            f"⏱ Zaman dilimleri (son kapanmış mum)\n"
-            f"• 1dk: {mum_yonu(one)} | 5dk: {mum_yonu(five)} | "
-            f"15dk: {mum_yonu(fifteen)}\n"
-            f"📉 EMA: {ema_text}\n"
-            f"📊 RSI(1dk): {rsi_text} | Hacim: ortalamanın {volume_ratio:.1f} katı\n"
-            f"📈 24s değişim: {change24:+.2f}% | "
-            f"24s hacim: {volume24 / 1_000_000:.2f}M USDT\n"
-            f"💹 Açık pozisyon değişimi: {oi_text}\n"
-            f"👥 Long/Short hesap oranı: {ls_text}\n"
-            f"🗓 30g High/Low: {fiyat(high30)} / {fiyat(low30)}\n"
-            f"📆 365g High/Low: {fiyat(high365)} / {fiyat(low365)}\n\n"
-            f"🔎 <b>Dönüş teyitleri</b>\n"
-            + "".join(f"• {r}\n" for r in reasons)
-            + f"\n🔗 <a href='https://www.binance.com/en/futures/{symbol}'>"
-              f"Binance Futures paritesi</a>\n"
-            f"🕒 {now_text}\n\n"
-            f"Bilgilendirme amaçlı sinyaldir; garanti değildir. "
-            f"Bot gerçek emir açmaz. Ek piyasa metrikleri Binance API "
-            f"yanıtına göre N/A görünebilir. Komisyon, funding ve kayma "
-            f"hesaba katılmaz."
-        )
-
-        return {"symbol": symbol, "score": score, "message": message}
-
-    except Exception as e:
-        log(f"{symbol} analiz hatası: {e}")
-        return None
-
-
-# =====================================================
-# ANA TARAMA DÖNGÜSÜ
-# =====================================================
-
-def bot_loop():
-    log("Binance Futures SHORT bot başlatılıyor.")
-    beklemeyi_yukle()
-
-    if not T:
-        log("UYARI: Render BOT_TOKEN değişkeni bulunamadı.")
-
-    if not C:
-        log("UYARI: CHAT_ID değişkeni boş.")
-
-    if T and C:
-        if tg(
-            C,
-            "✅ <b>SHORT FUTURES BOT BAŞLADI</b>\n\n"
-            "Telegram bağlantısı test ediliyor.\n"
-            "Binance USDT-M Futures botu aktif.\n"
-            "Bot gerçek emir açmaz; yalnızca sinyal gönderir."
-        ):
-            log("Telegram başlangıç mesajı gönderildi.")
-        else:
-            log("Telegram başlangıç mesajı gönderilemedi.")
-
+    if avg_loss == 0: return 100
+    return 100 - (100 / (1 + (avg_gain / avg_loss)))
+
+# --- TELEGRAM KOMUT DİNLEYİCİSİ ---
+def command_listener():
+    global last_update_id
     while True:
         try:
-            if binance_bekliyor():
-                kalan = int(BINANCE_BEKLEME_BITIS - time.time())
-                log(f"Binance beklemesi sürüyor: {kalan} saniye.")
-                time.sleep(min(180, max(5, kalan)))
+            updates = gj(f"https://api.telegram.org/bot{T}/getUpdates?offset={last_update_id + 1}&timeout=10")
+            if updates and updates.get("ok"):
+                for u in updates["result"]:
+                    last_update_id = u["update_id"]
+                    if "message" in u and "text" in u["message"]:
+                        text = u["message"]["text"]
+                        chat_id = u["message"]["chat"]["id"]
+                        if text.startswith("/ratio"):
+                            parts = text.split()
+                            if len(parts) < 2:
+                                tg(chat_id, "⚠️ Kullanım: /ratio btcusdt")
+                                continue
+                            symbol = parts[1].upper()
+                            if not symbol.endswith("USDT"): symbol += "USDT"
+                            period = parts[2].lower() if len(parts) > 2 else "1h"
+                            url = f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={period}&limit=1"
+                            data = gj(url)
+                            if data and len(data) > 0:
+                                d = data[0]
+                                msg = (f"Long/Short Ratio📊\nBinance - {symbol}\n⏳ <b>Timeframe:</b> {period}\n"
+                                       f"📈 <b>Long:</b> {float(d['longAccount'])*100:.2f}%\n"
+                                       f"📉 <b>Short:</b> {float(d['shortAccount'])*100:.2f}%\n"
+                                       f"⚖️ <b>Ratio:</b> {float(d['longShortRatio']):.2f}\n\n"
+                                       f"<i>Last Updated: {datetime.now(TR_Saati).strftime('%H:%M')} (TR)</i>")
+                                tg(chat_id, msg)
+                            else:
+                                tg(chat_id, f"❌ {symbol} için veri bulunamadı.")
+        except:
+            pass
+        time.sleep(2)
+
+# --- OTOMATİK TARAMA MOTORU (BINANCE FUTURES) ---
+def bot_loop():
+    tg(C, "🚀 <b>AzCrypto Futures Bot Başlatıldı!</b>\nSadece Binance Futures taranıyor.")
+    
+    while True:
+        try:
+            # Binance FUTURES piyasa özeti
+            tickers = gj("https://fapi.binance.com/fapi/v1/ticker/24hr")
+            if not tickers:
+                time.sleep(5)
                 continue
 
-            candidates = get_candidates()
+            adaylar = []
+            for t in tickers:
+                if t['symbol'].endswith('USDT'):
+                    try:
+                        vol = float(t['quoteVolume'])
+                        if vol > 10_000_000: # 10 Milyon Dolar üzeri likit Futures coinleri
+                            adaylar.append((t['symbol'], t['priceChangePercent'], vol, t['highPrice'], t['lowPrice']))
+                    except:
+                        pass
 
-            if binance_bekliyor():
-                continue
-
-            if candidates is None:
-                log("Aday listesi alınamadı; 60 saniye sonra denenecek.")
-                time.sleep(60)
-                continue
-
-            log(
-                f"Futures adayları: {len(candidates)} "
-                f"| En az 24s değişim: %{MIN_24H_DEGISIM:.1f}"
-            )
-
-            alerts = 0
-            tarama_durdu = False
-
-            for ticker in candidates:
-                if binance_bekliyor():
-                    tarama_durdu = True
-                    break
-
-                symbol = ticker["symbol"]
-
-                if (
-                    symbol in son_sinyaller
-                    and time.time() - son_sinyaller[symbol] < COOLDOWN
-                ):
+            for symbol, chg, vol, high_24, low_24 in adaylar:
+                if symbol in son_sinyaller and (time.time() - son_sinyaller[symbol] < COOLDOWN):
                     continue
 
-                result = analyze_symbol(ticker)
+                # 5 dakikalık Futures mum verisi
+                klines = gj(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=22")
+                if not klines or len(klines) < 22: continue
 
-                if binance_bekliyor():
-                    tarama_durdu = True
-                    break
+                curr_close = float(klines[-1][4])
+                curr_vol = float(klines[-1][7])
+                prev_close = float(klines[-2][4])
+                closes = [float(k[4]) for k in klines[:-1]]
+                
+                avg_vol = sum(float(k[7]) for k in klines[:-1]) / 20
+                if avg_vol == 0: continue
+                
+                vol_ratio = curr_vol / avg_vol
+                price_change_5m = ((curr_close - prev_close) / prev_close) * 100
 
-                if result:
-                    if tg(C, result["message"]):
-                        son_sinyaller[symbol] = time.time()
-                        alerts += 1
-                        log(
-                            f"SİNYAL GÖNDERİLDİ: {symbol} "
-                            f"| Skor: {result['score']}/6"
-                        )
-                    else:
-                        log(f"Telegram sinyali gönderemedi: {symbol}")
+                # Sinyal Şartı: Fiyat %3+ ve Hacim ortalamanın 3 katı+
+                if price_change_5m >= 3.0 and vol_ratio >= 3.0:
+                    
+                    # Futures Taker Oranı
+                    taker = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=1")
+                    taker_pct = 50
+                    if taker and len(taker) > 0:
+                        buy_vol = float(taker[0]['buyVol'])
+                        sell_vol = float(taker[0]['sellVol'])
+                        total = buy_vol + sell_vol
+                        if total > 0:
+                            taker_pct = (buy_vol / total) * 100
+                    
+                    # RSI
+                    rsi = calculate_rsi(closes, 14)
+                    rsi_emoji = "🔴" if rsi > 70 else "🟢" if rsi < 30 else ""
+                    
+                    dist_high = ((float(high_24) - curr_close) / curr_close) * 100
+                    dist_low = ((curr_close - float(low_24)) / float(low_24)) * 100
 
-                # Adaylar arasında kısa ara.
-                time.sleep(2)
+                    # Görseldeki Birebir Format (M5 Futures olarak güncellendi)
+                    msg = (f"#<b>{symbol}</b> 💚 <b>Price {price_change_5m:+.2f}% Vol ❌ {vol_ratio:.1f}</b> 💰\n"
+                           f"(M5 Futures)\n\n"
+                           f"Total Vol {format_vol(curr_vol)} Taker {taker_pct:.0f}% Rsi/{rsi:.0f}{rsi_emoji}\n"
+                           f"────────────────\n"
+                           f"🏷 Price: {curr_close:.4f} ...\n"
+                           f"🕒 24h: {float(chg):+.2f}% Vol {format_vol(float(vol))}\n"
+                           f"⬆ High: {float(high_24):.4f} ({dist_high:+.2f}%)\n"
+                           f"⬇ Low: {float(low_24):.4f} ({dist_low:+.2f}%)")
+                    
+                    tg(C, msg)
+                    son_sinyaller[symbol] = time.time()
+                    time.sleep(1) # API limitini koru
 
-            if tarama_durdu:
-                log("Binance kısıtlaması nedeniyle mevcut tarama kesildi.")
-                continue
-
-            log(f"Tarama tamamlandı: {len(candidates)} aday | {alerts} alarm")
-            time.sleep(TARAMA_ARALIGI)
-
+            time.sleep(10)
         except Exception as e:
-            log(f"Tarama motoru hatası: {e}")
-            time.sleep(30)
+            time.sleep(10)
 
-
-# =====================================================
-# RENDER HEALTH SERVER
-# =====================================================
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"Futures SHORT bot is running!"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, format_string, *args):
-        return
-
-
+# --- RENDER PORT SUNUCUSU ---
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
-
-    class ReusableServer(socketserver.ThreadingTCPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-
-    with ReusableServer(("0.0.0.0", port), Handler) as server:
-        log(f"Health server port: {port}")
-        server.serve_forever()
-
-
-# =====================================================
-# BAŞLAT
-# =====================================================
+    Handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), Handler) as httpd:
+        httpd.serve_forever()
 
 if __name__ == "__main__":
+    # 1. Render'ın kapanmaması için web sunucusu (Cronjob'un ping atacağı yer)
     threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    # 2. Telegram komut dinleyicisi (/ratio)
+    threading.Thread(target=command_listener, daemon=True).start()
+    
+    # 3. Ana tarama motoru
     bot_loop()
