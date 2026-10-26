@@ -17,15 +17,15 @@ BASE_URL = "https://fapi.binance.com"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
 PORT = int(os.environ.get("PORT", "10000"))
-SCAN_INTERVAL_SECONDS = max(180, int(os.environ.get("SCAN_INTERVAL_SECONDS", "240")))
-MAX_SYMBOLS = max(3, min(6, int(os.environ.get("MAX_SYMBOLS", "5"))))
+SCAN_INTERVAL_SECONDS = max(180, int(os.environ.get("SCAN_INTERVAL_SECONDS", "300")))
+MAX_SYMBOLS = max(2, min(4, int(os.environ.get("MAX_SYMBOLS", "3"))))
 MIN_QUOTE_VOLUME_USDT = float(os.environ.get("MIN_QUOTE_VOLUME_USDT", "5000000"))
-MIN_PUMP_5M_PCT = float(os.environ.get("MIN_PUMP_5M_PCT", "1.5"))
-MIN_SINGLE_CANDLE_PCT = float(os.environ.get("MIN_SINGLE_CANDLE_PCT", "1.0"))
-MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "1.2"))
-RSI_MIN = float(os.environ.get("RSI_MIN", "60"))
+MIN_PUMP_5M_PCT = float(os.environ.get("MIN_PUMP_5M_PCT", "1.2"))
+MIN_SINGLE_CANDLE_PCT = float(os.environ.get("MIN_SINGLE_CANDLE_PCT", "0.2"))
+MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "1.1"))
+RSI_MIN = float(os.environ.get("RSI_MIN", "58"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1200"))
-BINANCE_COOLDOWN_SECONDS = int(os.environ.get("BINANCE_COOLDOWN_SECONDS", "7200"))
+BINANCE_COOLDOWN_SECONDS = int(os.environ.get("BINANCE_COOLDOWN_SECONDS", "14400"))
 DATA_FILE = os.environ.get("DATA_FILE", "shortbot_data.json")
 COOLDOWN_FILE = os.environ.get("COOLDOWN_FILE", "binance_cooldown.json")
 TR_TZ = timezone(timedelta(hours=3))
@@ -35,10 +35,19 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
 log = logging.getLogger("azcrypto-short")
 _state_lock = threading.Lock()
 _last_signal = {}
-BINANCE_COOLDOWN_UNTIL = 0.0
+# Logdaki mevcut HTTP 418 beklemesinin deploy sırasında sıfırlanmaması için
+# 2026-10-26 13:14:47 UTC (16:14:47 Türkiye) zamanına kadar güvenli bekleme.
+# Bu zaman geçince normal tarama döngüsü otomatik devam eder.
+try:
+    BINANCE_COOLDOWN_UNTIL = float(
+        os.environ.get("BINANCE_COOLDOWN_UNTIL", "1793020487")
+    )
+except (TypeError, ValueError):
+    BINANCE_COOLDOWN_UNTIL = 1793020487.0
 try:
     with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
-        BINANCE_COOLDOWN_UNTIL = float(json.load(f).get("until", 0))
+        _file_until = float(json.load(f).get("until", 0))
+        BINANCE_COOLDOWN_UNTIL = max(BINANCE_COOLDOWN_UNTIL, _file_until)
 except Exception:
     pass
 
@@ -146,7 +155,12 @@ def pct_change(old, new):
 
 
 def scan_once():
+    """Tek düşük-sıklıklı tarama turu; sadece dönüş işareti olan SHORT adaylarını bildirir."""
     tickers = api_json("/fapi/v1/ticker/24hr", timeout=15)
+    if not isinstance(tickers, list):
+        log.warning("Binance 24s ticker yanıtı liste değil; tur atlandı.")
+        return
+
     candidates = []
     for t in tickers:
         symbol = t.get("symbol", "")
@@ -156,73 +170,124 @@ def scan_once():
             qv = float(t.get("quoteVolume", 0))
             change24 = float(t.get("priceChangePercent", 0))
             price = float(t.get("lastPrice", 0))
-            high24, low24 = float(t.get("highPrice", 0)), float(t.get("lowPrice", 0))
+            high24 = float(t.get("highPrice", 0))
+            low24 = float(t.get("lowPrice", 0))
         except (TypeError, ValueError):
             continue
-        if qv >= MIN_QUOTE_VOLUME_USDT and price > 0 and change24 > 0.5:
+        if qv >= MIN_QUOTE_VOLUME_USDT and price > 0 and change24 >= 2.0:
             candidates.append((qv, symbol, price, change24, high24, low24))
+
     candidates.sort(reverse=True)
+    selected = candidates[:MAX_SYMBOLS]
+    log.info("Tarama başladı: 24s ticker=%d, yükseliş/hacim filtresini geçen=%d, ayrıntılı incelenecek=%d",
+             len(tickers), len(candidates), len(selected))
+
     sent = 0
-    for qv, symbol, last_price, change24, high24, low24 in candidates[:MAX_SYMBOLS]:
+    checked = 0
+    rejected = 0
+    for qv, symbol, last_price, change24, high24, low24 in selected:
         try:
-            candles = api_json("/fapi/v1/klines", {"symbol": symbol, "interval": "1m", "limit": 35}, timeout=12)
+            # Kısa mum geçmişi: gereksiz API ağırlığını azaltır.
+            candles = api_json("/fapi/v1/klines", {
+                "symbol": symbol, "interval": "1m", "limit": 25
+            }, timeout=12)
             if not isinstance(candles, list) or len(candles) < 20:
+                rejected += 1
+                log.info("%s elendi: yetersiz mum verisi", symbol)
                 continue
-            # Binance candle: open time, open, high, low, close, volume, close time, quote volume, ... taker buy base, taker buy quote
-            closes = [float(c[4]) for c in candles[:-1]]  # exclude current unfinished candle
+
+            # Son mum tamamlanmamış olabileceği için atılır.
             finished = candles[:-1]
-            if len(closes) < 16:
+            closes = [float(c[4]) for c in finished]
+            if len(closes) < 17:
+                rejected += 1
                 continue
+
+            # Önceki 5 dakikadaki yükseliş, son kapanmış mumdaki dönüşle ayrı ölçülür.
+            pre_reversal_close = closes[-2]
+            pump_start_close = closes[-7]
+            prior_pump5 = pct_change(pump_start_close, pre_reversal_close)
             current = closes[-1]
-            five_min_old = closes[-6] if len(closes) >= 6 else closes[0]
-            one_min_old = closes[-2]
-            pump5 = pct_change(five_min_old, current)
-            change1 = pct_change(one_min_old, current)
+            previous_close = closes[-2]
+            change1 = pct_change(previous_close, current)
             rsi_value = rsi(closes)
             last_candle = finished[-1]
-            candle_open, candle_close = float(last_candle[1]), float(last_candle[4])
+            candle_open = float(last_candle[1])
+            candle_close = float(last_candle[4])
             candle_pct = pct_change(candle_open, candle_close)
+
             recent_vol = sum(float(c[5]) for c in finished[-5:]) / 5
             previous_vols = [float(c[5]) for c in finished[-15:-5]]
             prev_vol = sum(previous_vols) / max(1, len(previous_vols))
-            vol_ratio = recent_vol / prev_vol if prev_vol else 0
+            vol_ratio = recent_vol / prev_vol if prev_vol else 0.0
             taker_buy_quote = sum(float(c[10]) for c in finished[-5:])
             total_quote = sum(float(c[7]) for c in finished[-5:])
             taker_sell_quote = max(0.0, total_quote - taker_buy_quote)
-            if pump5 < MIN_PUMP_5M_PCT or candle_pct < MIN_SINGLE_CANDLE_PCT or rsi_value < RSI_MIN or vol_ratio < MIN_VOLUME_RATIO:
+            checked += 1
+
+            # Gerçek dönüş teyidi: önce yükseliş, ardından kapanmış kırmızı mum.
+            if prior_pump5 < MIN_PUMP_5M_PCT:
+                rejected += 1
+                log.info("%s elendi: önceki 5dk yükselişi %.2f%% < %.2f%%",
+                         symbol, prior_pump5, MIN_PUMP_5M_PCT)
                 continue
+            if candle_pct > -MIN_SINGLE_CANDLE_PCT or current >= previous_close:
+                rejected += 1
+                log.info("%s elendi: kapanmış mumda yeterli aşağı dönüş yok (mum %.2f%%)",
+                         symbol, candle_pct)
+                continue
+            if rsi_value < RSI_MIN:
+                rejected += 1
+                log.info("%s elendi: RSI %.1f < %.1f", symbol, rsi_value, RSI_MIN)
+                continue
+            if vol_ratio < MIN_VOLUME_RATIO:
+                rejected += 1
+                log.info("%s elendi: hacim oranı %.2fx < %.2fx", symbol, vol_ratio, MIN_VOLUME_RATIO)
+                continue
+
             with _state_lock:
                 last_time = _last_signal.get(symbol, 0)
                 if time.time() - last_time < COOLDOWN_SECONDS:
+                    rejected += 1
+                    log.info("%s elendi: sinyal bekleme süresi devam ediyor", symbol)
                     continue
                 _last_signal[symbol] = time.time()
+
             entry = current
             sl = entry * 1.012
             tp1 = entry * 0.988
             tp2 = entry * 0.978
-            score = min(99, int(45 + min(pump5, 5) * 5 + min(max(rsi_value - 60, 0), 25) * 0.5 + min(vol_ratio, 3) * 5))
+            score = min(99, int(45 + min(prior_pump5, 5) * 5 + min(max(rsi_value - 58, 0), 25) * 0.5 + min(vol_ratio, 3) * 5 + min(abs(candle_pct), 2) * 3))
             message = (
-                f"<b>🔻 AZCRYPTO SHORT SİNYALİ</b>\n"
+                f"<b>🔻 AZCRYPTO SHORT — DÖNÜŞ ADAYI</b>\n"
                 f"<b>Parite:</b> <a href=\"https://www.binance.com/en/futures/{escape(symbol)}\">{escape(symbol)}</a>\n"
-                f"<b>Giriş (izleme):</b> {entry:.8g}\n"
-                f"<b>Stop Loss:</b> {sl:.8g} (+1.2%)\n"
+                f"<b>Giriş referansı:</b> {entry:.8g}\n"
+                f"<b>Stop-loss:</b> {sl:.8g} (+1.2%)\n"
                 f"<b>TP1:</b> {tp1:.8g} (-1.2%) | <b>TP2:</b> {tp2:.8g} (-2.2%)\n"
-                f"<b>Skor:</b> {score}/100\n\n"
-                f"<b>1 dk:</b> {change1:+.2f}% | <b>5 dk:</b> {pump5:+.2f}%\n"
-                f"<b>RSI(14):</b> {rsi_value:.1f} | <b>Hacim oranı:</b> {vol_ratio:.2f}x\n"
-                f"<b>Taker alım/satım (5 dk):</b> {taker_buy_quote:,.0f} / {taker_sell_quote:,.0f} USDT\n"
+                f"<b>Sinyal skoru:</b> {score}/100\n\n"
+                f"<b>1dk değişim:</b> {change1:+.2f}% | <b>Önceki 5dk yükselişi:</b> {prior_pump5:+.2f}%\n"
+                f"<b>Son kapanmış mum:</b> {candle_pct:+.2f}% | <b>RSI(1dk):</b> {rsi_value:.1f}\n"
+                f"<b>Hacim oranı:</b> {vol_ratio:.2f}x\n"
+                f"<b>Taker alım/satım (5dk):</b> {taker_buy_quote:,.0f} / {taker_sell_quote:,.0f} USDT\n"
                 f"<b>24s değişim:</b> {change24:+.2f}% | <b>24s hacim:</b> {qv:,.0f} USDT\n"
                 f"<b>24s yüksek/düşük:</b> {high24:.8g} / {low24:.8g}\n"
                 f"<b>Saat:</b> {tr_saat()}\n\n"
-                f"<i>Bu bir izleme sinyalidir, emir açmaz. Stop/TP garanti değildir; riski kendin değerlendir.</i>"
+                f"<i>Bilgilendirme amaçlı izleme sinyalidir; emir açmaz ve sonuç garantisi vermez.</i>"
             )
             if tg(message):
                 sent += 1
                 data = load_state()
-                data.setdefault("signals", []).append({"symbol": symbol, "time": tr_saat(), "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "score": score, "status": "OPEN"})
+                data.setdefault("signals", []).append({
+                    "symbol": symbol, "time": tr_saat(), "entry": entry,
+                    "sl": sl, "tp1": tp1, "tp2": tp2,
+                    "score": score, "status": "OPEN"
+                })
                 data["signals"] = data["signals"][-300:]
                 save_state(data)
-                log.info("SHORT sinyali gönderildi: %s score=%s", symbol, score)
+                log.info("SHORT sinyali Telegram'a gönderildi: %s skor=%s", symbol, score)
+            else:
+                log.warning("%s sinyali bulundu fakat Telegram'a gönderilemedi.", symbol)
+
         except RuntimeError as exc:
             log.warning("Tarama durdu: %s", exc)
             break
@@ -230,7 +295,9 @@ def scan_once():
             log.warning("%s taranamadı: %s", symbol, exc)
         except Exception:
             log.exception("%s taramasında beklenmeyen hata", symbol)
-    log.info("Tarama tamamlandı; gönderilen sinyal: %d", sent)
+
+    log.info("Tarama tamamlandı: ayrıntılı incelenen=%d, elenen=%d, gönderilen sinyal=%d",
+             checked, rejected, sent)
 
 
 def scanner_loop():
@@ -282,7 +349,7 @@ def main():
     thread = threading.Thread(target=scanner_loop, name="scanner", daemon=True)
     thread.start()
     log.info("HTTP sağlık sunucusu 0.0.0.0:%s üzerinde başladı.", PORT)
-    log.info("Tarama aralığı: %s sn; maksimum sembol: %s", SCAN_INTERVAL_SECONDS, MAX_SYMBOLS)
+    log.info("Tarama aralığı: %s sn; ayrıntılı incelenecek en fazla sembol: %s", SCAN_INTERVAL_SECONDS, MAX_SYMBOLS)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
