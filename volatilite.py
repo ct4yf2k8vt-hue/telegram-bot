@@ -1,3 +1,4 @@
+
 import os
 import time
 import json
@@ -21,18 +22,10 @@ BINANCE_BASE = os.getenv(
 ).rstrip("/")
 
 CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "10"))
+WINDOW_SECONDS = int(os.getenv("WINDOW_SECONDS", "300"))
 
-WINDOW_SECONDS = int(
-    os.getenv("WINDOW_SECONDS", "300")
-)
-
-PUMP_PERCENT = float(
-    os.getenv("PUMP_PERCENT", "5.0")
-)
-
-DUMP_PERCENT = float(
-    os.getenv("DUMP_PERCENT", "5.0")
-)
+PUMP_PERCENT = float(os.getenv("PUMP_PERCENT", "5.0"))
+DUMP_PERCENT = float(os.getenv("DUMP_PERCENT", "5.0"))
 
 VOLUME_INCREASE_PERCENT = float(
     os.getenv("VOLUME_INCREASE_PERCENT", "20")
@@ -64,6 +57,8 @@ last_alert = {}
 
 last_volume = {}
 
+volume_cache = {}
+
 # ============================================================
 # LOG
 # ============================================================
@@ -72,9 +67,7 @@ def log(message):
 
     now = datetime.now(
         TURKEY_TZ
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
     print(
         f"[{now} TR] {message}",
@@ -83,7 +76,7 @@ def log(message):
 
 
 # ============================================================
-# BINANCE VERİ ÇEKME
+# HTTP JSON
 # ============================================================
 
 def http_json(url, timeout=15):
@@ -91,7 +84,7 @@ def http_json(url, timeout=15):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "PumpDumpTelegramBot/1.0",
+            "User-Agent": "PumpDumpTelegramBot/2.0",
             "Accept": "application/json"
         }
     )
@@ -107,7 +100,7 @@ def http_json(url, timeout=15):
 
 
 # ============================================================
-# TELEGRAM MESAJ GÖNDERME
+# TELEGRAM
 # ============================================================
 
 def telegram_request(
@@ -244,7 +237,7 @@ def telegram_request(
 
 
 # ============================================================
-# TELEGRAM YAZI MESAJI
+# TELEGRAM YAZI
 # ============================================================
 
 def send_text(text):
@@ -261,7 +254,7 @@ def send_text(text):
 
 
 # ============================================================
-# BINANCE USDT PARİTELERİ
+# BINANCE PARİTELERİ
 # ============================================================
 
 def get_symbols_and_tickers():
@@ -324,13 +317,15 @@ def get_symbols_and_tickers():
             quote_volume = float(
                 ticker.get(
                     "quoteVolume",
-                0)
+                    0
+                )
             )
 
             price = float(
                 ticker.get(
                     "lastPrice",
-                0)
+                    0
+                )
             )
 
         except (
@@ -351,13 +346,7 @@ def get_symbols_and_tickers():
             {
                 "symbol": symbol,
                 "price": price,
-                "quote_volume": quote_volume,
-                "change_24h": float(
-                    ticker.get(
-                        "priceChangePercent",
-                        0
-                    )
-                )
+                "quote_volume": quote_volume
             }
         )
 
@@ -376,7 +365,7 @@ def get_symbols_and_tickers():
 
 
 # ============================================================
-# ESKİ FİYATLARI TEMİZLE
+# FİYAT GEÇMİŞİ
 # ============================================================
 
 def clean_history(
@@ -438,7 +427,102 @@ def get_reference_price(
 
 
 # ============================================================
-# GRAFİK OLUŞTURMA
+# GERÇEK 5 DAKİKALIK HACİM
+# Binance kline:
+# row[5] = base asset volume
+# row[7] = quote asset volume (USDT)
+#
+# Son kapanmış 5m mum ile önceki kapanmış 5m mum
+# karşılaştırılır.
+# ============================================================
+
+def get_volume_data(symbol):
+
+    now = time.time()
+
+    cached = volume_cache.get(
+        symbol
+    )
+
+    # Aynı parite için 60 saniyede bir hacim sorgusu
+    if (
+        cached
+        and now - cached["time"] < 60
+    ):
+
+        return (
+            cached["current"],
+            cached["previous"],
+            cached["change"]
+        )
+
+    url = (
+        f"{BINANCE_BASE}/api/v3/klines"
+        f"?symbol={urllib.parse.quote(symbol)}"
+        f"&interval=5m"
+        f"&limit=3"
+    )
+
+    candles = http_json(
+        url
+    )
+
+    if len(candles) < 3:
+
+        return None, None, None
+
+    # Son mum henüz kapanmamış olabilir.
+    # Bu yüzden sondan ikinci ve üçüncü mum alınır.
+
+    current_candle = candles[-2]
+
+    previous_candle = candles[-3]
+
+    current_volume = float(
+        current_candle[7]
+    )
+
+    previous_volume = float(
+        previous_candle[7]
+    )
+
+    if previous_volume > 0:
+
+        volume_change = (
+            (
+                current_volume
+                - previous_volume
+            )
+            / previous_volume
+            * 100
+        )
+
+    else:
+
+        volume_change = 0
+
+    volume_cache[
+        symbol
+    ] = {
+
+        "time": now,
+
+        "current": current_volume,
+
+        "previous": previous_volume,
+
+        "change": volume_change
+    }
+
+    return (
+        current_volume,
+        previous_volume,
+        volume_change
+    )
+
+
+# ============================================================
+# GRAFİK
 # ============================================================
 
 def make_chart(
@@ -459,13 +543,15 @@ def make_chart(
 
         import matplotlib.dates as mdates
 
+        url = (
+            f"{BINANCE_BASE}/api/v3/klines"
+            f"?symbol={urllib.parse.quote(symbol)}"
+            f"&interval=1m"
+            f"&limit=30"
+        )
+
         raw = http_json(
-            (
-                f"{BINANCE_BASE}/api/v3/klines"
-                f"?symbol={urllib.parse.quote(symbol)}"
-                f"&interval=1m"
-                f"&limit=30"
-            )
+            url
         )
 
         if not raw:
@@ -535,16 +621,16 @@ def make_chart(
 
         if direction == "PUMP":
 
-            line_color = "#24c6a4"
+            color = "#24c6a4"
 
         else:
 
-            line_color = "#ff667a"
+            color = "#ff667a"
 
         ax_price.plot(
             times,
             closes,
-            color=line_color,
+            color=color,
             linewidth=2
         )
 
@@ -558,11 +644,10 @@ def make_chart(
         ax_price.set_title(
             (
                 f"{symbol} | {direction} | "
-                f"Current: {current_price:g}"
+                f"${current_price:g}"
             ),
             color="white",
-            fontsize=12,
-            pad=10
+            fontsize=12
         )
 
         ax_price.set_ylabel(
@@ -574,7 +659,7 @@ def make_chart(
             times,
             volumes,
             width=0.0006,
-            color=line_color,
+            color=color,
             alpha=0.75
         )
 
@@ -613,8 +698,7 @@ def make_chart(
     except Exception as exc:
 
         log(
-            f"Grafik oluşturulamadı "
-            f"({symbol}): {exc}"
+            f"Grafik hatası {symbol}: {exc}"
         )
 
         return None
@@ -646,7 +730,7 @@ def fmt_price(value):
 
 
 # ============================================================
-# PUMP / DUMP TELEGRAM ALARMI
+# ALARM MESAJI
 # ============================================================
 
 def send_alert(
@@ -655,7 +739,8 @@ def send_alert(
     start_price,
     current_price,
     change_pct,
-    quote_volume,
+    volume_current,
+    volume_previous,
     volume_change
 ):
 
@@ -663,28 +748,33 @@ def send_alert(
 
         arrow = "🚀"
 
-        title = "Pump Activity"
+        color = "🟢🟢"
 
-        color_emoji = "🟢🟢"
+        title = "Pump Activity"
 
     else:
 
         arrow = "🔻"
 
+        color = "🔴🔴"
+
         title = "Dump Activity"
 
-        color_emoji = "🔴🔴"
-
-    volume_line = (
-        f"📊 24s Hacim: "
-        f"<b>${quote_volume:,.0f}</b>"
+    volume_text = (
+        f"📊 5m Hacim: "
+        f"<b>${volume_previous:,.2f}"
+        f" → ${volume_current:,.2f}</b>\n"
     )
 
-    if volume_change is not None:
+    volume_text += (
+        f"📈 Hacim değişimi: "
+        f"<b>{volume_change:+.2f}%</b>\n"
+    )
 
-        volume_line += (
-            f" ({volume_change:+.2f}%)"
-        )
+    volume_text += (
+        f"💵 Hacim farkı: "
+        f"<b>${volume_current - volume_previous:+,.2f}</b>"
+    )
 
     text = (
 
@@ -692,17 +782,17 @@ def send_alert(
         f"<b>{direction} - {symbol} [Binance]</b>\n"
 
         f"{title} on {symbol} "
-        f"{color_emoji}\n\n"
+        f"{color}\n\n"
 
         f"💰 Fiyat: "
         f"<b>${fmt_price(start_price)} "
         f"→ ${fmt_price(current_price)} "
-        f"({change_pct:+.2f}%)</b>\n"
+        f"({change_pct:+.2f}%)</b>\n\n"
 
-        f"{volume_line}\n"
+        f"{volume_text}\n\n"
 
-        f"⏱ Hareket: son "
-        f"{WINDOW_SECONDS // 60} dakika\n"
+        f"⏱ Fiyat hareketi: "
+        f"son {WINDOW_SECONDS // 60} dakika\n"
 
         f"🕒 "
         f"{datetime.now(TURKEY_TZ).strftime('%d.%m.%Y %H:%M:%S')} "
@@ -745,7 +835,7 @@ def send_alert(
 
 
 # ============================================================
-# BOT ÇALIŞTIRMA
+# ANA BOT
 # ============================================================
 
 def run():
@@ -753,21 +843,26 @@ def run():
     if not BOT_TOKEN or not CHAT_ID:
 
         log(
-            "UYARI: BOT_TOKEN ve CHAT_ID "
-            "Render Environment Variables "
-            "içinde tanımlanmalı."
+            "BOT_TOKEN ve CHAT_ID Render "
+            "Environment Variables içinde olmalı."
         )
 
     send_text(
-        "🤖 <b>Pump & Dump Alert Bot aktif</b>\n"
+        "🤖 <b>Pump & Dump Bot Aktif</b>\n\n"
 
-        f"⏱ Kontrol: {CHECK_SECONDS} sn\n"
+        f"⏱ Kontrol: {CHECK_SECONDS} saniye\n"
 
-        f"📈 Pump: +{PUMP_PERCENT:.1f}% "
-        f"/ 📉 Dump: -{DUMP_PERCENT:.1f}%\n"
+        f"📈 Pump: +{PUMP_PERCENT:.1f}%\n"
 
-        f"🪟 Pencere: "
-        f"{WINDOW_SECONDS // 60} dk"
+        f"📉 Dump: -{DUMP_PERCENT:.1f}%\n"
+
+        f"🪟 Fiyat penceresi: "
+        f"{WINDOW_SECONDS // 60} dakika\n"
+
+        f"📊 Hacim: gerçek 5 dakikalık mum\n"
+
+        f"🔁 Alarm bekleme: "
+        f"{COOLDOWN_SECONDS // 60} dakika"
     )
 
     while True:
@@ -790,10 +885,6 @@ def run():
 
                 price = ticker[
                     "price"
-                ]
-
-                quote_volume = ticker[
-                    "quote_volume"
                 ]
 
                 history = price_history[
@@ -822,37 +913,16 @@ def run():
                     or reference <= 0
                 ):
 
-                    last_volume[
-                        symbol
-                    ] = quote_volume
-
                     continue
 
                 change_pct = (
-                    (price - reference)
-                    / reference
-                    * 100.0
-                )
-
-                previous_volume = last_volume.get(
-                    symbol
-                )
-
-                volume_change = None
-
-                if (
-                    previous_volume
-                    and previous_volume > 0
-                ):
-
-                    volume_change = (
-                        (
-                            quote_volume
-                            - previous_volume
-                        )
-                        / previous_volume
-                        * 100.0
+                    (
+                        price
+                        - reference
                     )
+                    / reference
+                    * 100
+                )
 
                 direction = None
 
@@ -864,60 +934,89 @@ def run():
 
                     direction = "DUMP"
 
-                cooldown_ok = (
+                if not direction:
+
+                    continue
+
+                # Alarm cooldown kontrolü
+                if (
                     now
                     - last_alert.get(
                         symbol,
                         0
                     )
-                    >= COOLDOWN_SECONDS
-                )
-
-                volume_ok = (
-
-                    volume_change is None
-
-                    or volume_change
-                    >= VOLUME_INCREASE_PERCENT
-
-                    or abs(change_pct)
-                    >= (
-                        PUMP_PERCENT
-                        * 1.5
-                    )
-                )
-
-                if (
-                    direction
-                    and cooldown_ok
-                    and volume_ok
+                    < COOLDOWN_SECONDS
                 ):
 
-                    log(
-                        f"{direction} "
-                        f"{symbol}: "
-                        f"{change_pct:+.2f}%"
-                    )
+                    continue
 
-                    send_alert(
-                        symbol,
-                        direction,
-                        reference,
-                        price,
-                        change_pct,
-                        quote_volume,
+                # Gerçek 5 dakikalık hacim
+                try:
+
+                    (
+                        volume_current,
+                        volume_previous,
                         volume_change
+                    ) = get_volume_data(
+                        symbol
                     )
 
-                    last_alert[
-                        symbol
-                    ] = now
+                except Exception as exc:
 
-                    alert_count += 1
+                    log(
+                        f"Hacim alınamadı "
+                        f"{symbol}: {exc}"
+                    )
 
-                last_volume[
+                    continue
+
+                if (
+                    volume_current is None
+                    or volume_previous is None
+                    or volume_change is None
+                ):
+
+                    continue
+
+                # Hacim artış koşulu
+                volume_ok = (
+                    volume_change
+                    >= VOLUME_INCREASE_PERCENT
+                )
+
+                # Büyük fiyat hareketinde hacim şartı esnetilir
+                strong_move = (
+                    abs(change_pct)
+                    >= PUMP_PERCENT * 1.5
+                )
+
+                if not volume_ok and not strong_move:
+
+                    continue
+
+                log(
+                    f"{direction} {symbol} "
+                    f"| Fiyat: {change_pct:+.2f}% "
+                    f"| 5m Hacim: "
+                    f"{volume_change:+.2f}%"
+                )
+
+                send_alert(
+                    symbol,
+                direction,
+                    reference,
+                    price,
+                    change_pct,
+                    volume_current,
+                    volume_previous,
+                    volume_change
+                )
+
+                last_alert[
                     symbol
-            ] = quote_volume
+                ] = now
+
+                alert_count += 1
 
             log(
                 f"Tarama tamamlandı: "
@@ -952,7 +1051,7 @@ def run():
 
 
 # ============================================================
-# BAŞLAT
+# BOT BAŞLAT
 # ============================================================
 
 if __name__ == "__main__":
