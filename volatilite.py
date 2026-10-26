@@ -1,173 +1,196 @@
-import urllib.request, urllib.parse, json, time, socket
+import json
+import logging
 import os
-from datetime import datetime, timedelta, timezone
 import threading
-import http.server
-import socketserver
+import time
+import urllib.parse
+import urllib.request
+from urllib.error import HTTPError, URLError
+import re
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html import escape
 
-socket.setdefaulttimeout(10)
-T = os.environ.get("BOT_TOKEN")
-C = os.environ.get("CHAT_ID", "1623907197")
-TR_Saati = timezone(timedelta(hours=3))
+# AZCRYPTO SHORT SCANNER — Binance USDT-M Futures
+# Sadece sinyal üretir; gerçek emir açmaz.
 
-son_sinyaller = {}
-COOLDOWN = 900
-last_update_id = 0
+BASE_URL = "https://fapi.binance.com"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
+PORT = int(os.environ.get("PORT", "10000"))
 
-def tg(chat_id, m):
+SCAN_INTERVAL_SECONDS = max(
+    120, int(os.environ.get("SCAN_INTERVAL_SECONDS", "180"))
+)
+MAX_SYMBOLS = max(
+    3, min(10, int(os.environ.get("MAX_SYMBOLS", "8")))
+)
+MIN_QUOTE_VOLUME_USDT = float(
+    os.environ.get("MIN_QUOTE_VOLUME_USDT", "5000000")
+)
+MIN_PUMP_5M_PCT = float(
+    os.environ.get("MIN_PUMP_5M_PCT", "1.5")
+)
+MIN_SINGLE_CANDLE_PCT = float(
+    os.environ.get("MIN_SINGLE_CANDLE_PCT", "1.0")
+)
+MIN_VOLUME_RATIO = float(
+    os.environ.get("MIN_VOLUME_RATIO", "1.2")
+)
+RSI_MIN = float(os.environ.get("RSI_MIN", "60"))
+COOLDOWN_SECONDS = int(
+    os.environ.get("COOLDOWN_SECONDS", "1200")
+)
+DATA_FILE = os.environ.get("DATA_FILE", "shortbot_data.json")
+
+TR_TZ = timezone(timedelta(hours=3))
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger("azcrypto-short")
+
+# Binance 418/429 hatalarında bekleme uygula.
+BINANCE_COOLDOWN_SECONDS = int(
+    os.environ.get("BINANCE_COOLDOWN_SECONDS", "7200")
+)
+COOLDOWN_FILE = os.environ.get(
+    "COOLDOWN_FILE", "binance_cooldown.json"
+)
+
+_saved_pause = 0.0
+try:
+    with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+        _saved_pause = float(json.load(f).get("until", 0))
+except Exception:
+    pass
+
+BINANCE_COOLDOWN_UNTIL = _saved_pause
+TELEGRAM_POLLING_DISABLED = False
+
+
+class BinanceRateLimitError(Exception):
+    pass
+
+
+def tr_saat():
+    return datetime.now(TR_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def api_json(path, params=None, timeout=12):
+    global BINANCE_COOLDOWN_UNTIL
+
+    remaining = int(BINANCE_COOLDOWN_UNTIL - time.time())
+    if remaining > 0:
+        raise BinanceRateLimitError(
+            f"Binance beklemede: {remaining} saniye"
+        )
+
+    query = urllib.parse.urlencode(params or {})
+    url = BASE_URL + path + (("?" + query) if query else "")
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "AZCryptoShortScanner/1.0",
+            "Accept": "application/json"
+        }
+    )
+
     try:
-        d = urllib.parse.urlencode({"chat_id": chat_id, "text": m, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
-        req = urllib.request.Request("https://api.telegram.org/bot" + T + "/sendMessage", data=d)
-        urllib.request.urlopen(req).read()
-    except:
-        pass
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
 
-def gj(u):
+    except HTTPError as exc:
+        if exc.code in (418, 429):
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+
+            wait_seconds = (
+                600 if exc.code == 429
+                else BINANCE_COOLDOWN_SECONDS
+            )
+
+            retry_after = (
+                exc.headers.get("Retry-After")
+                if exc.headers else None
+            )
+
+            try:
+                if retry_after:
+                    wait_seconds = max(
+                        wait_seconds, int(float(retry_after))
+                    )
+            except (TypeError, ValueError):
+                pass
+
+            match = re.search(r"(\d+)\s*seconds?", body, re.I)
+            if match:
+                wait_seconds = max(
+                    wait_seconds, int(match.group(1))
+                )
+
+            BINANCE_COOLDOWN_UNTIL = time.time() + wait_seconds
+
+            try:
+                with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"until": BINANCE_COOLDOWN_UNTIL}, f
+                    )
+            except Exception as save_exc:
+                log.warning(
+                    "Bekleme süresi kaydedilemedi: %s", save_exc
+                )
+
+            log.error(
+                "Binance HTTP %s: %d saniye bekleme; istekler durduruldu.",
+                exc.code, wait_seconds
+            )
+
+            raise BinanceRateLimitError(
+                f"Binance HTTP {exc.code}; "
+                f"{wait_seconds} saniye bekleniyor"
+            ) from exc
+
+        raise
+
+
+def tg(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        log.warning(
+            "BOT_TOKEN veya CHAT_ID eksik; mesaj gönderilmedi."
+        )
+        return False
+
+    payload = urllib.parse.urlencode({
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true"
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+    )
+
     try:
-        req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
-        return json.loads(urllib.request.urlopen(req).read().decode())
-    except:
-        return None
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-def format_vol(v):
-    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
-    elif v >= 1_000: return f"{v/1_000:.2f}K"
-    return f"{v:.2f}"
+        if not result.get("ok"):
+            log.error("Telegram API hatası: %s", result)
+            return False
 
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1: return 50
-    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0: return 100
-    return 100 - (100 / (1 + (avg_gain / avg_loss)))
+        return True
 
-def command_listener():
-    global last_update_id
-    while True:
-        try:
-            updates = gj(f"https://api.telegram.org/bot{T}/getUpdates?offset={last_update_id + 1}&timeout=10")
-            if updates and updates.get("ok"):
-                for u in updates["result"]:
-                    last_update_id = u["update_id"]
-                    if "message" in u and "text" in u["message"]:
-                        text = u["message"]["text"]
-                        chat_id = u["message"]["chat"]["id"]
-                        if text.startswith("/ratio"):
-                            parts = text.split()
-                            if len(parts) < 2:
-                                tg(chat_id, "⚠️ Kullanım: /ratio btcusdt")
-                                continue
-                            symbol = parts[1].upper()
-                            if not symbol.endswith("USDT"): symbol += "USDT"
-                            period = parts[2].lower() if len(parts) > 2 else "1h"
-                            url = f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={period}&limit=1"
-                            data = gj(url)
-                            if data and len(data) > 0:
-                                d = data[0]
-                                msg = (f"Long/Short Ratio📊\nBinance - {symbol}\n⏳ <b>Timeframe:</b> {period}\n"
-                                       f"📈 <b>Long:</b> {float(d['longAccount'])*100:.2f}%\n"
-                                       f"📉 <b>Short:</b> {float(d['shortAccount'])*100:.2f}%\n"
-                                       f"⚖️ <b>Ratio:</b> {float(d['longShortRatio']):.2f}\n\n"
-                                       f"<i>Last Updated: {datetime.now(TR_Saati).strftime('%H:%M')} (TR)</i>")
-                                tg(chat_id, msg)
-                            else:
-                                tg(chat_id, f"❌ {symbol} için veri bulunamadı.")
-        except:
-            pass
-        time.sleep(2)
-
-def bot_loop():
-    tg(C, "🚀 <b>AzCrypto Bot (Hacim Patlaması) Başlatıldı!</b>\nSadece Binance Spot taranıyor.")
-    
-    while True:
-        try:
-            tickers = gj("https://api.binance.com/api/v3/ticker/24hr")
-            if not tickers:
-                time.sleep(5)
-                continue
-
-            adaylar = []
-            for t in tickers:
-                if t['symbol'].endswith('USDT'):
-                    try:
-                        vol = float(t['quoteVolume'])
-                        chg = float(t['priceChangePercent'])
-                        if vol > 5_000_000:
-                            adaylar.append((t['symbol'], chg, vol))
-                    except:
-                        pass
-
-            for symbol, chg, vol in adaylar:
-                if symbol in son_sinyaller and (time.time() - son_sinyaller[symbol] < COOLDOWN):
-                    continue
-
-                klines = gj(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=22")
-                if not klines or len(klines) < 22: continue
-
-                curr_close = float(klines[-1][4])
-                curr_vol = float(klines[-1][7])
-                prev_close = float(klines[-2][4])
-                closes = [float(k[4]) for k in klines[:-1]]
-                
-                avg_vol = sum(float(k[7]) for k in klines[:-1]) / 20
-                if avg_vol == 0: continue
-                vol_ratio = curr_vol / avg_vol
-                price_change_5m = ((curr_close - prev_close) / prev_close) * 100
-
-                if price_change_5m >= 3.0 and vol_ratio >= 3.0:
-                    
-                    # Taker Oranı
-                    taker = gj(f"https://api.binance.com/api/v3/trades?symbol={symbol}&limit=500")
-                    buy_vol = sum(float(t['qty']) for t in taker if t['isBuyerMaker'] == False) if taker else 0
-                    total_vol = sum(float(t['qty']) for t in taker) if taker else 1
-                    taker_pct = (buy_vol / total_vol) * 100 if total_vol > 0 else 50
-                    
-                    # RSI
-                    rsi = calculate_rsi(closes, 14)
-                    rsi_emoji = "🔴" if rsi > 70 else "🟢" if rsi < 30 else ""
-                    
-                    # 24s Yüksek/Düşük
-                    high_24 = float(tickers[0]['highPrice']) if symbol == tickers[0]['symbol'] else 0
-                    low_24 = float(tickers[0]['lowPrice']) if symbol == tickers[0]['symbol'] else 0
-                    # Ticker içinden doğru olanı bul
-                    t_info = next((t for t in tickers if t['symbol'] == symbol), None)
-                    if t_info:
-                        high_24 = float(t_info['highPrice'])
-                        low_24 = float(t_info['lowPrice'])
-
-                    dist_high = ((high_24 - curr_close) / curr_close) * 100
-                    dist_low = ((curr_close - low_24) / low_24) * 100
-
-                    msg = (f"#<b>{symbol}</b> 💚 <b>Price {price_change_5m:+.2f}% Vol ❌ {vol_ratio:.1f}</b> 💰\n"
-                           f"(M5 Spot)\n\n"
-                           f"Total Vol {format_vol(curr_vol)} Taker {taker_pct:.0f}% Rsi/{rsi:.0f}{rsi_emoji}\n"
-                           f"────────────────\n"
-                           f"🏷 Price: {curr_close:.4f} ...\n"
-                           f"🕒 24h: {chg:+.2f}% Vol {format_vol(vol)}\n"
-                           f"⬆ High: {high_24:.4f} ({dist_high:+.2f}%)\n"
-                           f"⬇ Low: {low_24:.4f} ({dist_low:+.2f}%)")
-                    
-                    tg(C, msg)
-                    son_sinyaller[symbol] = time.time()
-                    time.sleep(1)
-
-            time.sleep(10)
-        except Exception as e:
-            time.sleep(10)
-
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    Handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", port), Handler) as httpd:
-        httpd.serve_forever()
-
-if __name__ == "__main__":
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-    threading.Thread(target=command_listener, daemon=True).start()
-    bot_loop()
+    except Exception:
+        log.exception("Telegram mesajı gönderilemedi")
+        return False
