@@ -7,26 +7,50 @@ import urllib.parse
 import urllib.request
 from urllib.error import HTTPError
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
 
-# AZCRYPTO SHORT SCANNER — Binance USDT-M Futures
-# Sinyal üretir; Binance'te gerçek emir açmaz.
+# AZCRYPTO SHORT SCANNER
+# Sinyal üretir; gerçek Binance emri açmaz.
 
 BASE_URL = "https://fapi.binance.com"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "30"))
-MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS", "35"))
-MIN_QUOTE_VOLUME_USDT = float(os.environ.get("MIN_QUOTE_VOLUME_USDT", "5000000"))
-MIN_PUMP_5M_PCT = float(os.environ.get("MIN_PUMP_5M_PCT", "1.5"))
-MIN_SINGLE_CANDLE_PCT = float(os.environ.get("MIN_SINGLE_CANDLE_PCT", "1.0"))
-MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "1.2"))
+# Daha düşük Binance API trafiği
+SCAN_INTERVAL_SECONDS = max(
+    60, int(os.environ.get("SCAN_INTERVAL_SECONDS", "90"))
+)
+MAX_SYMBOLS = max(
+    5, min(20, int(os.environ.get("MAX_SYMBOLS", "12")))
+)
+
+MIN_QUOTE_VOLUME_USDT = float(
+    os.environ.get("MIN_QUOTE_VOLUME_USDT", "5000000")
+)
+MIN_PUMP_5M_PCT = float(
+    os.environ.get("MIN_PUMP_5M_PCT", "1.5")
+)
+MIN_SINGLE_CANDLE_PCT = float(
+    os.environ.get("MIN_SINGLE_CANDLE_PCT", "1.0")
+)
+MIN_VOLUME_RATIO = float(
+    os.environ.get("MIN_VOLUME_RATIO", "1.2")
+)
 RSI_MIN = float(os.environ.get("RSI_MIN", "60"))
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1200"))
+COOLDOWN_SECONDS = int(
+    os.environ.get("COOLDOWN_SECONDS", "1200")
+)
+
 DATA_FILE = os.environ.get("DATA_FILE", "shortbot_data.json")
+COOLDOWN_FILE = os.environ.get(
+    "BINANCE_COOLDOWN_FILE", "binance_cooldown.json"
+)
+DEFAULT_418_WAIT = max(
+    900, int(os.environ.get("BINANCE_COOLDOWN_SECONDS", "3600"))
+)
 
 TR_TZ = timezone(timedelta(hours=3))
 
@@ -36,11 +60,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("azcrypto-short")
 
-# Binance 418/429 koruması
-BINANCE_COOLDOWN_SECONDS = int(
-    os.environ.get("BINANCE_COOLDOWN_SECONDS", "900")
-)
 BINANCE_COOLDOWN_UNTIL = 0.0
+COOLDOWN_LOCK = threading.Lock()
 
 
 class BinanceRateLimitError(Exception):
@@ -51,13 +72,76 @@ def tr_saat():
     return datetime.now(TR_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def api_json(path, params=None, timeout=10):
+# --------------------------------------------------
+# BINANCE 418 / 429 BEKLEME KORUMASI
+# --------------------------------------------------
+
+def load_cooldown():
     global BINANCE_COOLDOWN_UNTIL
 
+    try:
+        with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+
+        until = float(obj.get("until", 0))
+
+        if until > time.time():
+            BINANCE_COOLDOWN_UNTIL = until
+            log.warning(
+                "Kayıtlı Binance beklemesi devam ediyor: yaklaşık %d saniye.",
+                int(until - time.time())
+            )
+
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def save_cooldown(until, reason):
+    global BINANCE_COOLDOWN_UNTIL
+
+    with COOLDOWN_LOCK:
+        BINANCE_COOLDOWN_UNTIL = max(
+            BINANCE_COOLDOWN_UNTIL, float(until)
+        )
+
+        try:
+            with open(COOLDOWN_FILE + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({
+                    "until": BINANCE_COOLDOWN_UNTIL,
+                    "reason": reason
+                }, f)
+
+            os.replace(COOLDOWN_FILE + ".tmp", COOLDOWN_FILE)
+
+        except OSError:
+            log.exception("Binance bekleme süresi kaydedilemedi")
+
+
+def retry_after_seconds(exc):
+    value = exc.headers.get("Retry-After") if exc.headers else None
+
+    if value:
+        try:
+            return max(1, int(float(value)))
+        except (ValueError, TypeError):
+            try:
+                dt = parsedate_to_datetime(value)
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+
+                return max(1, int(dt.timestamp() - time.time()))
+
+            except Exception:
+                pass
+
+    return DEFAULT_418_WAIT
+
+
+def api_json(path, params=None, timeout=12):
     if time.time() < BINANCE_COOLDOWN_UNTIL:
-        remaining = max(1, int(BINANCE_COOLDOWN_UNTIL - time.time()))
         raise BinanceRateLimitError(
-            f"Binance API bekleme süresi devam ediyor ({remaining} sn)"
+            "Binance API bekleme süresi devam ediyor"
         )
 
     query = urllib.parse.urlencode(params or {})
@@ -66,7 +150,7 @@ def api_json(path, params=None, timeout=10):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "AZCryptoShortScanner/1.0",
+            "User-Agent": "AZCryptoShortScanner/2.0",
             "Accept": "application/json"
         }
     )
@@ -77,42 +161,35 @@ def api_json(path, params=None, timeout=10):
 
     except HTTPError as exc:
         if exc.code in (418, 429):
-            retry_after = (
-                exc.headers.get("Retry-After")
-                if exc.headers else None
-            )
+            wait = retry_after_seconds(exc)
+            until = time.time() + wait
 
-            try:
-                wait_seconds = max(
-                    BINANCE_COOLDOWN_SECONDS,
-                    int(retry_after or 0)
-                )
-            except (TypeError, ValueError):
-                wait_seconds = BINANCE_COOLDOWN_SECONDS
-
-            BINANCE_COOLDOWN_UNTIL = time.time() + wait_seconds
+            save_cooldown(until, f"HTTP {exc.code}")
 
             log.error(
-                "Binance HTTP %s: API istekleri %s saniye duraklatıldı.",
-                exc.code,
-                wait_seconds
+                "Binance HTTP %s: API istekleri %d saniye durduruldu.",
+                exc.code, wait
             )
 
             raise BinanceRateLimitError(
-                f"Binance HTTP {exc.code}; {wait_seconds} sn bekleniyor"
+                f"Binance HTTP {exc.code}; {wait} saniye bekleniyor"
             ) from exc
 
         raise
 
 
+# --------------------------------------------------
+# TELEGRAM
+# --------------------------------------------------
+
 def tg(message):
     if not BOT_TOKEN or not CHAT_ID:
         log.warning(
-            "BOT_TOKEN veya CHAT_ID eksik; Telegram mesajı gönderilmedi."
+            "BOT_TOKEN veya CHAT_ID eksik; Telegram mesajı gönderilemedi."
         )
         return False
 
-    payload = urllib.parse.urlencode({
+    data = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
@@ -121,14 +198,14 @@ def tg(message):
 
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data=payload,
+        data=data,
         headers={
             "Content-Type": "application/x-www-form-urlencoded"
         }
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=12) as response:
             result = json.loads(response.read().decode("utf-8"))
 
         if not result.get("ok"):
@@ -142,32 +219,38 @@ def tg(message):
         return False
 
 
+# --------------------------------------------------
+# BOT DURUMU VE İSTATİSTİKLER
+# --------------------------------------------------
+
 def load_state():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
-
-        state.setdefault("last_signal", {})
-        state.setdefault("active", {})
-        state.setdefault("history", [])
-
-        return state
-
     except (OSError, ValueError):
-        return {
-            "last_signal": {},
-            "active": {},
-            "history": []
-        }
+        state = {}
+
+    state.setdefault("last_signal", {})
+    state.setdefault("active", {})
+    state.setdefault("history", [])
+    state.setdefault("telegram_offset", 0)
+
+    return state
 
 
 def save_state(state):
-    temp_file = DATA_FILE + ".tmp"
+    try:
+        with open(DATA_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
 
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(DATA_FILE + ".tmp", DATA_FILE)
 
-    os.replace(temp_file, DATA_FILE)
+    except OSError:
+        log.exception("Bot durumu kaydedilemedi")
+
+
+def average(values):
+    return sum(values) / len(values) if values else 0.0
 
 
 def calculate_rsi(prices, period=14):
@@ -179,92 +262,42 @@ def calculate_rsi(prices, period=14):
         for i in range(1, len(prices))
     ]
 
-    gains = [max(d, 0.0) for d in deltas]
-    losses = [max(-d, 0.0) for d in deltas]
+    gains = [max(x, 0.0) for x in deltas]
+    losses = [max(-x, 0.0) for x in deltas]
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    gain = average(gains[:period])
+    loss = average(losses[:period])
 
     for i in range(period, len(deltas)):
-        avg_gain = (
-            avg_gain * (period - 1) + gains[i]
+        gain = (
+            gain * (period - 1) + gains[i]
         ) / period
 
-        avg_loss = (
-            avg_loss * (period - 1) + losses[i]
+        loss = (
+            loss * (period - 1) + losses[i]
         ) / period
 
-    if avg_loss == 0:
+    if loss == 0:
         return 100.0
 
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    rs = gain / loss
+    return 100.0 - 100.0 / (1.0 + rs)
 
 
-def average(values):
-    return sum(values) / len(values) if values else 0.0
+def ema(values, period):
+    if not values:
+        return 0.0
 
+    alpha = 2.0 / (period + 1.0)
+    result = values[0]
 
-def get_trading_symbols():
-    info = api_json("/fapi/v1/exchangeInfo")
-    symbols = set()
-
-    excluded_suffixes = (
-        "UPUSDT",
-        "DOWNUSDT",
-        "BULLUSDT",
-        "BEARUSDT"
-    )
-
-    for item in info.get("symbols", []):
-        symbol = item.get("symbol", "")
-
-        if (
-            item.get("status") == "TRADING"
-            and item.get("contractType") == "PERPETUAL"
-            and item.get("quoteAsset") == "USDT"
-            and symbol.endswith("USDT")
-            and not symbol.endswith(excluded_suffixes)
-        ):
-            symbols.add(symbol)
-
-    return symbols
-
-
-def get_market_snapshot(allowed_symbols):
-    tickers = api_json("/fapi/v1/ticker/24hr")
-    result = {}
-
-    for t in tickers:
-        symbol = t.get("symbol")
-
-        if symbol not in allowed_symbols:
-            continue
-
-        try:
-            quote_volume = float(t["quoteVolume"])
-            last_price = float(t["lastPrice"])
-            change_24h = float(t["priceChangePercent"])
-
-            if (
-                quote_volume >= MIN_QUOTE_VOLUME_USDT
-                and last_price > 0
-            ):
-                result[symbol] = {
-                    "price": last_price,
-                    "quote_volume": quote_volume,
-                    "change_24h": change_24h,
-                    "high_24h": float(t["highPrice"]),
-                    "low_24h": float(t["lowPrice"])
-                }
-
-        except (KeyError, TypeError, ValueError):
-            continue
+    for value in values[1:]:
+        result = alpha * value + (1 - alpha) * result
 
     return result
 
 
-def candle_data(raw):
+def candle(raw):
     return {
         "open_time": int(raw[0]),
         "open": float(raw[1]),
@@ -272,100 +305,135 @@ def candle_data(raw):
         "low": float(raw[3]),
         "close": float(raw[4]),
         "volume": float(raw[5]),
-        "quote_volume": float(raw[7]),
-        "close_time": int(raw[6])
+        "close_time": int(raw[6]),
+        "quote_volume": float(raw[7])
     }
 
 
-def detect_short_setup(raw_klines):
-    # Devam eden mum yerine kapanmış mumları kullan.
-    if not raw_klines or len(raw_klines) < 30:
+# --------------------------------------------------
+# BINANCE PİYASA VERİLERİ
+# --------------------------------------------------
+
+def get_market_snapshot():
+    # Tek ticker isteğiyle USDT vadeli paritelerini al.
+    tickers = api_json("/fapi/v1/ticker/24hr")
+    result = {}
+
+    excluded = (
+        "UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"
+    )
+
+    for t in tickers:
+        symbol = t.get("symbol", "")
+
+        if (
+            not symbol.endswith("USDT")
+            or symbol.endswith(excluded)
+        ):
+            continue
+
+        try:
+            volume = float(t["quoteVolume"])
+            price = float(t["lastPrice"])
+
+            if (
+                volume < MIN_QUOTE_VOLUME_USDT
+                or price <= 0
+            ):
+                continue
+
+            result[symbol] = {
+                "price": price,
+                "quote_volume": volume,
+                "change_24h": float(t["priceChangePercent"]),
+                "high_24h": float(t["highPrice"]),
+                "low_24h": float(t["lowPrice"])
+            }
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return result
+
+
+# --------------------------------------------------
+# SHORT SİNYAL TESPİTİ
+# --------------------------------------------------
+
+def detect_short_setup(raw):
+    # Açık olan son mumu kullanma; kapanmış mumları analiz et.
+    if not raw or len(raw) < 30:
         return None
 
-    candles = [
-        candle_data(x)
-        for x in raw_klines[:-1]
-    ]
+    cs = [candle(x) for x in raw[:-1]]
+    closes = [x["close"] for x in cs]
 
-    closes = [c["close"] for c in candles]
-    current = candles[-1]
-    previous = candles[-2]
+    cur = cs[-1]
+    prev = cs[-2]
 
-    pump_window = candles[-6:-1]
+    pump_window = cs[-6:-1]
 
-    if len(pump_window) < 5 or pump_window[0]["open"] <= 0:
+    if len(pump_window) != 5 or pump_window[0]["open"] <= 0:
         return None
 
     pump_pct = (
-        pump_window[-1]["close"] / pump_window[0]["open"] - 1.0
-    ) * 100.0
+        pump_window[-1]["close"] / pump_window[0]["open"] - 1
+    ) * 100
 
-    one_candle_pct = (
-        previous["close"] / previous["open"] - 1.0
-    ) * 100.0
+    one_pct = (
+        prev["close"] / prev["open"] - 1
+    ) * 100 if prev["open"] else 0
 
-    rsi = calculate_rsi(closes[:-1], 14)
+    rsi = calculate_rsi(closes, 14)
 
     prior_volumes = [
-        c["quote_volume"]
-        for c in candles[-22:-2]
+        x["quote_volume"] for x in cs[-22:-2]
     ]
 
     avg_volume = average(prior_volumes)
 
-    volume_ratio = (
-        current["quote_volume"] / avg_volume
-        if avg_volume > 0 else 0.0
+    vol_ratio = (
+        cur["quote_volume"] / avg_volume
+        if avg_volume else 0
     )
 
-    body = abs(current["close"] - current["open"])
+    body = abs(cur["close"] - cur["open"])
 
     upper_wick = (
-        current["high"]
-        - max(current["open"], current["close"])
+        cur["high"] - max(cur["open"], cur["close"])
     )
 
-    candle_range = current["high"] - current["low"]
+    candle_range = cur["high"] - cur["low"]
 
-    upper_wick_rejection = (
-        current["close"] < current["open"]
+    rejection = (
+        cur["close"] < cur["open"]
         and upper_wick >= max(
             body * 1.2,
             candle_range * 0.25
         )
     )
 
-    support_break = current["close"] < previous["low"]
-    bearish_close = current["close"] < current["open"]
+    breakdown = cur["close"] < prev["low"]
 
-    pump_detected = (
+    pumped = (
         pump_pct >= MIN_PUMP_5M_PCT
-        or one_candle_pct >= MIN_SINGLE_CANDLE_PCT
+        or one_pct >= MIN_SINGLE_CANDLE_PCT
     )
 
-    reversal_confirmed = (
-        support_break
-        or (bearish_close and upper_wick_rejection)
-    )
-
-    if not pump_detected or not reversal_confirmed:
+    if (
+        not pumped
+        or not (breakdown or rejection)
+        or rsi < RSI_MIN
+        or vol_ratio < MIN_VOLUME_RATIO
+    ):
         return None
 
-    if rsi < RSI_MIN:
-        return None
+    atr = average([
+        x["high"] - x["low"] for x in cs[-15:]
+    ])
 
-    if volume_ratio < MIN_VOLUME_RATIO:
-        return None
-
-    ranges = [
-        c["high"] - c["low"]
-        for c in candles[-15:]
-    ]
-
-    atr = average(ranges)
-    recent_high = max(c["high"] for c in candles[-6:])
-
-    entry = current["close"]
+    recent_high = max(x["high"] for x in cs[-6:])
+    entry = cur["close"]
 
     stop = recent_high + max(
         atr * 0.25,
@@ -374,161 +442,82 @@ def detect_short_setup(raw_klines):
 
     risk = stop - entry
 
-    if risk <= 0 or stop <= entry:
+    if risk <= 0:
         return None
-
-    tp1 = entry - risk
-    tp2 = entry - 2.0 * risk
-
-    if tp2 <= 0:
-        return None
-
-    reasons = [
-        f"Önceki 5 mum hareketi: %{pump_pct:.2f}"
-    ]
-
-    if one_candle_pct >= MIN_SINGLE_CANDLE_PCT:
-        reasons.append(
-            f"Önceki mum yükselişi: %{one_candle_pct:.2f}"
-        )
-
-    reasons.append(
-        "Destek kırılımı"
-        if support_break
-        else "Üst fitil reddi + kırmızı kapanış"
-    )
-
-    reasons.append(f"RSI: {rsi:.1f}")
-    reasons.append(
-        f"Hacim: ortalamanın {volume_ratio:.1f} katı"
-    )
 
     return {
         "entry": entry,
         "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
+        "tp1": entry - risk,
+        "tp2": entry - 2 * risk,
+        "risk_pct": risk / entry * 100,
         "rsi": rsi,
         "pump_pct": pump_pct,
-        "volume_ratio": volume_ratio,
-        "risk_pct": (risk / entry) * 100.0,
-        "reasons": reasons,
-        "candle_high": current["high"],
-        "candle_low": current["low"],
+        "one_pct": one_pct,
+        "volume_ratio": vol_ratio,
+        "candle_high": cur["high"],
+        "candle_low": cur["low"],
         "time": tr_saat(),
-        "candle_close_time": current["close_time"]
+        "reasons": [
+            f"Önceki 5 mum hareketi: %{pump_pct:.2f}",
+            f"Önceki mum hareketi: %{one_pct:.2f}",
+            (
+                "Destek kırılımı"
+                if breakdown
+                else "Üst fitil reddi + kırmızı kapanış"
+            ),
+            f"RSI: {rsi:.1f}",
+            f"Hacim: ortalamanın {vol_ratio:.1f} katı"
+        ],
+        "ema11": ema(closes[-40:], 11),
+        "ema21": ema(closes[-60:], 21)
     }
 
 
-def ema(values, period):
-    if not values:
-        return 0.0
-
-    k = 2.0 / (period + 1.0)
-    value = values[0]
-
-    for item in values[1:]:
-        value = item * k + value * (1.0 - k)
-
-    return value
-
-
-def pct_change_from_klines(symbol, interval, candles_back):
-    try:
-        raw = api_json(
-            "/fapi/v1/klines",
-            {
-                "symbol": symbol,
-                "interval": interval,
-                "limit": candles_back + 3
-            }
-        )
-
-        if (
-            not isinstance(raw, list)
-            or len(raw) < candles_back + 2
-        ):
-            return None
-
-        closed = raw[:-1]
-        old = float(closed[-(candles_back + 1)][4])
-        new = float(closed[-1][4])
-
-        return (
-            (new / old - 1.0) * 100.0
-            if old else None
-        )
-
-    except BinanceRateLimitError:
-        raise
-
-    except Exception:
-        return None
-
-
-def extra_market_metrics(symbol, current_price):
-    """
-    Ek metrikleri yalnızca sinyal adayı oluştuğunda al.
-    Böylece her tarama turunda ek API yükü oluşturulmaz.
-    """
-
-    result = {
-        "m1": None,
+def extra_market_metrics(symbol):
+    # Sinyal adayı başına en fazla dört ek istek.
+    # 418/429 hatası asla yutulmaz; tarama durdurulur.
+    out = {
         "m5": None,
         "m15": None,
-        "ema11": None,
-        "ema21": None,
         "oi_change": None,
-        "long_short": None,
-        "month_high": None,
-        "month_low": None,
-        "year_high": None,
-        "year_low": None,
-        "score": 0
+        "long_short": None
     }
 
+    for interval, key in (
+        ("5m", "m5"),
+        ("15m", "m15")
+    ):
+        try:
+            data = api_json(
+                "/fapi/v1/klines",
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "limit": 3
+                }
+            )
+
+            if isinstance(data, list) and len(data) >= 3:
+                old = float(data[-3][4])
+                new = float(data[-2][4])
+
+                out[key] = (
+                    (new / old - 1) * 100
+                    if old else None
+                )
+
+        except BinanceRateLimitError:
+            raise
+
+        except Exception as exc:
+            log.debug(
+                "%s %s metrik hatası: %s",
+                symbol, key, exc
+            )
+
     try:
-        result["m1"] = pct_change_from_klines(
-            symbol, "1m", 1
-        )
-
-        result["m5"] = pct_change_from_klines(
-            symbol, "5m", 1
-        )
-
-        result["m15"] = pct_change_from_klines(
-            symbol, "15m", 1
-        )
-
-        raw = api_json(
-            "/fapi/v1/klines",
-            {
-                "symbol": symbol,
-                "interval": "1m",
-                "limit": 80
-            }
-        )
-
-        if isinstance(raw, list) and len(raw) >= 25:
-            closes = [
-                float(x[4])
-                for x in raw[:-1]
-            ]
-
-            result["ema11"] = ema(closes[-40:], 11)
-            result["ema21"] = ema(closes[-60:], 21)
-
         oi = api_json(
-            "/fapi/v1/openInterest",
-            {"symbol": symbol}
-        )
-
-        oi_now = (
-            float(oi.get("openInterest", 0))
-            if isinstance(oi, dict) else 0.0
-        )
-
-        oi_hist = api_json(
             "/futures/data/openInterestHist",
             {
                 "symbol": symbol,
@@ -537,20 +526,26 @@ def extra_market_metrics(symbol, current_price):
             }
         )
 
-        if isinstance(oi_hist, list) and len(oi_hist) >= 2:
-            old_oi = float(
-                oi_hist[-2].get("sumOpenInterest", 0)
+        if isinstance(oi, list) and len(oi) >= 2:
+            old = float(
+                oi[-2].get("sumOpenInterest", 0)
+            )
+            new = float(
+                oi[-1].get("sumOpenInterest", 0)
             )
 
-            new_oi = float(
-                oi_hist[-1].get("sumOpenInterest", 0)
-            )
+            if old > 0:
+                out["oi_change"] = (
+                    new / old - 1
+                ) * 100
 
-            if old_oi > 0:
-                result["oi_change"] = (
-                    new_oi / old_oi - 1.0
-                ) * 100.0
+    except BinanceRateLimitError:
+        raise
 
+    except Exception as exc:
+        log.debug("%s OI metrik hatası: %s", symbol, exc)
+
+    try:
         ls = api_json(
             "/futures/data/globalLongShortAccountRatio",
             {
@@ -561,239 +556,88 @@ def extra_market_metrics(symbol, current_price):
         )
 
         if isinstance(ls, list) and ls:
-            result["long_short"] = float(
+            out["long_short"] = float(
                 ls[-1].get("longShortRatio", 0)
             )
-
-        daily = api_json(
-            "/fapi/v1/klines",
-            {
-                "symbol": symbol,
-                "interval": "1d",
-                "limit": 365
-            }
-        )
-
-        if isinstance(daily, list) and daily:
-            highs = [float(x[2]) for x in daily]
-            lows = [float(x[3]) for x in daily]
-
-            result["month_high"] = max(highs[-30:])
-            result["month_low"] = min(lows[-30:])
-            result["year_high"] = max(highs)
-            result["year_low"] = min(lows)
-
-        score = 0
-
-        if result["m1"] is not None and result["m1"] < 0:
-            score += 1
-
-        if result["m5"] is not None and result["m5"] < 0:
-            score += 1
-
-        if result["m15"] is not None and result["m15"] < 0:
-            score += 1
-
-        if (
-            result["ema11"] is not None
-            and result["ema21"] is not None
-            and result["ema11"] < result["ema21"]
-        ):
-            score += 1
-
-        if (
-            result["oi_change"] is not None
-            and result["oi_change"] > 0
-        ):
-            score += 1
-
-        if (
-            result["long_short"] is not None
-            and result["long_short"] > 1
-        ):
-            score += 1
-
-        result["score"] = score
 
     except BinanceRateLimitError:
         raise
 
     except Exception as exc:
         log.debug(
-            "Ek piyasa verisi alınamadı %s: %s",
-            symbol,
-            exc
+            "%s Long/Short metrik hatası: %s",
+            symbol, exc
         )
 
-    return result
+    return out
 
 
-def fmt_price(price):
-    if price >= 1000:
-        return f"{price:,.2f}"
-
-    if price >= 1:
-        return f"{price:.4f}"
-
-    if price >= 0.01:
-        return f"{price:.6f}"
-
-    return f"{price:.8f}"
+def fmt_price(value):
+    if value >= 1000:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    if value >= 0.01:
+        return f"{value:.6f}"
+    return f"{value:.8f}"
 
 
-def update_active_trade(state, symbol, candles):
-    trade = state["active"].get(symbol)
+# --------------------------------------------------
+# TELEGRAM SİNYAL MESAJI
+# --------------------------------------------------
 
-    if not trade or len(candles) < 2:
-        return
-
-    # İki seviye aynı mumda görülürse temkinli olarak stop kabul edilir.
-    last = candle_data(candles[-2])
-
-    if last["high"] >= trade["stop"]:
-        outcome = "STOP"
-        exit_price = trade["stop"]
-
-    elif last["low"] <= trade["tp1"]:
-        outcome = "TP1"
-        exit_price = trade["tp1"]
-
-    else:
-        return
-
-    entry = trade["entry"]
-
-    pnl_pct = (
-        (entry - exit_price) / entry
-    ) * 100.0
-
-    record = {
-        "symbol": symbol,
-        "entry_time": trade["time"],
-        "exit_time": tr_saat(),
-        "entry": entry,
-        "exit": exit_price,
-        "outcome": outcome,
-        "gross_pnl_pct": pnl_pct
-    }
-
-    state["history"].append(record)
-    state["history"] = state["history"][-2000:]
-
-    del state["active"][symbol]
-    save_state(state)
-
-    emoji = "✅" if outcome == "TP1" else "🛑"
-
-    tg(
-        f"{emoji} <b>SHORT SANAL İŞLEM SONUCU</b>\n"
-        f"#{escape(symbol)} · Sonuç: <b>{outcome}</b>\n"
-        f"Giriş: {fmt_price(entry)}\n"
-        f"Çıkış: {fmt_price(exit_price)}\n"
-        f"Brüt fiyat sonucu: {pnl_pct:+.2f}%\n"
-        f"<i>Komisyon/funding düşülmemiştir. "
-        f"Bu kayıt simülasyondur.</i>"
-    )
-
-
-def stats_message(state):
-    history = state.get("history", [])
-
-    wins = sum(
-        1 for x in history
-        if x.get("outcome") == "TP1"
-    )
-
-    losses = sum(
-        1 for x in history
-        if x.get("outcome") == "STOP"
-    )
-
-    closed = wins + losses
-
-    gross = sum(
-        float(x.get("gross_pnl_pct", 0.0))
-        for x in history
-    )
-
-    win_rate = (
-        wins / closed * 100.0
-        if closed else 0.0
-    )
-
-    return (
-        "<b>AZCRYPTO SHORT İSTATİSTİKLERİ</b>\n"
-        f"Tamamlanan sanal işlemler: {closed}\n"
-        f"TP1: {wins} | Stop: {losses}\n"
-        f"Başarı oranı: %{win_rate:.1f}\n"
-        f"İşlem yüzdelerinin basit toplamı: {gross:+.2f}%\n"
-        f"Açık sanal işlemler: "
-        f"{len(state.get('active', {}))}\n\n"
-        "<i>Basit brüt fiyat ölçümüdür; bileşik getiri değildir. "
-        "Komisyon, funding, kayma ve gerçek emir gerçekleşmesi "
-        "dahil değildir.</i>"
-    )
-
-
-def send_signal(symbol, snapshot, setup):
+def send_signal(symbol, market, setup, extra):
     link = (
         "https://www.binance.com/en/futures/"
         + urllib.parse.quote(symbol)
     )
+
+    ema_text = (
+        "EMA11 < EMA21 (ayı)"
+        if setup["ema11"] < setup["ema21"]
+        else "EMA11 ≥ EMA21 (yukarı)"
+    )
+
+    def pct(value):
+        return "N/A" if value is None else f"{value:+.2f}%"
+
+    oi = (
+        "N/A"
+        if extra["oi_change"] is None
+        else f"{extra['oi_change']:+.2f}% / 5dk"
+    )
+
+    ls = (
+        "N/A"
+        if extra["long_short"] is None
+        else f"{extra['long_short']:.2f} (hesap oranı)"
+    )
+
+    score = sum([
+        extra["m5"] is not None and extra["m5"] < 0,
+        extra["m15"] is not None and extra["m15"] < 0,
+        setup["ema11"] < setup["ema21"],
+        extra["oi_change"] is not None and extra["oi_change"] > 0,
+        extra["long_short"] is not None and extra["long_short"] > 1,
+        setup["rsi"] >= RSI_MIN
+    ])
 
     reasons = "\n".join(
         "• " + escape(x)
         for x in setup["reasons"]
     )
 
-    x = setup.get("extra", {})
-
-    def pct(key):
-        value = x.get(key)
-        return (
-            "N/A"
-            if value is None
-            else f"{value:+.2f}%"
-        )
-
-    def price_or_na(key):
-        value = x.get(key)
-        return (
-            "N/A"
-            if value is None
-            else fmt_price(value)
-        )
-
-    if x.get("ema11") is None or x.get("ema21") is None:
-        ema_text = "N/A"
-    elif x["ema11"] < x["ema21"]:
-        ema_text = "EMA11 < EMA21 (ayı)"
-    else:
-        ema_text = "EMA11 ≥ EMA21 (yukarı)"
-
-    oi_text = (
-        "N/A"
-        if x.get("oi_change") is None
-        else f"{x['oi_change']:+.2f}% / 5dk"
-    )
-
-    ls_text = (
-        "N/A"
-        if x.get("long_short") is None
-        else f"{x['long_short']:.2f} (hesap oranı)"
-    )
-
     return (
-        f"🔻 <b>SHORT ADAYI — TEYİTLİ DÖNÜŞ</b>\n"
+        f"🔻 <b>SHORT ADAYI — DÖNÜŞ TEYİDİ</b>\n"
         f"<b>#{escape(symbol)} · Binance USDT-M Futures</b>\n"
-        f"⭐ Sinyal skoru: <b>{x.get('score', 0)}/6</b>\n\n"
+        f"⭐ Sinyal skoru: <b>{score}/6</b>\n\n"
 
         f"🏷 Giriş referansı: "
         f"<code>{fmt_price(setup['entry'])}</code>\n"
 
         f"🛑 Stop-loss: "
         f"<code>{fmt_price(setup['stop'])}</code> "
-        f"(girişten +%{setup['risk_pct']:.2f})\n"
+        f"(+%{setup['risk_pct']:.2f})\n"
 
         f"🎯 TP1 (1R): "
         f"<code>{fmt_price(setup['tp1'])}</code>\n"
@@ -801,10 +645,10 @@ def send_signal(symbol, snapshot, setup):
         f"🎯 TP2 (2R): "
         f"<code>{fmt_price(setup['tp2'])}</code>\n\n"
 
-        f"⏱ <b>Zaman dilimleri (son kapanmış mum)</b>\n"
-        f"• 1dk: {pct('m1')} | "
-        f"5dk: {pct('m5')} | "
-        f"15dk: {pct('m15')}\n"
+        f"⏱ <b>Zaman dilimleri (kapanmış mum)</b>\n"
+        f"• 1dk sinyal mumu: %{setup['one_pct']:+.2f} | "
+        f"5dk: {pct(extra['m5'])} | "
+        f"15dk: {pct(extra['m15'])}\n"
 
         f"📉 EMA: {ema_text}\n"
         f"📊 RSI(1dk): {setup['rsi']:.1f} | "
@@ -812,122 +656,204 @@ def send_signal(symbol, snapshot, setup):
         f"{setup['volume_ratio']:.1f} katı\n"
 
         f"📈 24s değişim: "
-        f"{snapshot['change_24h']:+.2f}% | "
+        f"{market['change_24h']:+.2f}% | "
         f"24s hacim: "
-        f"{snapshot['quote_volume'] / 1_000_000:.2f}M USDT\n"
+        f"{market['quote_volume']/1_000_000:.2f}M USDT\n"
 
-        f"💹 Açık pozisyon değişimi: {oi_text}\n"
-        f"👥 Long/Short hesap oranı: {ls_text}\n"
+        f"💹 Açık pozisyon değişimi: {oi}\n"
+        f"👥 Long/Short hesap oranı: {ls}\n"
 
-        f"🗓 30g High/Low: "
-        f"{price_or_na('month_high')} / "
-        f"{price_or_na('month_low')}\n"
-
-        f"📆 365g High/Low: "
-        f"{price_or_na('year_high')} / "
-        f"{price_or_na('year_low')}\n\n"
+        f"📍 24s High/Low: "
+        f"{fmt_price(market['high_24h'])} / "
+        f"{fmt_price(market['low_24h'])}\n\n"
 
         f"🔎 <b>Dönüş teyitleri</b>\n{reasons}\n\n"
 
         f"🔗 <a href='{link}'>Binance Futures paritesi</a>\n"
         f"🕒 {escape(tr_saat())}\n\n"
 
-        "<i>Bilgilendirme amaçlı sinyaldir; garanti değildir. "
-        "Bot gerçek emir açmaz. Ek piyasa metrikleri Binance API "
-        "yanıtına göre N/A görünebilir. Komisyon, funding ve kayma "
-        "hesaba katılmaz.</i>"
+        "<i>Bu bir sinyal/simülasyondur, garanti değildir. "
+        "Bot gerçek emir açmaz. Komisyon, funding ve kayma dahil değildir.</i>"
     )
 
+
+# --------------------------------------------------
+# SANAL İŞLEM TAKİBİ
+# --------------------------------------------------
+
+def update_active_trade(state, symbol, raw):
+    trade = state["active"].get(symbol)
+
+    if not trade or len(raw) < 2:
+        return
+
+    last = candle(raw[-2])
+
+    # Aynı mumda hem hedef hem stop görülürse ihtiyatlı olarak stop kabul et.
+    if last["high"] >= trade["stop"]:
+        outcome, exit_price = "STOP", trade["stop"]
+
+    elif last["low"] <= trade["tp1"]:
+        outcome, exit_price = "TP1", trade["tp1"]
+
+    else:
+        return
+
+    pnl = (
+        (trade["entry"] - exit_price)
+        / trade["entry"]
+    ) * 100
+
+    state["history"].append({
+        "symbol": symbol,
+        "entry_time": trade["time"],
+        "exit_time": tr_saat(),
+        "entry": trade["entry"],
+        "exit": exit_price,
+        "outcome": outcome,
+        "gross_pnl_pct": pnl
+    })
+
+    state["history"] = state["history"][-2000:]
+    del state["active"][symbol]
+    save_state(state)
+
+    emoji = "✅" if outcome == "TP1" else "🛑"
+
+    tg(
+        f"{emoji} <b>SHORT SANAL İŞLEM SONUCU</b>\n"
+        f"#{escape(symbol)} · <b>{outcome}</b>\n"
+        f"Giriş: {fmt_price(trade['entry'])}\n"
+        f"Çıkış: {fmt_price(exit_price)}\n"
+        f"Brüt fiyat sonucu: {pnl:+.2f}%\n"
+        f"<i>Komisyon/funding hariçtir; simülasyondur.</i>"
+    )
+
+
+def stats_message(state):
+    hist = state["history"]
+
+    wins = sum(
+        x.get("outcome") == "TP1"
+        for x in hist
+    )
+
+    losses = sum(
+        x.get("outcome") == "STOP"
+        for x in hist
+    )
+
+    total = wins + losses
+
+    gross = sum(
+        float(x.get("gross_pnl_pct", 0))
+        for x in hist
+    )
+
+    win_rate = wins / total * 100 if total else 0
+
+    return (
+        "<b>AZCRYPTO SHORT İSTATİSTİKLERİ</b>\n"
+        f"Tamamlanan sanal işlemler: {total}\n"
+        f"TP1: {wins} | Stop: {losses}\n"
+        f"Başarı oranı: %{win_rate:.1f}\n"
+        f"Brüt işlem yüzdelerinin basit toplamı: {gross:+.2f}%\n"
+        f"Açık sanal işlemler: {len(state['active'])}\n\n"
+        "<i>Bileşik getiri değildir; komisyon, funding ve kayma dahil değildir.</i>"
+    )
+
+
+# --------------------------------------------------
+# TELEGRAM KOMUTLARI
+# --------------------------------------------------
 
 def process_commands(state):
     if not BOT_TOKEN:
         return
 
-    offset = state.get("telegram_offset", 0)
-
     try:
         url = (
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-            f"?timeout=1&offset={int(offset)}"
+            f"?timeout=1&offset={int(state.get('telegram_offset', 0))}"
         )
 
         req = urllib.request.Request(
             url,
-            headers={
-                "User-Agent": "AZCryptoShortScanner/1.0"
-            }
+            headers={"User-Agent": "AZCryptoShortScanner/2.0"}
         )
 
-        with urllib.request.urlopen(req, timeout=3) as response:
-            updates = json.loads(
-                response.read().decode("utf-8")
-            )
+        with urllib.request.urlopen(req, timeout=4) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-        if not updates or not updates.get("ok"):
+        if not result.get("ok"):
             return
 
-        for item in updates.get("result", []):
-            state["telegram_offset"] = item["update_id"] + 1
+        for update in result.get("result", []):
+            state["telegram_offset"] = update["update_id"] + 1
 
-            message = item.get("message", {})
-            chat_id = str(
-                message.get("chat", {}).get("id", "")
-            )
+            msg = update.get("message", {})
 
-            command = (
-                message.get("text") or ""
-            ).strip().lower()
-
-            if chat_id != CHAT_ID:
+            if str(msg.get("chat", {}).get("id", "")) != CHAT_ID:
                 continue
 
-            if command == "/stats":
+            cmd = (msg.get("text") or "").strip().lower()
+
+            if cmd == "/stats":
                 tg(stats_message(state))
 
-            elif command == "/status":
+            elif cmd == "/status":
+                remaining = max(
+                    0, int(BINANCE_COOLDOWN_UNTIL - time.time())
+                )
+
+                status = (
+                    f"Binance beklemesi: {remaining} sn"
+                    if remaining
+                    else "Tarama hazır"
+                )
+
                 tg(
-                    "<b>AZCRYPTO SHORT BOT AKTİF</b>\n"
+                    f"<b>AZCRYPTO SHORT BOT</b>\n"
+                    f"Durum: {status}\n"
                     f"Sembol üst sınırı: {MAX_SYMBOLS}\n"
-                    f"Tarama aralığı: "
-                    f"{SCAN_INTERVAL_SECONDS} saniye\n"
+                    f"Tarama aralığı: {SCAN_INTERVAL_SECONDS} sn\n"
                     f"Minimum 24s hacim: "
                     f"{MIN_QUOTE_VOLUME_USDT:,.0f} USDT\n"
-                    f"Zaman: {escape(tr_saat())}"
+                    f"Saat: {escape(tr_saat())}"
                 )
 
         save_state(state)
 
     except Exception as exc:
-        log.debug(
-            "Telegram komut kontrolü: %s",
-            exc
-        )
+        log.debug("Telegram komut kontrolü: %s", exc)
 
+
+# --------------------------------------------------
+# ANA TARAMA DÖNGÜSÜ
+# --------------------------------------------------
 
 def bot_loop():
-    log.info("AZCRYPTO SHORT SCANNER başlatıldı")
+    log.info(
+        "AZCRYPTO SHORT SCANNER başlatıldı; "
+        "tarama=%ss, sembol üst sınırı=%s",
+        SCAN_INTERVAL_SECONDS, MAX_SYMBOLS
+    )
 
-    if not BOT_TOKEN:
-        log.warning(
-            "BOT_TOKEN ortam değişkeni ayarlanmamış; "
-            "sinyaller Telegram'a gönderilemez."
-        )
-
+    load_cooldown()
     state = load_state()
-    allowed_symbols = set()
+    last_cooldown_log = 0
 
     while True:
-        if time.time() < BINANCE_COOLDOWN_UNTIL:
-            remaining = max(
-                1,
-                int(BINANCE_COOLDOWN_UNTIL - time.time())
-            )
+        remaining = BINANCE_COOLDOWN_UNTIL - time.time()
 
-            log.warning(
-                "Binance bekleme süresi: %d saniye; "
-                "tarama duraklatıldı.",
-                remaining
-            )
+        if remaining > 0:
+            if time.time() - last_cooldown_log >= 300:
+                log.warning(
+                    "Binance 418/429 beklemesi sürüyor: "
+                    "yaklaşık %d saniye. Yeni Binance isteği gönderilmiyor.",
+                    int(remaining)
+                )
+                last_cooldown_log = time.time()
 
             time.sleep(min(remaining, 60))
             continue
@@ -935,23 +861,15 @@ def bot_loop():
         started = time.time()
 
         try:
-            if not allowed_symbols:
-                allowed_symbols = get_trading_symbols()
-
-                log.info(
-                    "İşlem gören USDT perpetual pariteleri: %d",
-                    len(allowed_symbols)
-                )
-
-            snapshot = get_market_snapshot(allowed_symbols)
+            snapshot = get_market_snapshot()
 
             candidates = sorted(
                 snapshot.items(),
-                key=lambda item: item[1]["quote_volume"],
+                key=lambda x: x[1]["quote_volume"],
                 reverse=True
             )[:MAX_SYMBOLS]
 
-            signals_sent = 0
+            sent = 0
 
             for symbol, market in candidates:
                 try:
@@ -967,20 +885,13 @@ def bot_loop():
                     if not raw or len(raw) < 30:
                         continue
 
-                    update_active_trade(
-                        state,
-                        symbol,
-                        raw
-                    )
+                    update_active_trade(state, symbol, raw)
 
                     last_signal = float(
                         state["last_signal"].get(symbol, 0)
                     )
 
-                    if (
-                        time.time() - last_signal
-                        < COOLDOWN_SECONDS
-                    ):
+                    if time.time() - last_signal < COOLDOWN_SECONDS:
                         continue
 
                     setup = detect_short_setup(raw)
@@ -988,15 +899,9 @@ def bot_loop():
                     if not setup:
                         continue
 
-                    setup["extra"] = extra_market_metrics(
-                        symbol,
-                        setup["entry"]
-                    )
-
+                    extra = extra_market_metrics(symbol)
                     message = send_signal(
-                        symbol,
-                        market,
-                        setup
+                        symbol, market, setup, extra
                     )
 
                     if tg(message):
@@ -1011,24 +916,24 @@ def bot_loop():
                         }
 
                         save_state(state)
-                        signals_sent += 1
+                        sent += 1
 
                         log.info(
-                            "SHORT adayı gönderildi: %s",
+                            "SHORT sinyali gönderildi: %s",
                             symbol
                         )
 
-                    time.sleep(0.08)
+                    time.sleep(0.25)
 
                 except BinanceRateLimitError:
-                    # Binance sınırı aşıldıysa sembol döngüsünü durdur.
-                    break
+                    raise
 
                 except Exception:
                     log.exception(
                         "Sembol tarama hatası: %s",
                         symbol
                     )
+                    time.sleep(0.5)
 
             process_commands(state)
 
@@ -1036,26 +941,26 @@ def bot_loop():
                 "Tarama tamamlandı | aday coin: %d | "
                 "gönderilen sinyal: %d | süre: %.1fs",
                 len(candidates),
-                signals_sent,
+                sent,
                 time.time() - started
             )
 
         except BinanceRateLimitError as exc:
             log.warning(
-                "Binance taraması bekletildi: %s",
+                "Binance taraması durduruldu: %s",
                 exc
             )
 
         except Exception:
             log.exception("Ana tarama döngüsü hatası")
-            allowed_symbols = set()
 
         elapsed = time.time() - started
+        time.sleep(max(1, SCAN_INTERVAL_SECONDS - elapsed))
 
-        time.sleep(
-            max(1, SCAN_INTERVAL_SECONDS - elapsed)
-        )
 
+# --------------------------------------------------
+# RENDER WEB SERVİSİ VE CRON PING
+# --------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -1067,12 +972,10 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
+            "Content-Type", "text/plain; charset=utf-8"
         )
         self.send_header(
-            "Content-Length",
-            str(len(body))
+            "Content-Length", str(len(body))
         )
         self.end_headers()
         self.wfile.write(body)
@@ -1081,11 +984,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
-    def log_message(self, format_string, *args):
-        log.debug(
-            "HTTP: " + format_string,
-            *args
-        )
+    def log_message(self, fmt, *args):
+        log.debug("HTTP: " + fmt, *args)
 
 
 def run_web_server():
@@ -1094,18 +994,15 @@ def run_web_server():
         Handler
     )
 
-    log.info(
-        "Web health server started on port %d",
-        PORT
-    )
-
+    log.info("Web health server port %s", PORT)
     server.serve_forever()
 
 
 if __name__ == "__main__":
     threading.Thread(
         target=bot_loop,
-        daemon=True
+        daemon=True,
+        name="scanner"
     ).start()
 
     run_web_server()
