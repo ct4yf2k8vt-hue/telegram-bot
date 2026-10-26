@@ -19,12 +19,12 @@ socket.setdefaulttimeout(15)
 
 T = os.environ.get("BOT_TOKEN", "").strip()
 C = os.environ.get("CHAT_ID", "1623907197").strip()
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip() # 7/24 uyanık kalmak için
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://fapi.binance.com"
 
-TARAMA_ARALIGI = 120 # 2 dakika (Daha hızlı tarama için düşürdüm, API'yi yormaz)
+TARAMA_ARALIGI = 120 
 COOLDOWN = 900
 MIN_24H_DEGISIM = 5.0
 MIN_24H_HACIM = 5_000_000
@@ -192,14 +192,14 @@ def command_listener():
         time.sleep(2)
 
 # =====================================================
-# KALP ATIŞI VE SELF-PING (7/24 UYANIK KALMA)
+# KALP ATIŞI VE SELF-PING
 # =====================================================
 
 def heartbeat():
     while True:
-        time.sleep(1800) # 30 dakika
+        time.sleep(1800)
         if T and C:
-            tg(C, f"🤖 <b>Sistem Raporu:</b> Bot sorunsuz çalışıyor. (Log ekranı donmuş olabilir, Telegram aktiftir.)\n⏰ {simdi().strftime('%H:%M')}")
+            tg(C, f"🤖 <b>Sistem Raporu:</b> Bot sorunsuz çalışıyor.\n⏰ {simdi().strftime('%H:%M')}")
 
 def keep_alive():
     if not RENDER_URL: return
@@ -207,7 +207,7 @@ def keep_alive():
         try:
             urllib.request.urlopen(RENDER_URL, timeout=10).read()
         except: pass
-        time.sleep(600) # 10 dakika
+        time.sleep(600)
 
 # =====================================================
 # GÖSTERGELER
@@ -487,21 +487,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format_string, *args): return
 
-def run_dummy_server():
+def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    class ReusableServer(socketserver.ThreadingTCPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-    with ReusableServer(("0.0.0.0", port), Handler) as server:
-        log(f"Health server port: {port}")
-        server.serve_forever()
+    # ThreadingHTTPServer kullanarak sunucunun anında bağlanmasını sağlıyoruz
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    log(f"WEB SUNUCUSU BAŞLADI - PORT: {port}")
+    server.serve_forever()
 
 # =====================================================
-# BAŞLAT
+# BAŞLAT (ROLLER DEĞİŞTİ)
 # =====================================================
 
 if __name__ == "__main__":
-    threading.Thread(target=run_dummy_server, daemon=True).start()
+    # 1. Botları ve yardımcı sistemleri ARKA PLANA al (Böylece port taramasını engellemezler)
+    threading.Thread(target=bot_loop, daemon=True).start()
     
     if T:
         threading.Thread(target=command_listener, daemon=True).start()
@@ -511,4 +510,6 @@ if __name__ == "__main__":
             threading.Thread(target=keep_alive, daemon=True).start()
             log("Self-Ping (Uyanık Kalma) aktif.")
             
-    bot_loop()
+    # 2. Web sunucusunu ANA THREAD'de (Main) başlat. 
+    # Render portu anında görsün ve "Port scan timeout" hatası vermesin!
+    run_web_server()
