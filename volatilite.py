@@ -10,13 +10,12 @@ import threading
 import http.server
 import socketserver
 import re
-
 from datetime import datetime, timedelta, timezone
 
 socket.setdefaulttimeout(10)
 
 # =====================================================
-# AYARLAR — RENDER ENVIRONMENT DEĞİŞKENLERİ
+# AYARLAR
 # =====================================================
 
 T = os.environ.get("BOT_TOKEN", "").strip()
@@ -25,23 +24,23 @@ C = os.environ.get("CHAT_ID", "1623907197").strip()
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://fapi.binance.com"
 
-TARAMA_ARALIGI = 180
+TARAMA_ARALIGI = 300
 COOLDOWN = 900
 MIN_24H_DEGISIM = 5.0
 MIN_24H_HACIM = 5_000_000
-MAX_ADAY = 12
+MAX_ADAY = 5
 MIN_SKOR = 4
 
-BINANCE_BEKLEME_BITIS = 0
+COOLDOWN_FILE = "/tmp/binance_cooldown.json"
 
+BINANCE_BEKLEME_BITIS = 0
 son_sinyaller = {}
 son_gunluk_veriler = {}
-
 cooldown_lock = threading.Lock()
 
 
 # =====================================================
-# ZAMAN VE LOG
+# ZAMAN / LOG
 # =====================================================
 
 def simdi():
@@ -67,29 +66,75 @@ def fiyat(v):
         return f"{v:.4f}"
     if v >= 0.01:
         return f"{v:.6f}"
-
     return f"{v:.8f}"
 
 
 def format_vol(v):
     v = float(v)
-
     if v >= 1_000_000:
         return f"{v / 1_000_000:.2f}M"
     if v >= 1_000:
         return f"{v / 1_000:.2f}K"
-
     return f"{v:.2f}"
 
 
 # =====================================================
-# TELEGRAM — SADECE MESAJ GÖNDERİMİ
-# getUpdates / webhook çakışması oluşturulmaz.
+# BINANCE BEKLEME SÜRESİ
+# =====================================================
+
+def beklemeyi_yukle():
+    global BINANCE_BEKLEME_BITIS
+
+    try:
+        with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        BINANCE_BEKLEME_BITIS = float(data.get("until", 0))
+
+        if BINANCE_BEKLEME_BITIS > time.time():
+            kalan = int(BINANCE_BEKLEME_BITIS - time.time())
+            log(f"Kayıtlı Binance beklemesi yüklendi: {kalan} saniye")
+
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        BINANCE_BEKLEME_BITIS = 0
+
+
+def binance_bekleme_ayarla(saniye, neden):
+    global BINANCE_BEKLEME_BITIS
+
+    saniye = max(60, int(saniye))
+
+    with cooldown_lock:
+        BINANCE_BEKLEME_BITIS = max(
+            BINANCE_BEKLEME_BITIS,
+            time.time() + saniye
+        )
+
+        bitis = BINANCE_BEKLEME_BITIS
+
+        try:
+            with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+                json.dump({"until": bitis}, f)
+        except OSError as e:
+            log(f"Bekleme dosyası yazılamadı: {e}")
+
+    log(
+        f"{neden}: yaklaşık {int(bitis - time.time())} saniye. "
+        "Binance istekleri durduruldu."
+    )
+
+
+def binance_bekliyor():
+    return time.time() < BINANCE_BEKLEME_BITIS
+
+
+# =====================================================
+# TELEGRAM
 # =====================================================
 
 def tg(chat_id, message):
-    if not T:
-        log("Telegram gönderilemedi: BOT_TOKEN eksik.")
+    if not T or not chat_id:
+        log("Telegram gönderilemedi: BOT_TOKEN veya CHAT_ID eksik.")
         return False
 
     try:
@@ -106,9 +151,7 @@ def tg(chat_id, message):
         )
 
         with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(
-                response.read().decode("utf-8")
-            )
+            result = json.loads(response.read().decode("utf-8"))
 
         if result.get("ok"):
             return True
@@ -122,7 +165,7 @@ def tg(chat_id, message):
         except Exception:
             detail = ""
 
-        log(f"Telegram HTTP {e.code}: {detail[:250]}")
+        log(f"Telegram HTTP {e.code}: {detail[:200]}")
         return False
 
     except Exception as e:
@@ -131,32 +174,12 @@ def tg(chat_id, message):
 
 
 # =====================================================
-# BINANCE API — 418 / 429 BEKLEME KONTROLÜ
+# BINANCE API
 # =====================================================
 
-def binance_bekleme_ayarla(saniye, neden):
-    global BINANCE_BEKLEME_BITIS
-
-    saniye = max(60, int(saniye))
-
-    with cooldown_lock:
-        BINANCE_BEKLEME_BITIS = max(
-            BINANCE_BEKLEME_BITIS,
-            time.time() + saniye
-        )
-
-    log(
-        f"{neden}: {saniye} saniye. "
-        "Binance taraması geçici olarak durduruldu."
-    )
-
-
 def gj(url):
-    global BINANCE_BEKLEME_BITIS
-
-    if "fapi.binance.com" in url:
-        if time.time() < BINANCE_BEKLEME_BITIS:
-            return None
+    if "fapi.binance.com" in url and binance_bekliyor():
+        return None
 
     try:
         req = urllib.request.Request(
@@ -165,9 +188,13 @@ def gj(url):
         )
 
         with urllib.request.urlopen(req, timeout=15) as response:
-            return json.loads(
-                response.read().decode("utf-8")
-            )
+            result = json.loads(response.read().decode("utf-8"))
+
+        # Yanıt beklenirken başka istek 418 almış olabilir.
+        if "fapi.binance.com" in url and binance_bekliyor():
+            return None
+
+        return result
 
     except urllib.error.HTTPError as e:
         try:
@@ -185,33 +212,22 @@ def gj(url):
                 except (ValueError, TypeError):
                     pass
 
-            match = re.search(
-                r"banned until (\d+)",
-                body,
-                re.IGNORECASE
-            )
+            match = re.search(r"banned until (\d+)", body, re.IGNORECASE)
 
             if match:
                 try:
                     stamp = int(match.group(1))
-
                     if stamp > 10**12:
                         stamp //= 1000
 
-                    wait = max(
-                        wait or 0,
-                        int(stamp - time.time())
-                    )
-                except Exception:
+                    wait = max(wait or 0, int(stamp - time.time()))
+                except (ValueError, TypeError):
                     pass
 
             if wait is None:
                 wait = 1800 if e.code == 418 else 300
 
-            binance_bekleme_ayarla(
-                wait,
-                f"Binance HTTP {e.code}"
-            )
+            binance_bekleme_ayarla(wait, f"Binance HTTP {e.code}")
 
         else:
             log(f"HTTP {e.code}: {body[:200]}")
@@ -224,6 +240,9 @@ def gj(url):
 
 
 def futures_api(path, params=None):
+    if binance_bekliyor():
+        return None
+
     url = BASE + path
 
     if params:
@@ -252,13 +271,8 @@ def calculate_rsi(prices, period=14):
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(deltas)):
-        avg_gain = (
-            avg_gain * (period - 1) + gains[i]
-        ) / period
-
-        avg_loss = (
-            avg_loss * (period - 1) + losses[i]
-        ) / period
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
     if avg_loss == 0:
         return 100.0
@@ -275,10 +289,7 @@ def calculate_ema(values, period):
     multiplier = 2 / (period + 1)
 
     for value in values[period:]:
-        result = (
-            value * multiplier
-            + result * (1 - multiplier)
-        )
+        result = value * multiplier + result * (1 - multiplier)
 
     return result
 
@@ -286,17 +297,15 @@ def calculate_ema(values, period):
 def get_candles(symbol, interval, limit=60):
     data = futures_api(
         "/fapi/v1/klines",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        }
+        {"symbol": symbol, "interval": interval, "limit": limit}
     )
+
+    if binance_bekliyor():
+        return None
 
     if not isinstance(data, list) or len(data) < 22:
         return None
 
-    # Açık olan son mum kullanılmaz.
     return data[:-1]
 
 
@@ -311,12 +320,11 @@ def mum_yonu(candles):
         return "Yukarı"
     if b < a:
         return "Aşağı"
-
     return "Yatay"
 
 
 # =====================================================
-# 30 GÜN / 365 GÜN HIGH-LOW
+# GÜNLÜK HIGH / LOW — 12 SAAT ÖNBELLEK
 # =====================================================
 
 def get_daily_levels(symbol):
@@ -327,12 +335,11 @@ def get_daily_levels(symbol):
 
     data = futures_api(
         "/fapi/v1/klines",
-        {
-            "symbol": symbol,
-            "interval": "1d",
-            "limit": 365
-        }
+        {"symbol": symbol, "interval": "1d", "limit": 365}
     )
+
+    if binance_bekliyor():
+        return None
 
     if not isinstance(data, list) or not data:
         return None
@@ -367,12 +374,11 @@ def get_daily_levels(symbol):
 def get_oi_change(symbol):
     data = futures_api(
         "/futures/data/openInterestHist",
-        {
-            "symbol": symbol,
-            "period": "5m",
-            "limit": 2
-        }
+        {"symbol": symbol, "period": "5m", "limit": 2}
     )
+
+    if binance_bekliyor():
+        return None
 
     if not isinstance(data, list) or len(data) < 2:
         return None
@@ -393,12 +399,11 @@ def get_oi_change(symbol):
 def get_long_short(symbol):
     data = futures_api(
         "/futures/data/globalLongShortAccountRatio",
-        {
-            "symbol": symbol,
-            "period": "5m",
-            "limit": 1
-        }
+        {"symbol": symbol, "period": "5m", "limit": 1}
     )
+
+    if binance_bekliyor():
+        return None
 
     if not isinstance(data, list) or not data:
         return None
@@ -415,11 +420,14 @@ def get_long_short(symbol):
 
 
 # =====================================================
-# ADAYLAR — BINANCE USDT-M FUTURES
+# ADAY SEÇİMİ
 # =====================================================
 
 def get_candidates():
     tickers = futures_api("/fapi/v1/ticker/24hr")
+
+    if binance_bekliyor():
+        return None
 
     if not isinstance(tickers, list):
         return None
@@ -468,15 +476,15 @@ def analyze_symbol(ticker):
     symbol = ticker["symbol"]
 
     one = get_candles(symbol, "1m", 60)
-    if not one or len(one) < 25:
+    if not one or binance_bekliyor():
         return None
 
     five = get_candles(symbol, "5m", 30)
-    if not five:
+    if not five or binance_bekliyor():
         return None
 
     fifteen = get_candles(symbol, "15m", 30)
-    if not fifteen:
+    if not fifteen or binance_bekliyor():
         return None
 
     try:
@@ -494,10 +502,7 @@ def analyze_symbol(ticker):
             return None
 
         start = float(one[-6][4])
-        move5 = (
-            (entry - start) / start * 100
-            if start else 0
-        )
+        move5 = (entry - start) / start * 100 if start else 0
 
         rsi = calculate_rsi(closes)
         ema11 = calculate_ema(closes, 11)
@@ -510,8 +515,7 @@ def analyze_symbol(ticker):
         )
 
         volume_ratio = (
-            volumes[-1] / average_volume
-            if average_volume > 0 else 0
+            volumes[-1] / average_volume if average_volume > 0 else 0
         )
 
         support = min(lows[-6:-1])
@@ -523,9 +527,7 @@ def analyze_symbol(ticker):
 
         if move5 >= 1:
             score += 1
-            reasons.append(
-                f"Önceki 5 mum hareketi: %{move5:.2f}"
-            )
+            reasons.append(f"Önceki 5 mum hareketi: %{move5:.2f}")
 
         if rsi is not None and rsi >= 60:
             score += 1
@@ -533,9 +535,7 @@ def analyze_symbol(ticker):
 
         if volume_ratio >= 1.5:
             score += 1
-            reasons.append(
-                f"Hacim: ortalamanın {volume_ratio:.1f} katı"
-            )
+            reasons.append(f"Hacim: ortalamanın {volume_ratio:.1f} katı")
 
         if ema11 is not None and ema21 is not None:
             if ema11 >= ema21:
@@ -554,10 +554,7 @@ def analyze_symbol(ticker):
             score += 1
             reasons.append("Kırmızı mum")
 
-        if score < MIN_SKOR:
-            return None
-
-        if not support_break or not red_candle:
+        if score < MIN_SKOR or not support_break or not red_candle:
             return None
 
         stop = max(highs[-5:])
@@ -582,18 +579,19 @@ def analyze_symbol(ticker):
         volume24 = float(ticker["quoteVolume"])
 
         oi = get_oi_change(symbol)
+        if binance_bekliyor():
+            return None
+
         ls = get_long_short(symbol)
+        if binance_bekliyor():
+            return None
+
         levels = get_daily_levels(symbol)
+        if binance_bekliyor():
+            return None
 
-        oi_text = (
-            f"{oi:+.2f}% / 5dk"
-            if oi is not None else "N/A"
-        )
-
-        ls_text = (
-            f"{ls['ratio']:.2f} (hesap oranı)"
-            if ls else "N/A"
-        )
+        oi_text = f"{oi:+.2f}% / 5dk" if oi is not None else "N/A"
+        ls_text = f"{ls['ratio']:.2f} (hesap oranı)" if ls else "N/A"
 
         high30 = levels["high30"] if levels else None
         low30 = levels["low30"] if levels else None
@@ -607,33 +605,21 @@ def analyze_symbol(ticker):
             f"🔻 <b>SHORT ADAYI — TEYİTLİ DÖNÜŞ</b>\n"
             f"<b>#{symbol}</b> · Binance USDT-M Futures\n"
             f"⭐ Sinyal skoru: {score}/6\n\n"
-
             f"🏷 Giriş referansı: {fiyat(entry)}\n"
-            f"🛑 Stop-loss: {fiyat(stop)} "
-            f"(girişten +%{risk_pct:.2f})\n"
+            f"🛑 Stop-loss: {fiyat(stop)} (girişten +%{risk_pct:.2f})\n"
             f"🎯 TP1 (1R): {fiyat(tp1)}\n"
             f"🎯 TP2 (2R): {fiyat(tp2)}\n\n"
-
             f"⏱ Zaman dilimleri (son kapanmış mum)\n"
-            f"• 1dk: {mum_yonu(one)} | "
-            f"5dk: {mum_yonu(five)} | "
+            f"• 1dk: {mum_yonu(one)} | 5dk: {mum_yonu(five)} | "
             f"15dk: {mum_yonu(fifteen)}\n"
-
             f"📉 EMA: {ema_text}\n"
-            f"📊 RSI(1dk): {rsi_text} | "
-            f"Hacim: ortalamanın {volume_ratio:.1f} katı\n"
-
+            f"📊 RSI(1dk): {rsi_text} | Hacim: ortalamanın {volume_ratio:.1f} katı\n"
             f"📈 24s değişim: {change24:+.2f}% | "
             f"24s hacim: {volume24 / 1_000_000:.2f}M USDT\n"
-
             f"💹 Açık pozisyon değişimi: {oi_text}\n"
             f"👥 Long/Short hesap oranı: {ls_text}\n"
-
-            f"🗓 30g High/Low: "
-            f"{fiyat(high30)} / {fiyat(low30)}\n"
-            f"📆 365g High/Low: "
-            f"{fiyat(high365)} / {fiyat(low365)}\n\n"
-
+            f"🗓 30g High/Low: {fiyat(high30)} / {fiyat(low30)}\n"
+            f"📆 365g High/Low: {fiyat(high365)} / {fiyat(low365)}\n\n"
             f"🔎 <b>Dönüş teyitleri</b>\n"
             + "".join(f"• {r}\n" for r in reasons)
             + f"\n🔗 <a href='https://www.binance.com/en/futures/{symbol}'>"
@@ -641,15 +627,11 @@ def analyze_symbol(ticker):
             f"🕒 {now_text}\n\n"
             f"Bilgilendirme amaçlı sinyaldir; garanti değildir. "
             f"Bot gerçek emir açmaz. Ek piyasa metrikleri Binance API "
-            f"yanıtına göre N/A görünebilir. Komisyon, funding ve "
-            f"kayma hesaba katılmaz."
+            f"yanıtına göre N/A görünebilir. Komisyon, funding ve kayma "
+            f"hesaba katılmaz."
         )
 
-        return {
-            "symbol": symbol,
-            "score": score,
-            "message": message
-        }
+        return {"symbol": symbol, "score": score, "message": message}
 
     except Exception as e:
         log(f"{symbol} analiz hatası: {e}")
@@ -657,11 +639,12 @@ def analyze_symbol(ticker):
 
 
 # =====================================================
-# FUTURES OTOMATİK TARAMA
+# ANA TARAMA DÖNGÜSÜ
 # =====================================================
 
 def bot_loop():
     log("Binance Futures SHORT bot başlatılıyor.")
+    beklemeyi_yukle()
 
     if not T:
         log("UYARI: Render BOT_TOKEN değişkeni bulunamadı.")
@@ -674,7 +657,7 @@ def bot_loop():
             C,
             "✅ <b>SHORT FUTURES BOT BAŞLADI</b>\n\n"
             "Telegram bağlantısı test ediliyor.\n"
-            "Binance USDT-M Futures taraması aktif.\n"
+            "Binance USDT-M Futures botu aktif.\n"
             "Bot gerçek emir açmaz; yalnızca sinyal gönderir."
         ):
             log("Telegram başlangıç mesajı gönderildi.")
@@ -683,26 +666,19 @@ def bot_loop():
 
     while True:
         try:
-            if time.time() < BINANCE_BEKLEME_BITIS:
-                remaining = int(
-                    BINANCE_BEKLEME_BITIS - time.time()
-                )
-
-                log(
-                    f"Binance bekleme süresi: {remaining} saniye; "
-                    "tarama duraklatıldı."
-                )
-
-                time.sleep(min(180, max(5, remaining)))
+            if binance_bekliyor():
+                kalan = int(BINANCE_BEKLEME_BITIS - time.time())
+                log(f"Binance beklemesi sürüyor: {kalan} saniye.")
+                time.sleep(min(180, max(5, kalan)))
                 continue
 
             candidates = get_candidates()
 
+            if binance_bekliyor():
+                continue
+
             if candidates is None:
-                log(
-                    "Futures adayları alınamadı; "
-                    "60 saniye sonra tekrar."
-                )
+                log("Aday listesi alınamadı; 60 saniye sonra denenecek.")
                 time.sleep(60)
                 continue
 
@@ -712,9 +688,11 @@ def bot_loop():
             )
 
             alerts = 0
+            tarama_durdu = False
 
             for ticker in candidates:
-                if time.time() < BINANCE_BEKLEME_BITIS:
+                if binance_bekliyor():
+                    tarama_durdu = True
                     break
 
                 symbol = ticker["symbol"]
@@ -727,28 +705,29 @@ def bot_loop():
 
                 result = analyze_symbol(ticker)
 
+                if binance_bekliyor():
+                    tarama_durdu = True
+                    break
+
                 if result:
                     if tg(C, result["message"]):
                         son_sinyaller[symbol] = time.time()
                         alerts += 1
-
                         log(
                             f"SİNYAL GÖNDERİLDİ: {symbol} "
                             f"| Skor: {result['score']}/6"
                         )
                     else:
-                        log(
-                            f"Telegram sinyali gönderemedi: {symbol}"
-                        )
+                        log(f"Telegram sinyali gönderemedi: {symbol}")
 
-                # API isteklerini gereksiz sıklaştırma.
-                time.sleep(1)
+                # Adaylar arasında kısa ara.
+                time.sleep(2)
 
-            log(
-                f"Tarama tamamlandı: {len(candidates)} aday "
-                f"| {alerts} alarm"
-            )
+            if tarama_durdu:
+                log("Binance kısıtlaması nedeniyle mevcut tarama kesildi.")
+                continue
 
+            log(f"Tarama tamamlandı: {len(candidates)} aday | {alerts} alarm")
             time.sleep(TARAMA_ARALIGI)
 
         except Exception as e:
@@ -757,22 +736,15 @@ def bot_loop():
 
 
 # =====================================================
-# RENDER PORT SUNUCUSU
+# RENDER HEALTH SERVER
 # =====================================================
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         body = b"Futures SHORT bot is running!"
-
         self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -797,15 +769,9 @@ def run_dummy_server():
 
 
 # =====================================================
-# BAŞLAT — getUpdates DİNLENMİYOR
+# BAŞLAT
 # =====================================================
 
 if __name__ == "__main__":
-    threading.Thread(
-        target=run_dummy_server,
-        daemon=True
-    ).start()
-
-    # Telegram getUpdates dinleyicisi başlatılmıyor.
-    # Böylece aktif webhook ile 409 çakışması önlenir.
+    threading.Thread(target=run_dummy_server, daemon=True).start()
     bot_loop()
