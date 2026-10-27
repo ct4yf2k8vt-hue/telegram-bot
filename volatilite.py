@@ -11,7 +11,7 @@ import socketserver
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
-# AYARLAR (MİDAS FLOW TARZI RAPOR)
+# AYARLAR (MİDAS FLOW TARZI RAPOR - SAATLİK)
 # =====================================================
 
 socket.setdefaulttimeout(15)
@@ -23,7 +23,8 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://fapi.binance.com"
 
-RAPOR_ARALIGI = 86400 # 24 Saat (Test için 3600 yapabilirsin)
+# RAPOR ARALIĞI (Saniye cinsinden. 3600 = 1 Saat)
+RAPOR_ARALIGI = 3600 
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -60,7 +61,7 @@ def gj(url):
         with urllib.request.urlopen(req, timeout=15) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        # EĞER FUTURES ENGELLENDİYSE SPOT API'YE GEÇ
+        # Binance Futures engellenirse Spot API'ye geç
         if "fapi.binance.com" in url and e.code in (403, 451, 418):
             spot_url = url.replace("fapi.binance.com", "api.binance.com").replace("/fapi/v1", "/api/v3")
             try:
@@ -115,7 +116,7 @@ def get_peak_time(symbol):
 # =====================================================
 
 def generate_report():
-    log("Piyasa verileri çekiliyor...")
+    log("Piyasa verileri çekiliyor (Saatlik Rapor)...")
     
     tickers = gj(f"{BASE}/fapi/v1/ticker/24hr")
     if not isinstance(tickers, list):
@@ -167,7 +168,7 @@ def generate_report():
     msg += f"<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #crypto #pump #signals</a>"
 
     tg(C, msg)
-    log("Rapor başarıyla gönderildi.")
+    log("Saatlik rapor başarıyla gönderildi.")
     return True
 
 # =====================================================
@@ -175,8 +176,8 @@ def generate_report():
 # =====================================================
 
 def bot_loop():
-    log("--- MİDAS FLOW RAPOR BOTU BAŞLADI ---")
-    tg(C, "✅ <b>Midas Flow Rapor Botu Başladı!</b>\n\nGörseldeki formatta raporlar hazırlanıyor.")
+    log("--- MİDAS FLOW SAATLİK RAPOR BOTU BAŞLADI ---")
+    tg(C, "✅ <b>Midas Flow Saatlik Rapor Botu Başladı!</b>\n\nHer saat başı güncel Top 5 listesi gelecek.")
     
     time.sleep(3)
     
@@ -184,7 +185,7 @@ def bot_loop():
         try:
             basarili = generate_report()
             if basarili:
-                log(f"Bir sonraki rapor için {RAPOR_ARALIGI} saniye bekleniyor...")
+                log(f"Bir sonraki rapor için 1 saat (3600 saniye) bekleniyor...")
                 time.sleep(RAPOR_ARALIGI)
             else:
                 log("Rapor oluşturulamadı (API engeli). 5 dakika sonra tekrar denenecek...")
@@ -201,7 +202,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Midas Flow Bot is running!")
+        self.wfile.write(b"Midas Flow Hourly Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
