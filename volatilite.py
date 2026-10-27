@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
-# AYARLAR (SADECE SHORT)
+# AYARLAR (TÜM PİYASAYI TARAR)
 # =====================================================
 
 socket.setdefaulttimeout(15)
@@ -26,16 +26,13 @@ BASE = "https://fapi.binance.com"
 
 TARAMA_ARALIGI = 120 
 COOLDOWN = 900
-MIN_24H_DEGISIM = 2.0      # Filtre gevşetildi (Daha fazla coin taransın diye)
-MIN_24H_HACIM = 5_000_000
-MAX_ADAY = 10
-MIN_SKOR = 3               # Skor barajı düşürüldü (Sinyal sıklığı için)
+MIN_24H_HACIM = 1_000_000  # 1 Milyon Dolar barajı (Çok ölü coinleri eler, geri kalan her şeyi tarar)
+GLOBAL_SINYAL_LIMIT = 15   # Piyasa çökerse Telegram'ı spamlamamak için bir turda max 15 sinyal
 
 COOLDOWN_FILE = "/tmp/binance_cooldown.json"
 
 BINANCE_BEKLEME_BITIS = 0
 son_sinyaller = {}
-son_gunluk_veriler = {}
 cooldown_lock = threading.Lock()
 last_update_id = 0
 SON_RAPOR_ZAMANI = time.time()
@@ -57,10 +54,6 @@ def fiyat(v):
     if v >= 1: return f"{v:.4f}"
     if v >= 0.01: return f"{v:.6f}"
     return f"{v:.8f}"
-
-# =====================================================
-# BINANCE & TELEGRAM
-# =====================================================
 
 def beklemeyi_yukle():
     global BINANCE_BEKLEME_BITIS
@@ -97,8 +90,7 @@ def tg(chat_id, message):
         }).encode("utf-8")
         req = urllib.request.Request(f"https://api.telegram.org/bot{T}/sendMessage", data=data)
         with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        return result.get("ok", False)
+            return json.loads(response.read().decode("utf-8")).get("ok", False)
     except:
         return False
 
@@ -107,8 +99,7 @@ def gj(url):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        return result
+            return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if "fapi.binance.com" in url and e.code in (418, 429):
             binance_bekleme_ayarla(1800 if e.code == 418 else 300, f"Binance HTTP {e.code}")
@@ -149,8 +140,6 @@ def command_listener():
                                             f"📈 <b>Long:</b> {float(d['longAccount'])*100:.2f}%\n"
                                             f"📉 <b>Short:</b> {float(d['shortAccount'])*100:.2f}%\n"
                                             f"⚖️ <b>Ratio:</b> {float(d['longShortRatio']):.2f}")
-                            else:
-                                tg(chat_id, f"❌ {symbol} için veri bulunamadı.")
         except:
             pass
         time.sleep(2)
@@ -161,9 +150,9 @@ def command_listener():
 
 def heartbeat():
     while True:
-        time.sleep(7200) # 2 saatte bir
+        time.sleep(7200)
         if T and C:
-            tg(C, f"🤖 <b>Bot Aktif:</b> Sadece SHORT sinyalleri taranıyor.\n⏰ {simdi().strftime('%H:%M')}")
+            tg(C, f"🤖 <b>Bot Aktif:</b> TÜM BİNANCE FUTURES PİYASASI SHORT için taranıyor.\n⏰ {simdi().strftime('%H:%M')}")
 
 def keep_alive():
     if not RENDER_URL: return
@@ -189,48 +178,46 @@ def calculate_rsi(prices, period=14):
     if avg_loss == 0: return 100.0
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-def calculate_ema(values, period):
-    if len(values) < period: return None
-    result = sum(values[:period]) / period
-    multiplier = 2 / (period + 1)
-    for value in values[period:]:
-        result = value * multiplier + result * (1 - multiplier)
-    return result
-
 def get_candles(symbol, interval, limit=60):
     data = futures_api("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     if not isinstance(data, list) or len(data) < 22: return None
     return data[:-1]
 
 # =====================================================
-# ADAY SEÇİMİ VE ANALİZ (SADECE SHORT)
+# TÜM COİNLERİ SEÇ VE ANALİZ ET (SHORT)
 # =====================================================
 
-def get_candidates():
+def get_all_candidates():
     tickers = futures_api("/fapi/v1/ticker/24hr")
-    if not isinstance(tickers, list): return None
+    if not isinstance(tickers, list): return []
+    
     candidates = []
     for t in tickers:
         try:
             symbol = t["symbol"]
-            if not symbol.endswith("USDT") or any(x in symbol for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")): continue
-            change = float(t["priceChangePercent"])
-            volume = float(t["quoteVolume"])
+            # Mantık: Tüm USDT paritelerini al, ölü olanları (hacmi 1M altı) çıkar.
+            if not symbol.endswith("USDT") or any(x in symbol for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")): 
+                continue
             
-            # Sadece hacmi yüksek olanlar aday olsun (Yön önemli değil, analizde bakacağız)
+            volume = float(t["quoteVolume"])
+            change = float(t["priceChangePercent"])
+            
+            # Hacmi 1 Milyonun üzerinde olan TÜM coinler aday.
+            # (Piyasa düşerken hepsi kırmızı olacağı için 24s değişimine burada takılmıyoruz)
             if volume >= MIN_24H_HACIM: 
                 candidates.append(t)
         except: continue
     
-    # Hacme göre sırala
+    # Hacme göre büyükten küçüğe sırala (En likit olanları önce tara)
     candidates.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-    return candidates[:MAX_ADAY]
+    return candidates
 
 def analyze_symbol(ticker):
     symbol = ticker["symbol"]
-    one = get_candles(symbol, "1m", 60)
-    five = get_candles(symbol, "5m", 30)
-    if not one or not five: return None
+    
+    # 1 dakikalık grafik (Anlık düşüşleri yakalamak için)
+    one = get_candles(symbol, "1m", 30)
+    if not one: return None
 
     try:
         closes = [float(x[4]) for x in one]
@@ -247,48 +234,39 @@ def analyze_symbol(ticker):
         avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 1
         volume_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
 
-        # EMA Analizi (Trend yönü için)
-        ema11 = calculate_ema(closes, 11)
-        ema21 = calculate_ema(closes, 21)
-        
-        # --- SADECE SHORT ŞARTLARI ---
-        # 1. Kırmızı mum (Fiyat açılışın altında)
-        # 2. EMA11, EMA21'in altında (Düşüş trendi)
-        # 3. Hacim ortalamanın üzerinde (En az 1.1 katı)
-        # 4. RSI 50'nin altında (Satıcılar baskın)
-        
+        # --- SHORT ŞARTLARI ---
+        # 1. Fiyat düşüyor (Açılış > Kapanış)
+        # 2. Hacim normalin üzerinde (En az 1.1 katı)
+        # 3. RSI 60'ın altında (Yükseliş ivmesi zayıf)
         is_short = (entry < open_price and 
-                    ema11 < ema21 and 
                     volume_ratio >= 1.1 and 
-                    rsi is not None and rsi < 50)
+                    rsi is not None and rsi < 60)
 
         if not is_short: return None
 
-        # Hedef ve Stop Belirleme
-        stop = max(highs[-5:]) # Son 5 mumun en yükseği (Stop-loss)
-        if stop <= entry: stop = entry * 1.01 # Çok yakınsa %1 koy
+        # Stop ve Hedef Belirleme (Son 3 mumun zirvesi)
+        stop = max(highs[-3:]) 
+        if stop <= entry: stop = entry * 1.005 
         
         risk = stop - entry
-        if risk == 0 or (risk / entry) > 0.05: return None # Risk %5'ten büyükse işleme girme
+        if risk == 0 or (risk / entry) > 0.04: return None # Risk %4'ten büyükse girme
 
-        hedef1 = entry - risk # 1R
-        hedef2 = entry - (risk * 2) # 2R
+        hedef1 = entry - risk
+        hedef2 = entry - (risk * 2)
 
         message = (
             f"🔴 <b>SHORT SİNYALİ: {symbol}</b>\n"
-            f"⭐ Skor: {4}/4 (Kırmızı Mum + EMA Düşüş + RSI + Hacim)\n\n"
+            f"⭐ Skor: Kırmızı Mum + RSI + Hacim\n\n"
             f"🏷 <b>Giriş:</b> {fiyat(entry)}\n"
             f"🛑 <b>Stop:</b> {fiyat(stop)} (+%{(risk/entry)*100:.2f})\n"
             f"🎯 <b>Hedef 1:</b> {fiyat(hedef1)}\n"
             f"🎯 <b>Hedef 2:</b> {fiyat(hedef2)}\n\n"
             f"📊 <b>RSI:</b> {rsi:.1f} | <b>Hacim:</b> {volume_ratio:.1f}x\n"
-            f"⏱ <b>Zaman:</b> {simdi().strftime('%H:%M')}\n\n"
-            f"<i>Not: Sadece düşüş (Short) fırsatları aranmaktadır.</i>"
+            f"⏱ <b>Zaman:</b> {simdi().strftime('%H:%M')}"
         )
-        return {"symbol": symbol, "score": 4, "message": message}
+        return {"symbol": symbol, "message": message}
 
     except Exception as e:
-        log(f"{symbol} analiz hatası: {e}")
         return None
 
 # =====================================================
@@ -297,11 +275,11 @@ def analyze_symbol(ticker):
 
 def bot_loop():
     global SON_RAPOR_ZAMANI
-    log("Futures SADECE SHORT bot başlatılıyor.")
+    log("Tüm Piyasayı Tarayan SHORT Bot başlatılıyor...")
     beklemeyi_yukle()
 
     if T and C:
-        tg(C, "✅ <b>SADECE SHORT FUTURES BOT BAŞLADI</b>\n\nPiyasa düşüşe geçtiğinde sinyal üretilecektir.\n/ratio komutu aktiftir.")
+        tg(C, "✅ <b>TÜM PİYASA SHORT BOT BAŞLADI</b>\n\nBinance Futures'taki tüm USDT pariteleri (hacmi 1M üzeri) taranıyor.")
 
     while True:
         try:
@@ -309,19 +287,24 @@ def bot_loop():
                 time.sleep(60)
                 continue
 
-            candidates = get_candidates()
-            if candidates is None:
+            # Tüm piyasadaki adayları çek
+            candidates = get_all_candidates()
+            if not candidates:
                 time.sleep(60)
                 continue
 
             alerts = 0
+            taranan = 0
+            
             for ticker in candidates:
                 if binance_bekliyor(): break
+                if alerts >= GLOBAL_SINYAL_LIMIT: break # Spam koruması
 
                 symbol = ticker["symbol"]
                 if symbol in son_sinyaller and time.time() - son_sinyaller[symbol] < COOLDOWN:
                     continue
 
+                taranan += 1
                 result = analyze_symbol(ticker)
                 if result:
                     if tg(C, result["message"]):
@@ -329,11 +312,11 @@ def bot_loop():
                         alerts += 1
                         log(f"SHORT SİNYALİ GÖNDERİLDİ: {symbol}")
 
-                time.sleep(1)
+                time.sleep(0.05) # API'yi hızlı ama güvenli tara
 
             # Raporlama
             if time.time() - SON_RAPOR_ZAMANI > 1800:
-                tg(C, f"📊 <b>Tarama Raporu:</b>\nSon 30 dk: {len(candidates)} coin tarandı.\nSHORT Sinyali: {alerts}\n(Piyasa yükseliyorsa sinyal gelmez)\n⏰ {simdi().strftime('%H:%M')}")
+                tg(C, f"📊 <b>Tarama Raporu:</b>\nTüm Piyasa Tarandı.\nİncelenen: {taranan} coin\nSHORT Sinyali: {alerts}\n⏰ {simdi().strftime('%H:%M')}")
                 SON_RAPOR_ZAMANI = time.time()
 
             time.sleep(TARAMA_ARALIGI)
@@ -350,7 +333,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"SHORT Bot is running!")
+        self.wfile.write(b"ALL COINS SHORT Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
