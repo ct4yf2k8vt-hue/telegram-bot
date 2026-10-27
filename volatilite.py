@@ -8,12 +8,7 @@ import os
 import threading
 import http.server
 import socketserver
-import re
 from datetime import datetime, timedelta, timezone
-
-# =====================================================
-# AYARLAR (HIZLI TARAMA İÇİN OPTİMİZE EDİLDİ)
-# =====================================================
 
 socket.setdefaulttimeout(15)
 
@@ -22,19 +17,13 @@ C = os.environ.get("CHAT_ID", "1623907197").strip()
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
 TR_Saati = timezone(timedelta(hours=3))
-BASE = "https://fapi.binance.com"
 
-TARAMA_ARALIGI = 60 
-COOLDOWN = 900
-MIN_24H_HACIM = 2_000_000
+# ARBİTRAJ AYARLARI
+MIN_SPREAD_PCT = 2.5       # En az %2.5 fark olursa sinyal at
+MIN_VOLUME_USDT = 500_000  # Hacmi en az 500 Bin Dolar olanları dikkate al
 
-COOLDOWN_FILE = "/tmp/binance_cooldown.json"
-
-BINANCE_BEKLEME_BITIS = 0
 son_sinyaller = {}
-cooldown_lock = threading.Lock()
 last_update_id = 0
-SON_RAPOR_ZAMANI = time.time()
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -49,43 +38,21 @@ def log(m):
 def fiyat(v):
     if v is None: return "N/A"
     v = float(v)
-    if v >= 1000: return f"{v:.2f}"
+    if v >= 100: return f"{v:.3f}"
     if v >= 1: return f"{v:.4f}"
-    if v >= 0.01: return f"{v:.6f}"
-    return f"{v:.8f}"
+    return f"{v:.5f}"
 
-def beklemeyi_yukle():
-    global BINANCE_BEKLEME_BITIS
-    try:
-        with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        BINANCE_BEKLEME_BITIS = float(data.get("until", 0))
-    except:
-        BINANCE_BEKLEME_BITIS = 0
-
-def binance_bekleme_ayarla(saniye, neden):
-    global BINANCE_BEKLEME_BITIS
-    saniye = max(60, int(saniye))
-    with cooldown_lock:
-        BINANCE_BEKLEME_BITIS = max(BINANCE_BEKLEME_BITIS, time.time() + saniye)
-        try:
-            with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
-                json.dump({"until": BINANCE_BEKLEME_BITIS}, f)
-        except:
-            pass
-    log(f"!!! {neden}: {int(saniye)} saniye bekleme.")
-
-def binance_bekliyor():
-    return time.time() < BINANCE_BEKLEME_BITIS
+def format_vol(v):
+    v = float(v)
+    if v >= 1_000_000: return f"{v/1_000_000:.1f}M"
+    if v >= 1_000: return f"{v/1_000:.1f}K"
+    return f"{v:.0f}"
 
 def tg(chat_id, message):
     if not T or not chat_id: return False
     try:
         data = urllib.parse.urlencode({
-            "chat_id": str(chat_id),
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true"
+            "chat_id": str(chat_id), "text": message, "parse_mode": "HTML", "disable_web_page_preview": "true"
         }).encode("utf-8")
         req = urllib.request.Request(f"https://api.telegram.org/bot{T}/sendMessage", data=data)
         with urllib.request.urlopen(req, timeout=15) as response:
@@ -94,26 +61,51 @@ def tg(chat_id, message):
         return False
 
 def gj(url):
-    if "fapi.binance.com" in url and binance_bekliyor(): return None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if "fapi.binance.com" in url and e.code in (418, 429):
-            binance_bekleme_ayarla(300, f"Binance HTTP {e.code}")
-        return None
     except:
         return None
 
-def futures_api(path, params=None):
-    if binance_bekliyor(): return None
-    url = BASE + path
-    if params: url += "?" + urllib.parse.urlencode(params)
-    return gj(url)
+# =====================================================
+# BORSALARDAN VERİ ÇEKME
+# =====================================================
+
+def get_binance_tickers():
+    data = gj("https://api.binance.com/api/v3/ticker/24hr")
+    result = {}
+    if data:
+        for t in data:
+            if t['symbol'].endswith('USDT'):
+                result[t['symbol']] = {"price": float(t['lastPrice']), "vol": float(t['quoteVolume'])}
+    return result
+
+def get_kucoin_tickers():
+    data = gj("https://api.kucoin.com/api/v1/market/allTickers")
+    result = {}
+    if data and "data" in data and "ticker" in data["data"]:
+        for t in data["data"]["ticker"]:
+            # KuCoin formata: AIN-USDT -> AINUSDT
+            symbol = t['symbol'].replace("-", "")
+            if symbol.endswith("USDT"):
+                result[symbol] = {"price": float(t['last']), "vol": float(t['volValue'])}
+    return result
+
+def get_mexc_tickers():
+    data = gj("https://api.mexc.com/api/v3/ticker/24hr")
+    result = {}
+    if data:
+        for t in data:
+            if t['symbol'].endswith('USDT'):
+                try:
+                    result[t['symbol']] = {"price": float(t['lastPrice']), "vol": float(t['quoteVolume'])}
+                except:
+                    pass
+    return result
 
 # =====================================================
-# KOMUT DİNLEYİCİSİ VE RAPORLAMA
+# /RATIO KOMUT DİNLEYİCİSİ
 # =====================================================
 
 def command_listener():
@@ -142,6 +134,16 @@ def command_listener():
             pass
         time.sleep(2)
 
+# =====================================================
+# KALP ATIŞI VE RENDER UYANIK TUTMA
+# =====================================================
+
+def heartbeat():
+    while True:
+        time.sleep(3600) # 1 saat
+        if T and C:
+            tg(C, f"🤖 <b>Sistem Aktif:</b> Arbitraj botu piyasaları tarıyor.\n⏰ {simdi().strftime('%H:%M')}")
+
 def keep_alive():
     if not RENDER_URL: return
     while True:
@@ -150,155 +152,94 @@ def keep_alive():
         time.sleep(600)
 
 # =====================================================
-# GÖSTERGELER
-# =====================================================
-
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1: return None
-    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    gains = [max(d, 0) for d in deltas]
-    losses = [max(-d, 0) for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0: return 100.0
-    return 100 - (100 / (1 + (avg_gain / avg_loss)))
-
-# =====================================================
-# AKILLI TARAMA MANTIĞI
-# =====================================================
-
-def get_candidates():
-    """Tek istekle piyasa özetini çeker, sadece DÜŞÜŞTE olanları filtreler."""
-    tickers = futures_api("/fapi/v1/ticker/24hr")
-    if not isinstance(tickers, list): return []
-    
-    candidates = []
-    for t in tickers:
-        try:
-            symbol = t["symbol"]
-            if not symbol.endswith("USDT") or any(x in symbol for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")): continue
-            
-            volume = float(t["quoteVolume"])
-            # 24s değişim NEGATİF olanları al (Düşenler) veya hacmi çok yüksek olanları
-            # Sadece SHORT aradığımız için, 24 saatte eksi yönde olanlara odaklanıyoruz
-            change = float(t["priceChangePercent"])
-            
-            if volume >= MIN_24H_HACIM and change <= 1.0: # %1'den fazla artmamış olanlar
-                candidates.append(t)
-        except: continue
-    
-    # Hacme göre sırala
-    candidates.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-    return candidates
-
-def analyze_symbol(ticker):
-    symbol = ticker["symbol"]
-    # Sadece 1m grafik çekiyoruz (Hız için)
-    data = futures_api("/fapi/v1/klines", {"symbol": symbol, "interval": "1m", "limit": 30})
-    if not isinstance(data, list) or len(data) < 22: return None
-    
-    one = data[:-1] # Kapanmış mumlar
-
-    try:
-        closes = [float(x[4]) for x in one]
-        opens = [float(x[1]) for x in one]
-        highs = [float(x[2]) for x in one]
-        volumes = [float(x[7]) for x in one]
-
-        entry = float(one[-1][4])
-        open_price = float(one[-1][1])
-        rsi = calculate_rsi(closes)
-        
-        # Hacim Analizi
-        avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 1
-        volume_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
-
-        # SHORT ŞARTLARI (Kırmızı mum + Hacim artışı + RSI zayıf)
-        is_short = (entry < open_price and volume_ratio >= 1.1 and rsi is not None and rsi < 60)
-
-        if not is_short: return None
-
-        # Stop ve Hedef
-        stop = max(highs[-3:]) 
-        if stop <= entry: stop = entry * 1.005 
-        
-        risk = stop - entry
-        if risk == 0 or (risk / entry) > 0.04: return None 
-
-        message = (
-            f"🔴 <b>SHORT SİNYALİ: {symbol}</b>\n"
-            f"🏷 <b>Giriş:</b> {fiyat(entry)}\n"
-            f"🛑 <b>Stop:</b> {fiyat(stop)} (+%{(risk/entry)*100:.2f})\n"
-            f"🎯 <b>Hedef 1:</b> {fiyat(entry - risk)}\n"
-            f"🎯 <b>Hedef 2:</b> {fiyat(entry - (risk*2))}\n\n"
-            f"📊 <b>RSI:</b> {rsi:.1f} | <b>Hacim:</b> {volume_ratio:.1f}x\n"
-            f"⏱ <b>Zaman:</b> {simdi().strftime('%H:%M')}"
-        )
-        return {"symbol": symbol, "message": message}
-
-    except Exception:
-        return None
-
-# =====================================================
-# ANA TARAMA DÖNGÜSÜ
+# ARBİTRAJ TARAMA MOTORU
 # =====================================================
 
 def bot_loop():
-    global SON_RAPOR_ZAMANI
-    log("--- HIZLI TARAMA BOTU BAŞLADI ---")
-    beklemeyi_yukle()
-
+    log("--- BORSALAR ARASI ARBİTRAJ BOTU BAŞLADI ---")
+    
     if T and C:
-        tg(C, "✅ <b>SHORT BOT BAŞLADI</b>\n\nSistem artık tüm piyasayı önce tarayıp, sadece düşüşte olanları analiz ediyor. (Hızlı Mod)")
+        tg(C, f"✅ <b>ARBİTRAJ BOTU BAŞLADI</b>\n\nBinance, KuCoin ve MEXC arasındaki %{MIN_SPREAD_PCT}+ fiyat farkları taranıyor.\n/ratio komutu aktiftir.")
 
     while True:
         try:
-            if binance_bekliyor():
-                time.sleep(60)
-                continue
-
-            log("Tüm piyasa özeti çekiliyor...")
-            candidates = get_candidates()
+            log("Borsa verileri çekiliyor (Binance, KuCoin, MEXC)...")
             
-            if not candidates:
-                log("Uygun aday bulunamadı, 30 sn bekleniyor...")
-                time.sleep(30)
+            bn_data = get_binance_tickers()
+            kc_data = get_kucoin_tickers()
+            mx_data = get_mexc_tickers()
+
+            if not bn_data:
+                log("Hata: Binance verisi alınamadı.")
+                time.sleep(10)
                 continue
 
-            log(f"Analiz edilecek aday bulundu: {len(candidates)} coin. Taranıyor...")
-
+            log(f"Veriler alındı. Binance: {len(bn_data)} | KuCoin: {len(kc_data)} | MEXC: {len(mx_data)}")
+            
             alerts = 0
-            for ticker in candidates:
-                if binance_bekliyor(): break
-
-                symbol = ticker["symbol"]
-                if symbol in son_sinyaller and time.time() - son_sinyaller[symbol] < COOLDOWN:
-                    continue
-
-                result = analyze_symbol(ticker)
-                if result:
-                    if tg(C, result["message"]):
-                        son_sinyaller[symbol] = time.time()
-                        alerts += 1
-                        log(f">>> SİNYAL GÖNDERİLDİ: {symbol}")
-
-                time.sleep(0.1) # Kısa bekleme
-
-            log(f"Tarama bitti. {len(candidates)} coin incelendi. Sinyal: {alerts}. Bekleniyor...")
             
-            # Log ekranının donmaması için her 30 dakikada bir rapor at
-            if time.time() - SON_RAPOR_ZAMANI > 1800:
-                tg(C, f"📊 <b>Rapor:</b> Son 30 dk içinde {len(candidates)} düşüş adayı tarandı. Sinyal: {alerts}")
-                SON_RAPOR_ZAMANI = time.time()
+            # Binance'teki tüm coinleri tara, diğer borsalarda var mı diye bak
+            for symbol, b_info in bn_data.items():
+                try:
+                    b_price = b_info["price"]
+                    b_vol = b_info["vol"]
 
-            time.sleep(TARAMA_ARALIGI)
+                    if b_vol < MIN_VOLUME_USDT or b_price == 0: continue
+
+                    # Diğer borsalardaki fiyatları bul (varsa)
+                    kc_info = kc_data.get(symbol)
+                    mx_info = mx_data.get(symbol)
+
+                    # Fiyat listesi oluştur
+                    prices = {"BINANCE": b_info}
+                    if kc_info and kc_info["vol"] >= MIN_VOLUME_USDT: prices["KUCOIN"] = kc_info
+                    if mx_info and mx_info["vol"] >= MIN_VOLUME_USDT: prices["MEXC"] = mx_info
+
+                    if len(prices) < 2: continue # Karşılaştıracak başka borsa yok
+
+                    # En yüksek ve en düşük fiyatı bul
+                    max_ex = max(prices, key=lambda x: prices[x]["price"])
+                    min_ex = min(prices, key=lambda x: prices[x]["price"])
+                    
+                    max_price = prices[max_ex]["price"]
+                    min_price = prices[min_ex]["price"]
+
+                    # Spread hesapla
+                    spread = ((max_price - min_price) / min_price) * 100
+
+                    # EĞER FARK YETERİNCE BÜYÜKSE SİNYAL AT
+                    if spread >= MIN_SPREAD_PCT:
+                        # 30 dakika içinde aynı coin için tekrar sinyal atma
+                        if symbol in son_sinyaller and time.time() - son_sinyaller[symbol] < 1800:
+                            continue
+
+                        # Görseldeki formatta mesajı hazırla
+                        msg = f"🟡 #{symbol} {symbol}\n"
+                        msg += f"Spred:[{spread:.1f}%] ⬆️{max_ex}-{min_ex}⬇️\n\n"
+                        msg += f"🔴 SHORT {max_ex} @ {fiyat(max_price)} 📍{format_vol(prices[max_ex]['vol'])}\n"
+                        msg += f"🟢 LONG {min_ex} @ {fiyat(min_price)} 📍{format_vol(prices[min_ex]['vol'])}\n\n"
+                        msg += f"⚠️ Funding rates are not considered.\nCheck funding before trading.\n\n"
+                        
+                        # Tüm borsaların fiyatlarını listele
+                        for ex, info in prices.items():
+                            msg += f"{ex}: {fiyat(info['price'])} 📍{format_vol(info['vol'])}\n"
+                        
+                        msg += f"\n{simdi().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"
+                        
+                        if tg(C, msg):
+                            son_sinyaller[symbol] = time.time()
+                            alerts += 1
+                            log(f"🔥 ARBİTRAJ BULUNDU: {symbol} | Fark: %{spread:.2f} ({max_ex} vs {min_ex})")
+
+                except Exception as e:
+                    pass
+
+            log(f"Tarama bitti. Sinyal: {alerts}. 60 saniye bekleniyor...")
+            time.sleep(60) # API limitini korumak için 60 saniye bekle
 
         except Exception as e:
-            log(f"Tarama motoru hatası: {e}")
-            time.sleep(10)
+            log(f"Ana döngü hatası: {e}")
+            time.sleep(15)
 
 # =====================================================
 # RENDER WEB SUNUCUSU
@@ -308,7 +249,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Fast SHORT Bot is running!")
+        self.wfile.write(b"Arbitrage Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -325,6 +266,7 @@ if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     if T:
         threading.Thread(target=command_listener, daemon=True).start()
+        threading.Thread(target=heartbeat, daemon=True).start()
         if RENDER_URL:
             threading.Thread(target=keep_alive, daemon=True).start()
             
