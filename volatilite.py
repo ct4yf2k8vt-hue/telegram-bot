@@ -22,8 +22,7 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://fapi.binance.com"
 
-# RAPOR ARALIĞI (Saniye cinsinden. 86400 = 24 Saat)
-# Test etmek için bunu 3600 (1 saat) veya 600 (10 dakika) yapabilirsin.
+# RAPOR ARALIĞI (86400 = 24 Saat)
 RAPOR_ARALIGI = 86400 
 
 # =====================================================
@@ -60,31 +59,61 @@ def gj(url):
         return None
 
 # =====================================================
-# ZİRVE SAATİNİ BULMA FONKSİYONU
+# "GÜNÜN KAZANANI" HESAPLAYICI
 # =====================================================
 
-def get_peak_time(symbol):
-    """Coin'in son 24 saat içindeki en yüksek fiyata ulaştığı saati bulur."""
+def get_winner_of_the_day(symbol, change_24h):
+    """En çok yükselen coinin gün içindeki en düşük ve en yüksek noktalarını bulur."""
     klines = gj(f"{BASE}/fapi/v1/klines?symbol={symbol}&interval=1h&limit=24")
     if not isinstance(klines, list) or len(klines) < 24:
-        return "Bilinmiyor"
+        return None
     
     try:
-        max_price = 0
-        peak_index = 0
+        entry_price = float('inf')
+        entry_time = 0
+        peak_price = 0
+        peak_time = 0
         
-        # 24 mumu gez, en yüksek 'high' değerini bul
-        for i, k in enumerate(klines):
+        # Son 24 saati tara
+        for k in klines:
             high = float(k[2])
-            if high > max_price:
-                max_price = high
-                peak_index = i
+            low = float(k[3])
+            open_time = int(k[0])
+            
+            # En düşük fiyatı (giriş sinyali) bul
+            if low < entry_price:
+                entry_price = low
+                entry_time = open_time
                 
-        # Zirveye ne kadar sürede ulaştığını hesapla (kabaca saat)
-        saat = peak_index + 1
-        return f"{saat} saat"
-    except:
-        return "Bilinmiyor"
+            # En yüksek fiyatı (zirve) bul
+            if high > peak_price:
+                peak_price = high
+                peak_time = open_time
+                
+        # Süreyi saat cinsinden hesapla
+        duration_hours = (peak_time - entry_time) / (1000 * 60 * 60)
+        if duration_hours <= 0:
+            duration_hours = 1 # Hata payı
+            
+        # Kâr oranını hesapla (Girişten zirveye)
+        max_pct = ((peak_price - entry_price) / entry_price) * 100
+        
+        # Saat formatını al (UTC)
+        entry_dt = datetime.fromtimestamp(entry_time / 1000, timezone.utc)
+        peak_dt = datetime.fromtimestamp(peak_time / 1000, timezone.utc)
+        
+        return {
+            "symbol": symbol.replace("USDT", ""),
+            "entry_price": entry_price,
+            "entry_time": entry_dt.strftime("%H:%M"),
+            "peak_price": peak_price,
+            "peak_time": peak_dt.strftime("%H:%M"),
+            "duration": duration_hours,
+            "max_pct": max_pct
+        }
+    except Exception as e:
+        log(f"Winner hesaplama hatası: {e}")
+        return None
 
 # =====================================================
 # RAPOR OLUŞTURUCU
@@ -98,12 +127,11 @@ def generate_report():
         log("Binance verisi alınamadı.")
         return
 
-    # Sadece USDT paritelerini al
+    # Sadece USDT paritelerini al ve hacmi 5M üzeri olanları filtrele
     usdt_pairs = []
     for t in tickers:
         if t['symbol'].endswith('USDT'):
             try:
-                # Hacmi çok düşük olanları ele (manipülasyona açık olanlar)
                 vol = float(t['quoteVolume'])
                 if vol > 5_000_000: 
                     usdt_pairs.append(t)
@@ -116,66 +144,65 @@ def generate_report():
     # İlk 5 coini al
     top_5 = usdt_pairs[:5]
 
-    # Rapor metnini oluştur
-    msg = "🔮 <b>MidasFlow</b>\n"
-    msg += "AI-сканер рынка · @MidasFlowAI\n"
-    msg += "───────────────────\n\n"
-    msg += "📈 <b>En İyi Hareketler (Son 24 Saat)</b>\n"
-    msg += "Sinyal yönünde maksimum hareket:\n\n"
+    # --- 1. MESAJ: TOP 5 LİSTESİ ---
+    msg1 = "🔮 <b>MidasFlow</b>\n"
+    msg1 += "AI-сканер рынка · @MidasFlowAI\n"
+    msg1 += "───────────────────\n\n"
+    msg1 += "📈 <b>Лучшие движения за сутки</b>\n"
+    msg1 += "максимальный ход в сторону сигнала:\n\n"
 
     medals = ["🥇", "🥈", "🥉", "🏅", "⭐️"]
     
     for i, t in enumerate(top_5):
         symbol = t['symbol'].replace("USDT", "")
         change = float(t['priceChangePercent'])
-        
-        # Sadece pozitif (yükselen) olanları al, eğer piyasa tamamen düşüşteyse en az düşenleri alır
-        peak_time = get_peak_time(t['symbol'])
-        
-        # Görseldeki gibi sadece rakam ve yüzdeyi yazdır
         change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
+        msg1 += f"{medals[i]} <b>{symbol}</b> {change_str}\n"
+
+    msg1 += "\n───────────────────\n"
+    msg1 += f"🕒 {simdi().strftime('%Y-%m-%d %H:%M')} (TR)"
+    
+    tg(C, msg1)
+    log("Top 5 listesi gönderildi.")
+    time.sleep(2) # Mesajlar arası 2 saniye bekle
+
+    # --- 2. MESAJ: GÜNÜN KAZANANI (WINNER OF THE DAY) ---
+    if top_5:
+        winner_ticker = top_5[0]
+        winner_data = get_winner_of_the_day(winner_ticker['symbol'], float(winner_ticker['priceChangePercent']))
         
-        msg += f"{medals[i]} <b>{symbol}</b> {change_str} • Zirve: {peak_time}\n"
-
-    msg += "\n───────────────────\n"
-    msg += "📊 <i>İstatistikler (Son 24 Saat)</i>\n"
-    msg += "Toplam işlem gören: " + str(len(usdt_pairs)) + " parite\n"
-    msg += "Zaman: " + simdi().strftime('%Y-%m-%d %H:%M') + " (TR)"
-
-    if tg(C, msg):
-        log("Rapor başarıyla Telegram'a gönderildi.")
-    else:
-        log("Telegram gönderim hatası!")
+        if winner_data:
+            msg2 = f"🏆 <b>Победа дня: {winner_data['symbol']} +{winner_data['max_pct']:.0f}%</b>\n\n"
+            msg2 += f"{winner_data['entry_time']} UTC — памп-детектор дал сигнал: <b>{winner_data['symbol']}USDT LONG</b> по ${winner_data['entry_price']:.4f}\n"
+            msg2 += f"{winner_data['peak_time']} UTC — пик ${winner_data['peak_price']:.4f}. +{winner_data['max_pct']:.0f}% от входа за {winner_data['duration']:.2f}ч.\n\n"
+            msg2 += "⚠️ <i>Ход — потенциал движения, не гарантия профита.</i>"
+            
+            tg(C, msg2)
+            log(f"Günün Kazananı gönderildi: {winner_data['symbol']}")
 
 # =====================================================
 # ANA DÖNGÜ
 # =====================================================
 
 def bot_loop():
-    log("--- MİDAS FLOW TARZI RAPOR BOTU BAŞLADI ---")
+    log("--- MİDAS FLOW RAPOR BOTU BAŞLADI ---")
     
-    # Başlangıçta test mesajı
-    tg(C, "✅ <b>Midas Flow Tarzı Rapor Botu Başladı!</b>\n\nSadece günlük en iyi hareket eden 5 coini raporlayacak. Diğer özellikler kapatıldı.")
+    tg(C, "✅ <b>Midas Flow Rapor Botu Başladı!</b>\n\nTop 5 ve Günün Kazananı raporları hazırlanıyor.")
     
-    # İlk raporu hemen gönder (Botun çalıştığını görmen için)
-    time.sleep(5)
+    time.sleep(3)
     generate_report()
 
     while True:
         try:
-            # Belirlenen aralık kadar bekle (Varsayılan 24 saat)
             log(f"Bir sonraki rapor için {RAPOR_ARALIGI} saniye bekleniyor...")
             time.sleep(RAPOR_ARALIGI)
-            
-            # Raporu oluştur ve gönder
             generate_report()
-            
         except Exception as e:
             log(f"Döngü hatası: {e}")
             time.sleep(60)
 
 # =====================================================
-# RENDER WEB SUNUCUSU (Kapanmayı önler)
+# RENDER WEB SUNUCUSU
 # =====================================================
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -196,6 +223,5 @@ def run_web_server():
 # =====================================================
 
 if __name__ == "__main__":
-    # Web sunucusunu ana thread'de başlat (Render port sorunu için)
     threading.Thread(target=bot_loop, daemon=True).start()
     run_web_server()
