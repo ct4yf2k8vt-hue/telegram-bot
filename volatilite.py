@@ -23,7 +23,7 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://fapi.binance.com"
 
-RAPOR_ARALIGI = 86400 # 24 Saat
+RAPOR_ARALIGI = 86400 # 24 Saat (Test için 3600 yapabilirsin)
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -60,42 +60,36 @@ def gj(url):
         with urllib.request.urlopen(req, timeout=15) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        log(f"API Hatası: HTTP {e.code} - {e.reason}")
-        # EĞER FUTURES ENGELLENDİYSE SPOT API'YE GEÇ (Bypass)
+        # EĞER FUTURES ENGELLENDİYSE SPOT API'YE GEÇ
         if "fapi.binance.com" in url and e.code in (403, 451, 418):
-            log("Futures engellendi, otomatik olarak Spot API'ye geçiliyor...")
             spot_url = url.replace("fapi.binance.com", "api.binance.com").replace("/fapi/v1", "/api/v3")
             try:
                 req2 = urllib.request.Request(spot_url, headers=headers)
                 with urllib.request.urlopen(req2, timeout=15) as resp2:
                     return json.loads(resp2.read().decode("utf-8"))
-            except Exception as e2:
-                log(f"Spot API hatası: {e2}")
+            except Exception:
+                pass
         return None
-    except Exception as e:
-        log(f"Bağlantı hatası: {e}")
+    except:
         return None
 
 # =====================================================
-# "GÜNÜN KAZANANI" HESAPLAYICI
+# ZİRVE SÜRESİNİ BULMA
 # =====================================================
 
-def get_winner_of_the_day(symbol):
-    # Spot veya Futures farketmeksizin mum verisini çekmeye çalışır
+def get_peak_time(symbol):
     klines = gj(f"{BASE}/fapi/v1/klines?symbol={symbol}&interval=1h&limit=24")
-    
-    # Eğer futures engellendiyse Spot'tan çekmeyi dene
     if not isinstance(klines, list):
         klines = gj(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
         
     if not isinstance(klines, list) or len(klines) < 24:
-        return None
+        return "0"
     
     try:
-        entry_price = float('inf')
         entry_time = 0
-        peak_price = 0
         peak_time = 0
+        entry_price = float('inf')
+        peak_price = 0
         
         for k in klines:
             high = float(k[2])
@@ -111,41 +105,24 @@ def get_winner_of_the_day(symbol):
                 peak_time = open_time
                 
         duration_hours = (peak_time - entry_time) / (1000 * 60 * 60)
-        if duration_hours <= 0: duration_hours = 1
-            
-        max_pct = ((peak_price - entry_price) / entry_price) * 100
-        
-        entry_dt = datetime.fromtimestamp(entry_time / 1000, timezone.utc)
-        peak_dt = datetime.fromtimestamp(peak_time / 1000, timezone.utc)
-        
-        return {
-            "symbol": symbol.replace("USDT", ""),
-            "entry_price": entry_price,
-            "entry_time": entry_dt.strftime("%H:%M"),
-            "peak_price": peak_price,
-            "peak_time": peak_dt.strftime("%H:%M"),
-            "duration": duration_hours,
-            "max_pct": max_pct
-        }
-    except Exception as e:
-        return None
+        if duration_hours <= 0: duration_hours = 0.1
+        return f"{duration_hours:.1f}"
+    except:
+        return "0"
 
 # =====================================================
 # RAPOR OLUŞTURUCU
 # =====================================================
 
 def generate_report():
-    log("Piyasa verileri çekiliyor (Midas Flow Raporu)...")
+    log("Piyasa verileri çekiliyor...")
     
     tickers = gj(f"{BASE}/fapi/v1/ticker/24hr")
-    
-    # Futures engellendiyse Spot'tan çek
     if not isinstance(tickers, list):
-        log("Futures verisi alınamadı, Spot verisi deneniyor...")
         tickers = gj("https://api.binance.com/api/v3/ticker/24hr")
 
     if not isinstance(tickers, list):
-        log("HATA: Binance API'lerine (Futures ve Spot) erişilemedi. IP engeli olabilir.")
+        log("HATA: Binance API'lerine erişilemedi.")
         return False
 
     usdt_pairs = []
@@ -158,6 +135,7 @@ def generate_report():
             except:
                 pass
 
+    # 24 saatlik değişime göre büyükten küçüğe sırala
     usdt_pairs.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
     top_5 = usdt_pairs[:5]
 
@@ -165,41 +143,31 @@ def generate_report():
         log("Uygun coin bulunamadı.")
         return False
 
-    # --- 1. MESAJ: TOP 5 LİSTESİ ---
-    msg1 = "🔮 <b>MidasFlow</b>\n"
-    msg1 += "AI-сканер рынка · @MidasFlowAI\n"
-    msg1 += "───────────────────\n\n"
-    msg1 += "📈 <b>Лучшие движения за сутки</b>\n"
-    msg1 += "максимальный ход в сторону сигнала:\n\n"
+    # --- MESAJ OLUŞTURMA (Görseldeki Çeviriye Birebir Uyumlu) ---
+    msg = "🔥 <b>24 saatteki en iyi hareketler</b>\n"
+    msg += "sinyal yönündeki maksimum hareket, veritabanımıza göre:\n\n"
 
     medals = ["🥇", "🥈", "🥉", "🏅", "⭐️"]
+    hashtags = ""
     
     for i, t in enumerate(top_5):
         symbol = t['symbol'].replace("USDT", "")
         change = float(t['priceChangePercent'])
         change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
-        msg1 += f"{medals[i]} <b>{symbol}</b> {change_str}\n"
-
-    msg1 += "\n───────────────────\n"
-    msg1 += f"🕒 {simdi().strftime('%Y-%m-%d %H:%M')} (TR)"
-    
-    tg(C, msg1)
-    log("Top 5 listesi gönderildi.")
-    time.sleep(2)
-
-    # --- 2. MESAJ: GÜNÜN KAZANANI (WINNER OF THE DAY) ---
-    winner_ticker = top_5[0]
-    winner_data = get_winner_of_the_day(winner_ticker['symbol'])
-    
-    if winner_data:
-        msg2 = f"🏆 <b>Победа дня: {winner_data['symbol']} +{winner_data['max_pct']:.0f}%</b>\n\n"
-        msg2 += f"{winner_data['entry_time']} UTC — памп-детектор дал сигнал: <b>{winner_data['symbol']}USDT LONG</b> по ${winner_data['entry_price']:.4f}\n"
-        msg2 += f"{winner_data['peak_time']} UTC — пик ${winner_data['peak_price']:.4f}. +{winner_data['max_pct']:.0f}% от входа за {winner_data['duration']:.2f}ч.\n\n"
-        msg2 += "⚠️ <i>Ход — потенциал движения, не гарантия профита.</i>"
         
-        tg(C, msg2)
-        log(f"Günün Kazananı gönderildi: {winner_data['symbol']}")
-    
+        # Her coin için zirve süresini hesapla
+        peak_time = get_peak_time(t['symbol'])
+        
+        msg += f"{medals[i]} {symbol} {change_str} · {peak_time} saatte zirve\n"
+        hashtags += f"#{symbol} "
+
+    msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app\n\n"
+    msg += "💎 Bybit'te bizimle işlem yap — borsa komisyonu ve abonelik için indirim\n\n"
+    msg += "⚠️ Hareket — potansiyel hareket, kâr garantisi değildir.\n\n"
+    msg += f"<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #crypto #pump #signals</a>"
+
+    tg(C, msg)
+    log("Rapor başarıyla gönderildi.")
     return True
 
 # =====================================================
@@ -208,21 +176,19 @@ def generate_report():
 
 def bot_loop():
     log("--- MİDAS FLOW RAPOR BOTU BAŞLADI ---")
-    tg(C, "✅ <b>Midas Flow Rapor Botu Başladı!</b>\n\nTop 5 ve Günün Kazananı raporları hazırlanıyor.")
+    tg(C, "✅ <b>Midas Flow Rapor Botu Başladı!</b>\n\nGörseldeki formatta raporlar hazırlanıyor.")
     
     time.sleep(3)
     
     while True:
         try:
             basarili = generate_report()
-            
             if basarili:
-                log(f"Bir sonraki rapor için {RAPOR_ARALIGI} saniye (24 saat) bekleniyor...")
+                log(f"Bir sonraki rapor için {RAPOR_ARALIGI} saniye bekleniyor...")
                 time.sleep(RAPOR_ARALIGI)
             else:
-                log("Rapor oluşturulamadı (API hatası). 5 dakika sonra tekrar denenecek...")
-                time.sleep(300) # 5 dakika bekle
-                
+                log("Rapor oluşturulamadı (API engeli). 5 dakika sonra tekrar denenecek...")
+                time.sleep(300)
         except Exception as e:
             log(f"Döngü hatası: {e}")
             time.sleep(60)
