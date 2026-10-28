@@ -24,9 +24,15 @@ BASE = "https://api.binance.com"
 # MOTOR ÇALIŞMA SÜRELERİ
 RAPOR_ARALIGI = 3600       # Midas Flow (1 Saat)
 CHARTIST_ARALIGI = 3600    # Digital Chartist (1 Saat)
+PUMP_ARALIGI = 60          # Pump Alarmı (1 Dakika - Anlık yakalamak için)
 
-MIN_HACIM = 10_000_000     # Chartist için minimum hacim
+# FİLTRELER
+MIN_HACIM_CHARTIST = 10_000_000 
+MIN_HACIM_24H_PUMP = 5_000_000  # Çakma sinyalleri engellemek için 24s hacim barajı
+MIN_HACIM_ARTISI = 50_000       # Mum içindeki hacim artışı en az 50 Bin Dolar olmalı
+
 son_sinyaller = {}
+son_pump_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -66,6 +72,11 @@ def calculate_ema(prices, period):
     for price in prices[period:]:
         ema.append(price * k + ema[-1] * (1 - k))
     return ema
+
+def format_vol(v):
+    if v >= 1_000_000: return f"${v/1_000_000:.2f}M"
+    if v >= 1_000: return f"${v/1_000:.2f}K"
+    return f"${v:.2f}"
 
 # =====================================================
 # 1. MOTOR: MİDAS FLOW (EN İYİ 5 RAPORU)
@@ -142,7 +153,7 @@ def chartist_loop():
                 time.sleep(60)
                 continue
 
-            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM]
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_CHARTIST]
 
             for symbol in adaylar:
                 if f"CH_{symbol}" in son_sinyaller and time.time() - son_sinyaller[f"CH_{symbol}"] < 86400: continue
@@ -180,6 +191,74 @@ def chartist_loop():
             time.sleep(60)
 
 # =====================================================
+# 3. MOTOR: ANLIK PUMP ALARMI (GÖRSELDEKİ FORMAT)
+# =====================================================
+
+def pump_loop():
+    log("PUMP", "Anlık Pump Alarmı Motoru Başladı.")
+    time.sleep(25)
+    while True:
+        try:
+            log("PUMP", "Pump fırsatları taranıyor (15m)...")
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list):
+                time.sleep(30)
+                continue
+
+            # SADECE 24 SAATLİK HACİM 5 MİLYON DOLARIN ÜZERİNDEKİLER (Çakma sinyalleri engeller)
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_24H_PUMP]
+
+            for symbol in adaylar:
+                # Aynı coin için 15 dakikada 1 kez alarm at (Spam koruması)
+                if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900: 
+                    continue
+
+                # 15 Dakikalık grafikte son 2 kapanmış mumu çek
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=15m&limit=3")
+                if not isinstance(klines, list) or len(klines) < 3: continue
+
+                # Kapanmış mumları alıyoruz (anlık fitilleri elemek için)
+                curr_k = klines[-2]
+                prev_k = klines[-3]
+
+                curr_close = float(curr_k[4])
+                prev_close = float(prev_k[4])
+                curr_vol = float(curr_k[7])
+                prev_vol = float(prev_k[7])
+
+                if prev_close == 0 or prev_vol == 0: continue
+
+                price_change = ((curr_close - prev_close) / prev_close) * 100
+                vol_change = ((curr_vol - prev_vol) / prev_vol) * 100
+                vol_increase_usdt = curr_vol - prev_vol
+
+                # SİNYAL ŞARTLARI (Görseldeki gibi sert hareketler)
+                # Fiyat %5+ artmış VE Hacim %100+ (2 kat) artmış VE Artış en az 50 Bin Dolar
+                if price_change >= 5.0 and vol_change >= 100.0 and vol_increase_usdt >= MIN_HACIM_ARTISI:
+                    
+                    # Fiyatı virgülden sonra 8 hane olarak formatla (XEC gibi küçük coinler için)
+                    p_old = f"{prev_close:.8f}".rstrip('0').rstrip('.')
+                    p_new = f"{curr_close:.8f}".rstrip('0').rstrip('.')
+                    
+                    msg = (f"🚀 <b>Pump - {symbol.replace('USDT','')}/USDT [Binance]</b>\n"
+                           f"Pump Activity on {symbol.replace('USDT','')}/USDT 🟢 🟢\n"
+                           f"💰 <b>Price:</b> ${p_old} ➔ ${p_new} (<b>{price_change:+.2f}%</b>)\n"
+                           f"📊 <b>Volume:</b> {format_vol(curr_vol)} (<b>{vol_change:+.2f}%</b>)\n"
+                           f"Volume increased by {format_vol(vol_increase_usdt)} ⬆️")
+                    
+                    if tg(C, msg):
+                        son_pump_sinyalleri[symbol] = time.time()
+                        log("PUMP", f"🔥 PUMP SİNYALİ: {symbol} (+%{price_change:.1f})")
+
+                time.sleep(0.05)
+
+            log("PUMP", "Pump taraması bitti, 1 dk bekleniyor.")
+            time.sleep(PUMP_ARALIGI)
+        except Exception as e:
+            log("PUMP", f"Hata: {e}")
+            time.sleep(30)
+
+# =====================================================
 # RENDER WEB SUNUCUSU (KAPANMAYI ÖNLER)
 # =====================================================
 
@@ -187,7 +266,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Dual-Engine Bot is running!")
+        self.wfile.write(b"Triple-Engine Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -206,6 +285,9 @@ if __name__ == "__main__":
     
     # 2. Uzun Vade Motoru (Chartist)
     threading.Thread(target=chartist_loop, daemon=True).start()
+
+    # 3. Pump Alarm Motoru (Görseldeki Yeni Sistem)
+    threading.Thread(target=pump_loop, daemon=True).start()
     
     # Web sunucusunu başlat
     run_web_server()
