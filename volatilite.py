@@ -24,15 +24,18 @@ BASE = "https://api.binance.com"
 # MOTOR ÇALIŞMA SÜRELERİ
 RAPOR_ARALIGI = 3600       # Midas Flow (1 Saat)
 CHARTIST_ARALIGI = 3600    # Digital Chartist (1 Saat)
-PUMP_ARALIGI = 60          # Pump Alarmı (1 Dakika - Anlık yakalamak için)
+PUMP_ARALIGI = 60          # Pump Alarmı (1 Dakika)
+SETUP_ARALIGI = 900        # Setup Analizi (15 Dakika)
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
-MIN_HACIM_24H_PUMP = 5_000_000  # Çakma sinyalleri engellemek için 24s hacim barajı
-MIN_HACIM_ARTISI = 50_000       # Mum içindeki hacim artışı en az 50 Bin Dolar olmalı
+MIN_HACIM_24H_PUMP = 5_000_000  
+MIN_HACIM_ARTISI = 50_000       
+MIN_HACIM_SETUP = 20_000_000    # Setup için ekstra likit coinler (20M$)
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
+son_setup_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -191,7 +194,7 @@ def chartist_loop():
             time.sleep(60)
 
 # =====================================================
-# 3. MOTOR: ANLIK PUMP ALARMI (GÖRSELDEKİ FORMAT)
+# 3. MOTOR: ANLIK PUMP ALARMI
 # =====================================================
 
 def pump_loop():
@@ -205,19 +208,15 @@ def pump_loop():
                 time.sleep(30)
                 continue
 
-            # SADECE 24 SAATLİK HACİM 5 MİLYON DOLARIN ÜZERİNDEKİLER (Çakma sinyalleri engeller)
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_24H_PUMP]
 
             for symbol in adaylar:
-                # Aynı coin için 15 dakikada 1 kez alarm at (Spam koruması)
                 if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900: 
                     continue
 
-                # 15 Dakikalık grafikte son 2 kapanmış mumu çek
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=15m&limit=3")
                 if not isinstance(klines, list) or len(klines) < 3: continue
 
-                # Kapanmış mumları alıyoruz (anlık fitilleri elemek için)
                 curr_k = klines[-2]
                 prev_k = klines[-3]
 
@@ -232,19 +231,19 @@ def pump_loop():
                 vol_change = ((curr_vol - prev_vol) / prev_vol) * 100
                 vol_increase_usdt = curr_vol - prev_vol
 
-                # SİNYAL ŞARTLARI (Görseldeki gibi sert hareketler)
-                # Fiyat %5+ artmış VE Hacim %100+ (2 kat) artmış VE Artış en az 50 Bin Dolar
                 if price_change >= 5.0 and vol_change >= 100.0 and vol_increase_usdt >= MIN_HACIM_ARTISI:
                     
-                    # Fiyatı virgülden sonra 8 hane olarak formatla (XEC gibi küçük coinler için)
                     p_old = f"{prev_close:.8f}".rstrip('0').rstrip('.')
                     p_new = f"{curr_close:.8f}".rstrip('0').rstrip('.')
+                    now_time = simdi().strftime('%I:%M:%S %p')
                     
                     msg = (f"🚀 <b>Pump - {symbol.replace('USDT','')}/USDT [Binance]</b>\n"
-                           f"Pump Activity on {symbol.replace('USDT','')}/USDT 🟢 🟢\n"
                            f"💰 <b>Price:</b> ${p_old} ➔ ${p_new} (<b>{price_change:+.2f}%</b>)\n"
-                           f"📊 <b>Volume:</b> {format_vol(curr_vol)} (<b>{vol_change:+.2f}%</b>)\n"
-                           f"Volume increased by {format_vol(vol_increase_usdt)} ⬆️")
+                           f"📊 <b>Volume:</b> {curr_vol:.0f} (<b>{vol_change:+.0f}%</b>)\n"
+                           f"Volume increased by {vol_increase_usdt:.0f} ⬆️\n"
+                           f"Time: {now_time} 🕐\n\n"
+                           f"🔗 <a href='https://www.binance.com/en/trade/{symbol}?type=spot'>Pair on Binance.</a>\n\n"
+                           f"<b>${symbol.replace('USDT','')} #{symbol.replace('USDT','')}</b>")
                     
                     if tg(C, msg):
                         son_pump_sinyalleri[symbol] = time.time()
@@ -259,14 +258,92 @@ def pump_loop():
             time.sleep(30)
 
 # =====================================================
-# RENDER WEB SUNUCUSU (KAPANMAYI ÖNLER)
+# 4. MOTOR: SETUP ANALİZİ (GÖRSELDEKİ TÜRKÇE FORMAT)
+# =====================================================
+
+def setup_loop():
+    log("SETUP", "Profesyonel Setup Analiz Motoru Başladı.")
+    time.sleep(35)
+    while True:
+        try:
+            log("SETUP", "POC ve Hacim Profili Setup'ları taranıyor...")
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list):
+                time.sleep(60)
+                continue
+
+            # Sadece çok likit coinlerde çalışır (20M$ üzeri)
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SETUP]
+
+            for symbol in adaylar:
+                if symbol in son_setup_sinyalleri and time.time() - son_setup_sinyalleri[symbol] < 14400: # 4 saat bekle
+                    continue
+
+                # 1 Saatlik grafikte son 50 mumu çek (Destek/Direnç ve hacim analizi için)
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=50")
+                if not isinstance(klines, list) or len(klines) < 50: continue
+
+                # Son 24 saatin en yüksek ve en düşükleri (POC ve VAL simülasyonu)
+                highs = [float(k[2]) for k in klines[-24:]]
+                lows = [float(k[3]) for k in klines[-24:]]
+                vols = [float(k[7]) for k in klines[-24:]]
+                
+                # Hacmin en yüksek olduğu mumun direnci (POC)
+                poc_idx = vols.index(max(vols))
+                poc = highs[poc_idx] 
+                
+                # Son 24 saatin en düşüğü (VAL)
+                val = min(lows)
+                
+                current_price = float(klines[-1][4])
+                prev_price = float(klines[-2][4])
+                
+                # Fiyat POC'nin hemen altındaysa (Kırılım hazırlığı) ve bugün yükseliyorsa
+                if (poc * 0.98) <= current_price < poc and current_price > prev_price:
+                    
+                    # Hedef: POC'nin %15 üzeri
+                    target = poc * 1.15
+                    target_pct = ((target - current_price) / current_price) * 100
+                    
+                    # Stop: VAL'nin %1 altı (Destek kırılırsa)
+                    stop = val * 0.99
+                    stop_pct = ((stop - current_price) / current_price) * 100
+                    
+                    # Trend yönü (1G ve 1S)
+                    trend_1d = "yukarı" if current_price > float(klines[-24][4]) else "aşağı"
+                    trend_1h = "yukarı" if current_price > float(klines[-6][4]) else "aşağı"
+
+                    # Türkçe Profesyonel Analiz Metni (Görseldeki yapıya benzer)
+                    msg = (f"<b>#{symbol}</b>\n\n"
+                           f"Fiyat: <b>{current_price:.4f}</b>\n"
+                           f"Hedef: <b>{target:.4f}</b> ({target_pct:+.1f}%)\n"
+                           f"İptal (Stop): <b>{stop:.4f}</b> ({stop_pct:+.1f}%)\n\n"
+                           f"{symbol.replace('USDT','')}, <b>{poc:.4f}</b> seviyesindeki POC (Kontrol Noktası) direncine takıldı. Fiyat şu an {current_price:.4f}, hemen altında ama ivme kazandı. Trend 1g {trend_1d}, 1s {trend_1h} — karşı trend değil, konsolidasyon. ✊\n\n"
+                           f"<b>{val:.4f}</b> seviyesinde güçlü bir alım duvarı (destek) var — bu seviye düşüşe izin vermiyor. Hacim akışı POC'ye çekiyor, altında takılıyor ama çıkmıyor. 🧊\n\n"
+                           f"Anahtar — <b>{poc:.4f}</b> üzerinde kalıcılık. Alırlarsa -> hedef <b>{target:.4f}</b> ({target_pct:+.1f}%). Bu yapısal value area tepesi, doğal bir mıknatıs. ⚡\n\n"
+                           f"🛡️ Stop da {stop:.4f} arkasında — orada destek var, seviye korunaklı. Riski siz seçin.")
+                    
+                    if tg(C, msg):
+                        son_setup_sinyalleri[symbol] = time.time()
+                        log("SETUP", f"🔥 SETUP SİNYALİ: {symbol}")
+
+                time.sleep(0.1)
+
+            log("SETUP", "Setup taraması bitti, 15 dk bekleniyor.")
+            time.sleep(SETUP_ARALIGI)
+        except Exception as e:
+            log("SETUP", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# RENDER WEB SUNUCUSU
 # =====================================================
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Triple-Engine Bot is running!")
+        self.wfile.write(b"Quad-Engine Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -280,14 +357,9 @@ def run_web_server():
 # =====================================================
 
 if __name__ == "__main__":
-    # 1. Rapor Motoru (Midas Flow)
     threading.Thread(target=midas_flow_loop, daemon=True).start()
-    
-    # 2. Uzun Vade Motoru (Chartist)
     threading.Thread(target=chartist_loop, daemon=True).start()
-
-    # 3. Pump Alarm Motoru (Görseldeki Yeni Sistem)
     threading.Thread(target=pump_loop, daemon=True).start()
+    threading.Thread(target=setup_loop, daemon=True).start()
     
-    # Web sunucusunu başlat
     run_web_server()
