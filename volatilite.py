@@ -10,7 +10,7 @@ import socketserver
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
-# AYARLAR
+# AYARLAR (UZUN VADELİ SPOT STRATEJİSİ)
 # =====================================================
 
 socket.setdefaulttimeout(15)
@@ -21,11 +21,9 @@ C = os.environ.get("CHAT_ID", "1623907197").strip()
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://api.binance.com"
 
-TARAMA_ARALIGI = 300       # 5 dakikada bir tarama yapar
-MIN_HACIM = 15_000_000     # 15 Milyon Dolar üzeri hacmi olan coinler
+TARAMA_ARALIGI = 3600      # 1 saatte bir tarama yapar (12H grafik için yeterli)
+MIN_HACIM = 10_000_000     # 10 Milyon Dolar üzeri hacmi olanlar
 
-# Aktif işlemleri takip etmek için (TP1 veya SL vuruldu mu diye)
-aktif_islemler = {} 
 son_sinyaller = {}
 
 # =====================================================
@@ -36,7 +34,7 @@ def simdi():
     return datetime.now(TR_Saati)
 
 def log(m):
-    print(f"[{simdi().strftime('%H:%M:%S')}] {m}", flush=True)
+    print(f"[{simdi().strftime('%H:%M')}] {m}", flush=True)
 
 def tg(chat_id, message):
     if not T or not chat_id: return False
@@ -60,7 +58,7 @@ def gj(url):
         return None
 
 # =====================================================
-# İNDİKATÖRLER (EMA ve ATR)
+# EMA200 HESAPLAMA
 # =====================================================
 
 def calculate_ema(prices, period):
@@ -71,129 +69,79 @@ def calculate_ema(prices, period):
         ema.append(price * k + ema[-1] * (1 - k))
     return ema
 
-def calculate_atr(klines, period=14):
-    """Ortalama Gerçek Aralık (Volatilite ölçüsü)"""
-    if len(klines) < period + 1: return 0
-    tr_list = []
-    for i in range(1, len(klines)):
-        high = float(klines[i][2])
-        low = float(klines[i][3])
-        prev_close = float(klines[i-1][4])
-        
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        tr_list.append(tr)
-    
-    # Son 14 ATR'nin ortalaması
-    return sum(tr_list[-period:]) / period
-
 # =====================================================
-# SİNYAL MOTORU VE TAKİPÇİ
+# STRATEJİ MOTORU (12H EMA200 KIRILIMI)
 # =====================================================
-
-def check_active_trades():
-    """Daha önce sinyal atılan işlemlerin TP1 veya SL'ye ulaşıp ulaşmadığını kontrol eder."""
-    if not aktif_islemler: return
-
-    for symbol, trade in list(aktif_islemler.items()):
-        ticker = gj(f"{BASE}/api/v3/ticker/price?symbol={symbol}")
-        if not ticker: continue
-        
-        current_price = float(ticker['price'])
-        
-        # LONG İşlemler
-        if trade['yon'] == "LONG":
-            if current_price >= trade['tp1']:
-                tg(C, f"✅ <b>{symbol} TP1 VURULDU!</b>\n💰 Fiyat: {current_price:.4f}\n📈 Kâr: ~%3\n\n<i>Kârını alabilirsin!</i>")
-                del aktif_islemler[symbol] # İşlem bitti, listeden çıkar
-            elif current_price <= trade['sl']:
-                tg(C, f"❌ <b>{symbol} STOP-LOSS OLDU!</b>\n💰 Fiyat: {current_price:.4f}\n📉 Zarar: ~%1.5\n\n<i>Pozisyonu kapat!</i>")
-                del aktif_islemler[symbol]
-                
-        # SHORT İşlemler
-        elif trade['yon'] == "SHORT":
-            if current_price <= trade['tp1']:
-                tg(C, f"✅ <b>{symbol} TP1 VURULDU!</b>\n💰 Fiyat: {current_price:.4f}\n📈 Kâr: ~%3\n\n<i>Kârını alabilirsin!</i>")
-                del aktif_islemler[symbol]
-            elif current_price >= trade['sl']:
-                tg(C, f"❌ <b>{symbol} STOP-LOSS OLDU!</b>\n💰 Fiyat: {current_price:.4f}\n📉 Zarar: ~%1.5\n\n<i>Pozisyonu kapat!</i>")
-                del aktif_islemler[symbol]
 
 def check_signals():
-    log("Piyasa taranıyor...")
+    log("12H EMA200 Kırılımları taranıyor...")
     
-    # Önce aktif işlemleri kontrol et (TP1 veya SL oldu mu?)
-    check_active_trades()
-
+    # Spot piyasa verilerini çek
     tickers = gj("https://api.binance.com/api/v3/ticker/24hr")
     if not isinstance(tickers, list): return
 
     adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM]
 
     for symbol in adaylar:
-        if symbol in son_sinyaller and time.time() - son_sinyaller[symbol] < 3600:
+        # Aynı coin için 24 saat içinde tekrar sinyal atma
+        if symbol in son_sinyaller and time.time() - son_sinyaller[symbol] < 86400:
             continue
 
-        klines = gj(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=15m&limit=100")
-        if not isinstance(klines, list) or len(klines) < 50: continue
+        # 12 Saatlik grafikte son 210 mumu çek (EMA200 için en az 200 mum lazım)
+        klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=12h&limit=210")
+        if not isinstance(klines, list) or len(klines) < 205: 
+            continue
 
         closes = [float(k[4]) for k in klines]
-        entry_price = closes[-1]
+        current_price = closes[-1]
         
-        ema9 = calculate_ema(closes, 9)
-        ema21 = calculate_ema(closes, 21)
-        atr = calculate_atr(klines, 14)
+        ema200 = calculate_ema(closes, 200)
+        if len(ema200) < 2: continue
 
-        if len(ema9) < 2 or len(ema21) < 2 or atr == 0: continue
-
-        curr_ema9, curr_ema21 = ema9[-1], ema21[-1]
-        prev_ema9, prev_ema21 = ema9[-2], ema21[-2]
-
-        yon = None
+        curr_ema200 = ema200[-1]
+        prev_ema200 = ema200[-2]
         
-        # LONG Sinyali
-        if prev_ema9 <= prev_ema21 and curr_ema9 > curr_ema21:
-            yon = "LONG"
-            sl = entry_price - (atr * 1.0)       # Zarar durdur (1 ATR)
-            tp1 = entry_price * 1.03             # Kâr Al 1 (%3)
-            tp2 = entry_price * 1.06             # Kâr Al 2 (%6)
-            tp3 = entry_price * 1.09             # Kâr Al 3 (%9)
+        prev_close = closes[-2]
+
+        # SİNYAL ŞARTI: Fiyat EMA200'ün altındayken üzerine çıktı mı? (Kırılım anı)
+        if prev_close <= prev_ema200 and current_price > curr_ema200:
             
-        # SHORT Sinyali
-        elif prev_ema9 >= prev_ema21 and curr_ema9 < curr_ema21:
-            yon = "SHORT"
-            sl = entry_price + (atr * 1.0)
-            tp1 = entry_price * 0.97
-            tp2 = entry_price * 0.94
-            tp3 = entry_price * 0.91
+            # Kademeli Hedefler (Görseldeki gibi %5, %10, %15 vb. ama fiyata göre uzaklık)
+            tp1 = current_price * 1.05  # %5
+            tp2 = current_price * 1.10  # %10
+            tp3 = current_price * 1.15  # %15
+            tp4 = current_price * 1.25  # %25
+            tp5 = current_price * 1.40  # %40
+            
+            # Stop-loss: Kırılan EMA200'ün hemen altı (Trend dönmezse diye)
+            sl = curr_ema200 * 0.97 
 
-        if yon:
-            # Aktif işlemlere kaydet (Takip için)
-            aktif_islemler[symbol] = {"yon": yon, "tp1": tp1, "sl": sl}
-
-            emoji = "🟢" if yon == "LONG" else "🔴"
-            msg = (f"<b>neoshark.</b>\n"
-                   f"<b>#{symbol.replace('USDT','')} - 🔒</b>\n\n"
-                   f"<b>Yön:</b> {yon} {emoji}\n"
-                   f"<b>Entry:</b> {entry_price:.4f}\n\n"
-                   f"<b>TP1:</b> {tp1:.4f} (~%3)\n"
-                   f"<b>TP2:</b> {tp2:.4f} (~%6)\n"
-                   f"<b>TP3:</b> {tp3:.4f} (~%9)\n\n"
-                   f"<b>SL:</b> {sl:.4f}\n"
-                   f"<b>Leverage:</b> 10x")
+            msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ: {symbol}</b>\n"
+                   f"<i>12 Saatlik EMA200 Kırılımı Gerçekleşti!</i>\n\n"
+                   f"💰 <b>Giriş (Fiyat):</b> {current_price:.4f}\n"
+                   f"🛑 <b>Stop-Loss:</b> {sl:.4f} (EMA200 Altı)\n\n"
+                   f"🎯 <b>Kademeli Hedefler (TP):</b>\n"
+                   f"• TP1: {tp1:.4f} (+%5)\n"
+                   f"• TP2: {tp2:.4f} (+%10)\n"
+                   f"• TP3: {tp3:.4f} (+%15)\n"
+                   f"• TP4: {tp4:.4f} (+%25)\n"
+                   f"• TP5: {tp5:.4f} (+%40)\n\n"
+                   f"⏱ <b>Strateji:</b> Yüksek Zaman Dilimi Trend Takibi\n"
+                   f"⚠️ <i>Bu sinyal nadir gelir, hedefi büyüktür. Kademeli kâr almayı unutma!</i>")
             
             if tg(C, msg):
                 son_sinyaller[symbol] = time.time()
-                log(f"{yon} SİNYALİ GÖNDERİLDİ: {symbol}")
+                log(f"🔥 UZUN VADELİ SİNYAL: {symbol}")
 
-        time.sleep(0.05)
+        time.sleep(0.1)
 
 # =====================================================
 # ANA DÖNGÜ
 # =====================================================
 
 def bot_loop():
-    log("--- NEOSHARK TARZI SİNYAL BOTU BAŞLADI ---")
-    tg(C, "✅ <b>Neoshark Tarzı Bot Başladı!</b>\n\nSinyal formatı hazır. Hedef: %3 Kâr (TP1).\nBot TP1'e ulaşınca haber verecek!")
+    log("--- 12H EMA200 UZUN VADELİ SPOT BOTU BAŞLADI ---")
+    tg(C, "✅ <b>Uzun Vadeli Spot Botu Başladı!</b>\n\nStrateji: 12 Saatlik EMA200 Kırılımı.\nBu bot nadir ama büyük sinyaller üretir.")
     
     while True:
         try:
@@ -211,7 +159,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Neoshark Style Bot is running!")
+        self.wfile.write(b"12H Spot Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
