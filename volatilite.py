@@ -26,12 +26,12 @@ BASE = "https://api.binance.com"
 RAPOR_ARALIGI = 3600       
 CHARTIST_ARALIGI = 3600    
 SETUP_ARALIGI = 1800       
-BOLLINGER_ARALIGI = 3600   # Haftalık tarama için 1 saatte 1 yeterli
+BOLLINGER_ARALIGI = 3600   
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_SETUP = 15_000_000    
-MIN_HACIM_BOLLINGER = 20_000_000 # Bollinger için büyük coinler
+MIN_HACIM_BOLLINGER = 20_000_000 
 
 son_sinyaller = {}
 son_setup_sinyalleri = {}
@@ -222,7 +222,7 @@ def midas_flow_loop():
             time.sleep(60)
 
 # =====================================================
-# 2. MOTOR: CHARTIST (EMA200 KIRILIMI)
+# 2. MOTOR: CHARTIST (EMA200 KIRILIMI - LONG)
 # =====================================================
 def chartist_loop():
     log("CHARTIST", "Uzun Vadeli EMA200 Motoru Başladı.")
@@ -249,7 +249,8 @@ def chartist_loop():
                     prev_close = closes[-2]
                     if prev_close <= prev_ema200 and current_price > curr_ema200:
                         sl = curr_ema200 * 0.97 
-                        msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ: {symbol}</b>\n"
+                        # YÖN: LONG EKLENDİ
+                        msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ (LONG): {symbol}</b>\n"
                                f"<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
                                f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
                                f"🛑 <b>SL:</b> {akilli_fiyat(sl)}\n"
@@ -264,7 +265,7 @@ def chartist_loop():
             time.sleep(60)
 
 # =====================================================
-# 3. MOTOR: POC / VAH / VAL SETUP ANALİZİ
+# 3. MOTOR: POC / VAH / VAL SETUP ANALİZİ (SHORT)
 # =====================================================
 def setup_loop():
     log("SETUP", "POC / VAH / VAL Setup Analiz Motoru Başladı.")
@@ -298,13 +299,21 @@ def setup_loop():
                 poc_idx = recent_vols.index(max(recent_vols))
                 poc = closes[-24 + poc_idx] 
                 
-                if val < current_price < vah:
+                # Fiyat POC seviyesine çok yakınsa veya altına sarktıysa (SHORT Senaryosu)
+                if current_price <= poc * 1.01 and current_price < vah:
+                    
                     low_1h = min(lows[-1:])
                     low_4h = min(lows[-4:])
                     
-                    tp1 = val
-                    tp2 = low_1h if low_1h < val else val * 0.98
-                    tp3 = low_4h if low_4h < tp2 else tp2 * 0.95
+                    hedefler = sorted(list(set([low_1h, low_4h, val])), reverse=True)
+                    hedefler = [h for h in hedefler if h < current_price]
+                    
+                    if len(hedefler) >= 3:
+                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[2]
+                    elif len(hedefler) == 2:
+                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[1] * 0.98
+                    else:
+                        continue 
                     
                     stop = vah * 1.02 
                     
@@ -315,12 +324,13 @@ def setup_loop():
 
                     coin = symbol.replace("USDT", "")
                     
-                    msg = (f"<b>#{symbol}</b>\n\n"
+                    # YÖN: SHORT EKLENDİ
+                    msg = (f"🔻 <b>SETUP SİNYALİ (SHORT): {symbol}</b>\n\n"
                            f"Fiyat: <b>{akilli_fiyat(current_price)}</b>\n"
                            f"Hedefler: <b>{akilli_fiyat(tp1)}</b> ({tp1_pct:+.1f}%) → <b>{akilli_fiyat(tp2)}</b> ({tp2_pct:+.1f}%) → <b>{akilli_fiyat(tp3)}</b> ({tp3_pct:+.1f}%)\n"
                            f"İptal: <b>{akilli_fiyat(stop)}</b> ({stop_pct:+.1f}%) üzerinde\n\n"
-                           f"{coin}, <b>VAH {akilli_fiyat(vah)}</b> ile <b>VAL {akilli_fiyat(val)}</b> arasında havada asılı kaldı. Merkezde <b>POC {akilli_fiyat(poc)}</b> var ve şu an hakem konumunda. Fiyat <b>{akilli_fiyat(current_price)}</b> ile onun üzerinde dönüyor, ancak VAH üzerinde kalıcılık sağlayacak güç yok. 🧊\n\n"
-                           f"Kilit ayrım: POC kaybı aşağıya VAL <b>{akilli_fiyat(val)}</b> ({tp1_pct:+.1f}%) yolunu açar. Ardından 1s dip <b>{akilli_fiyat(low_1h)}</b> ({tp2_pct:+.1f}%) ve 4s dip <b>{akilli_fiyat(low_4h)}</b> ({tp3_pct:+.1f}%). Akış borsalarda senkronize. 🎯")
+                           f"{coin}, <b>VAH {akilli_fiyat(vah)}</b> ile <b>VAL {akilli_fiyat(val)}</b> arasında havada asılı kaldı. Merkezde <b>POC {akilli_fiyat(poc)}</b> var ve şu an hakem konumunda. Fiyat <b>{akilli_fiyat(current_price)}</b> ile onun üzerinde tutunmaya çalışıyor ancak yukarı ivme zayıf. 🧊\n\n"
+                           f"Kilit ayrım: POC kaybı aşağıya ilk olarak 1s dip <b>{akilli_fiyat(low_1h)}</b> ve 4s dip <b>{akilli_fiyat(low_4h)}</b> yolunu açar. Akış borsalarda senkronize, zayıflık devam ederse VAL <b>{akilli_fiyat(val)}</b> hedefe girer. 🎯")
                     
                     if tg(C, msg):
                         son_setup_sinyalleri[symbol] = time.time()
@@ -333,7 +343,7 @@ def setup_loop():
             time.sleep(60)
 
 # =====================================================
-# 4. MOTOR: HAFTALIK BOLLINGER SIKIŞMASI VE KIRILIMI (YENİ)
+# 4. MOTOR: HAFTALIK BOLLINGER SIKIŞMASI VE KIRILIMI (LONG/SHORT)
 # =====================================================
 def bollinger_loop():
     log("BOLLINGER", "Haftalık Bollinger Sıkışması Motoru Başladı.")
@@ -347,7 +357,6 @@ def bollinger_loop():
             for symbol in adaylar:
                 if symbol in son_bollinger_sinyalleri and time.time() - son_bollinger_sinyalleri[symbol] < 259200: continue
                 
-                # Haftalık grafik, son 50 mum. (Sadece kapanmış mumları alıyoruz: klines[:-1])
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1w&limit=50")
                 if not isinstance(klines, list) or len(klines) < 25: continue
                 
@@ -356,14 +365,12 @@ def bollinger_loop():
                 current_price = closes[-1]
                 current_vol = vols[-1]
                 
-                # Hacim ortalaması (son 20 hafta)
                 avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 1
-                if current_vol <= (avg_vol * 1.2): continue # Hacim teyidi yoksa geç
+                if current_vol <= (avg_vol * 1.2): continue 
 
                 bb = calculate_bollinger(closes, 20, 2)
                 if not bb or not bb["signal"]: continue
                 
-                # Sıkışma (Squeeze) Kontrolü: Mevcut bant genişliği son 10 haftanın ortalamasından %40 daha dar mı?
                 bandwidth_history = []
                 for i in range(10, 0, -1):
                     past_closes = closes[:-i]
@@ -374,20 +381,18 @@ def bollinger_loop():
                 avg_bandwidth = sum(bandwidth_history) / len(bandwidth_history)
                 is_squeeze = bb["bandwidth"] < (avg_bandwidth * 0.6)
 
-                # Eğer sıkışma varsa ve kırılım gerçekleşmişse
                 if is_squeeze:
-                    yon = "AL (Yukarı Kırılım)" if "AL" in bb["signal"] else "SAT (Aşağı Kırılım)"
+                    # YÖN: LONG VEYA SHORT BELİRLEMESİ
+                    yon = "LONG (Yukarı Kırılım)" if "AL" in bb["signal"] else "SHORT (Aşağı Kırılım)"
                     emoji = "🚀" if "AL" in bb["signal"] else "🔴"
                     
-                    # Hedef: Karşı bant
                     target = bb["upper"] if "AL" in bb["signal"] else bb["lower"]
                     target_pct = ((target - current_price) / current_price) * 100
                     
-                    # Stop: Orta bant (SMA20)
                     sl = bb["sma"]
                     sl_pct = ((sl - current_price) / current_price) * 100
                     
-                    msg = (f"{emoji} <b>HAFTALIK BOLLINGER SİNYALİ: {symbol}</b>\n"
+                    msg = (f"{emoji} <b>HAFTALIK BOLLINGER SİNYALİ ({yon}): {symbol}</b>\n"
                            f"<i>Haftalık Sıkışma (Squeeze) Kırılımı!</i>\n\n"
                            f"📈 <b>Yön:</b> {yon}\n"
                            f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(current_price)}\n"
@@ -395,7 +400,7 @@ def bollinger_loop():
                            f"🛑 <b>Stop (Orta Bant):</b> {akilli_fiyat(sl)} ({sl_pct:+.1f}%)\n\n"
                            f"📊 <b>Bant Genişliği:</b> Son 10 haftanın en dar seviyesinde (Sıkışma var)\n"
                            f"📈 <b>Hacim:</b> {current_vol/avg_vol:.1f}x Artış (Teyitli)\n\n"
-                           f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Haftalık kapanış itibariyle {yon.lower()} gerçekleşti. Haftalık kırılımlar aylarca sürebilecek ana trendlerin başlangıcıdır. Banta dokunmak değil, kapanışı beklemek (kural) teyit edildi! 🧠")
+                           f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Haftalık kapanış itibariyle {yon.lower()} gerçekleşti. Haftalık kırılımlar aylarca sürebilecek ana trendlerin başlangıcıdır. 🧠")
                     
                     if tg(C, msg):
                         son_bollinger_sinyalleri[symbol] = time.time()
@@ -413,7 +418,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Ultimate Turkish Bot is running!")
+        self.wfile.write(b"Turkish Ultimate Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -429,6 +434,6 @@ if __name__ == "__main__":
     threading.Thread(target=midas_flow_loop, daemon=True).start()
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=setup_loop, daemon=True).start()
-    threading.Thread(target=bollinger_loop, daemon=True).start() # YENİ MOTOR
+    threading.Thread(target=bollinger_loop, daemon=True).start()
     
     run_web_server()
