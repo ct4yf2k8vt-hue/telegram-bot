@@ -63,15 +63,6 @@ def akilli_fiyat(p):
     if p >= 0.01: return f"{p:.6f}"
     return f"{p:.8f}"
 
-# EFSANE PİYASA PSİKOLOJİSİ UYARISI (Görseldeki Mantık)
-PIYASA_PSIKOLOJISI = (
-    "\n\n🧠 <b>PİYASA PSİKOLOJİSİ UYARISI:</b>\n"
-    "📉 <i>'Satsam uçar'</i> (FOMO) korkusuyla erken satma.\n"
-    "🛑 <i>'Tutsam sürünür'</i> diye körü körüne HODL yapma.\n"
-    "🩸 <i>'Alsan çöker'</i> kâbusunu engellemek için <b>STOP-LOSS</b>'a sadık kal!\n"
-    "✅ <b>Kural:</b> Duyguları kapat, seviyelere odaklan. Balinaların yem olma!"
-)
-
 def tg(chat_id, message):
     if not T or not chat_id: return False
     try:
@@ -183,11 +174,10 @@ def midas_flow_loop():
                     peak = get_peak_time(t['symbol'])
                     msg += f"{medals[i]} {symbol} {change_str} · {peak} saatte zirve\n"
                     hashtags += f"#{symbol} "
-                msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app\n"
-                msg += PIYASA_PSIKOLOJISI
-                msg += f"\n<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #crypto #pump #signals</a>"
+                msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app\n\n"
+                msg += f"<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #crypto #pump #signals</a>"
                 tg(C, msg)
-                log("RAPOR", f"Saatlik rapor gönderildi.")
+                log("RAPOR", "Saatlik rapor gönderildi.")
             time.sleep(RAPOR_ARALIGI)
         except Exception as e:
             log("RAPOR", f"Hata: {e}")
@@ -226,8 +216,8 @@ def chartist_loop():
                         msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ: {symbol}</b>\n"
                                f"<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
                                f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n🛑 <b>SL:</b> {akilli_fiyat(sl)}\n\n"
-                               f"🎯 <b>Hedefler:</b> TP1: {akilli_fiyat(tp1)} | TP2: {akilli_fiyat(tp2)} | TP3: {akilli_fiyat(tp3)}\n"
-                               f"{PIYASA_PSIKOLOJISI}")
+                               f"🎯 <b>Hedefler:</b> TP1: {akilli_fiyat(tp1)} | TP2: {akilli_fiyat(tp2)} | TP3: {akilli_fiyat(tp3)}\n\n"
+                               f"⚠️ <i>Nadir gelen büyük fırsat. Kademeli kâr al!</i>")
                         if tg(C, msg):
                             son_sinyaller[cooldown_key] = time.time()
                             log("CHARTIST", f"🔥 KIRILIM SİNYALİ ({tf.upper()}): {symbol}")
@@ -273,8 +263,7 @@ def pump_loop():
                     msg = (f"{emoji} <b>PUMP SİNYALİ: {symbol} ({yon})</b>\n\n"
                            f"💰 <b>Fiyat:</b> ${p_old} ➔ ${p_new} (<b>{price_change:+.2f}%</b>)\n"
                            f"📊 <b>Hacim Artışı:</b> {vol_increase_usdt:.0f} USDT (<b>{vol_change:+.0f}%</b>)\n\n"
-                           f"💡 <b>Analiz:</b> {aciklama}\n⏱ <b>Zaman:</b> {now_time}"
-                           f"{PIYASA_PSIKOLOJISI}")
+                           f"💡 <b>Analiz:</b> {aciklama}\n⏱ <b>Zaman:</b> {now_time}")
                     if tg(C, msg):
                         son_pump_sinyalleri[symbol] = time.time()
                         log("PUMP", f"🔥 {yon} SİNYALİ: {symbol}")
@@ -319,8 +308,7 @@ def setup_loop():
                            f"{symbol.replace('USDT','')}, <b>{akilli_fiyat(poc)}</b> POC direncine takıldı. Trend 1g {trend_1d}, 1s {trend_1h}. ✊\n\n"
                            f"<b>{akilli_fiyat(val)}</b> seviyesinde güçlü alım duvarı var. 🧊\n\n"
                            f"Anahtar — <b>{akilli_fiyat(poc)}</b> üzerinde kalıcılık. Hedef <b>{akilli_fiyat(target)}</b>. ⚡\n\n"
-                           f"🛡️ Stop {akilli_fiyat(stop)} arkasında."
-                           f"{PIYASA_PSIKOLOJISI}")
+                           f"🛡️ Stop {akilli_fiyat(stop)} arkasında.")
                     if tg(C, msg):
                         son_setup_sinyalleri[symbol] = time.time()
                         log("SETUP", f"🔥 SETUP SİNYALİ: {symbol}")
@@ -331,53 +319,97 @@ def setup_loop():
             time.sleep(60)
 
 # =====================================================
-# 5. MOTOR: FORMASYON VE KIRILIM AVCISI
+# 5. MOTOR: FORMASYON VE KIRILIM AVCISI (ÇİFT YÖNLÜ)
 # =====================================================
 def formasyon_loop():
-    log("FORMASYON", "Formasyon ve Kırılım Motoru Başladı.")
+    log("FORMASYON", "Çift Yönlü Formasyon ve Kırılım Motoru Başladı.")
     time.sleep(45) 
     while True:
         try:
-            log("FORMASYON", "Düşen kanal ve destek kırılımları taranıyor...")
+            log("FORMASYON", "Kırılımlar taranıyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list):
                 time.sleep(60)
                 continue
+            
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FORMASYON]
+
             for symbol in adaylar:
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 21600: continue
+                
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=50")
                 if not isinstance(klines, list) or len(klines) < 50: continue
+                
                 highs = [float(k[2]) for k in klines]
                 lows = [float(k[3]) for k in klines]
                 closes = [float(k[4]) for k in klines]
                 vols = [float(k[7]) for k in klines]
+                
                 current_price = closes[-1]
+                current_vol = vols[-1]
+                avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else 1
+                is_vol_spike = current_vol > (avg_vol * 2.0)
+
+                if not is_vol_spike:
+                    continue # Hacim patlaması yoksa diğer coine geç
+
+                # --- LONG SENARYOSU (Düşen Trend Kırılımı) ---
                 high_first_half = max(highs[-40:-20])
                 high_second_half = max(highs[-20:-5])
                 support_zone = min(lows[-20:])
-                avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else 1
-                current_vol = vols[-1]
-                if high_first_half > high_second_half and current_price > high_second_half and current_price < (support_zone * 1.20):
-                    if current_vol > (avg_vol * 1.5):
-                        target = high_first_half
-                        if target > current_price: 
-                            stop = support_zone * 0.98
-                            target_pct = ((target - current_price) / current_price) * 100
-                            stop_pct = ((stop - current_price) / current_price) * 100
-                            msg = (f"🚀 <b>FORMASYON SİNYALİ: {symbol.replace('USDT','')}/USDT</b>\n"
-                                   f"<i>Düşen Kanal / Kama Kırılımı ve Destek Dönüşü!</i>\n\n"
-                                   f"📈 <b>Yön:</b> LONG (Spot Alım)\n"
-                                   f"💰 <b>Giriş (Güncel Fiyat):</b> {akilli_fiyat(current_price)}\n"
-                                   f"🎯 <b>Hedef (Big Move):</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
-                                   f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                                   f"📊 <b>Hacim:</b> {current_vol:.0f} (Ortalamanın {current_vol/avg_vol:.1f} katı)\n"
-                                   f"🛡️ <b>Destek Bölgesi:</b> {akilli_fiyat(support_zone)}\n\n"
-                                   f"💡 <b>Analiz:</b> Fiyat uzun süredir düşen bir kanal içindeydi. {akilli_fiyat(support_zone)} seviyesindeki güçlü destek bölgesinden tepki aldı ve şu an direnci kırıp yukarı ivme kazanıyor. <b>Buy and hold (Al ve Tut)!</b> 📈\n"
-                                   f"{PIYASA_PSIKOLOJISI}")
-                            if tg(C, msg):
-                                son_formasyon_sinyalleri[symbol] = time.time()
-                                log("FORMASYON", f"🔥 KIRILIM SİNYALİ: {symbol}")
+                
+                is_downtrend = high_first_half > high_second_half
+                is_breakout_up = current_price > high_second_half
+                is_near_support = current_price < (support_zone * 1.20)
+
+                if is_downtrend and is_breakout_up and is_near_support:
+                    target = high_first_half
+                    if target > current_price:
+                        stop = support_zone * 0.98
+                        target_pct = ((target - current_price) / current_price) * 100
+                        stop_pct = ((stop - current_price) / current_price) * 100
+
+                        msg = (f"🚀 <b>FORMASYON SİNYALİ (LONG): {symbol.replace('USDT','')}/USDT</b>\n"
+                               f"<i>Düşen Trend Direnci Kırıldı + Hacim Patlaması!</i>\n\n"
+                               f"📈 <b>Yön:</b> LONG\n"
+                               f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
+                               f"🎯 <b>Hedef:</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
+                               f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
+                               f"📊 <b>Hacim:</b> {current_vol/avg_vol:.1f}x\n"
+                               f"🛡️ <b>Destek:</b> {akilli_fiyat(support_zone)}")
+                        if tg(C, msg):
+                            son_formasyon_sinyalleri[symbol] = time.time()
+                            log("FORMASYON", f"🔥 LONG SİNYALİ: {symbol}")
+                        continue # LONG işlemi yapıldıysa aynı mumda SHORT aramaya gerek yok
+
+                # --- SHORT SENARYOSU (Yükselen Trend Desteğinin Kırılması) ---
+                low_first_half = min(lows[-40:-20])
+                low_second_half = min(lows[-20:-5])
+                resistance_zone = max(highs[-20:])
+                
+                is_uptrend = low_second_half > low_first_half
+                is_breakout_down = current_price < low_second_half
+                is_near_resistance = current_price > (resistance_zone * 0.80)
+
+                if is_uptrend and is_breakout_down and is_near_resistance:
+                    target = low_first_half
+                    if target < current_price:
+                        stop = resistance_zone * 1.02
+                        target_pct = ((target - current_price) / current_price) * 100
+                        stop_pct = ((stop - current_price) / current_price) * 100
+
+                        msg = (f"🔻 <b>FORMASYON SİNYALİ (SHORT): {symbol.replace('USDT','')}/USDT</b>\n"
+                               f"<i>Yükselen Trend Desteği Kırıldı + Hacim Patlaması!</i>\n\n"
+                               f"📉 <b>Yön:</b> SHORT\n"
+                               f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
+                               f"🎯 <b>Hedef:</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
+                               f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
+                               f"📊 <b>Hacim:</b> {current_vol/avg_vol:.1f}x\n"
+                               f"🛡️ <b>Direnç:</b> {akilli_fiyat(resistance_zone)}")
+                        if tg(C, msg):
+                            son_formasyon_sinyalleri[symbol] = time.time()
+                            log("FORMASYON", f"🔥 SHORT SİNYALİ: {symbol}")
+
                 time.sleep(0.1)
             time.sleep(FORMASYON_ARALIGI)
         except Exception as e:
@@ -434,8 +466,7 @@ def bollinger_loop():
                                f"🛑 <b>Stop Bant:</b> {akilli_fiyat(sl)} ({sl_pct:+.1f}%)\n\n"
                                f"📊 <b>Bant Durumu:</b> Sıkışma Tespit Edildi\n"
                                f"📈 <b>Hacim:</b> {current_vol:.0f} (Ortalamanın {current_vol/avg_vol:.1f} katı)\n\n"
-                               f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Bu hafta kapanış itibariyle <b>{yon}</b> gerçekleşti ve hacim patladı. Haftalık kırılımlar aylarca sürebilecek büyük trendlerin başlangıcıdır. <b>{'Long' if 'AL' in bb['signal'] else 'Short'} pozisyon açılabilir.</b>"
-                               f"{PIYASA_PSIKOLOJISI}")
+                               f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Bu hafta kapanış itibariyle <b>{yon}</b> gerçekleşti ve hacim patladı. Haftalık kırılımlar aylarca sürebilecek büyük trendlerin başlangıcıdır. <b>{'Long' if 'AL' in bb['signal'] else 'Short'} pozisyon açılabilir.</b>")
                         if tg(C, msg):
                             son_bollinger_sinyalleri[symbol] = time.time()
                             log("BOLLINGER", f"🔥 SQUEEZE KIRILIMI: {symbol} ({yon})")
@@ -488,8 +519,7 @@ def macro_loop():
                            f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
                            f"🎯 <b>Hedef (Big Move):</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                           f"💡 <b>Analiz:</b> {symbol.replace('USDT','')} uzun süredir düşen bir trenddeydi. Bugün 50 günlük hareketli ortalamayı (SMA50) hacimle yukarı kırdı. Bu, büyük balinaların birikim yaptığının ve trendin yukarı döndüğünün en güçlü işaretidir. <b>Buy and hold big Move soon! 🚀🍕</b>"
-                           f"{PIYASA_PSIKOLOJISI}")
+                           f"💡 <b>Analiz:</b> {symbol.replace('USDT','')} uzun süredir düşen bir trenddeydi. Bugün 50 günlük hareketli ortalamayı (SMA50) hacimle yukarı kırdı. Bu, büyük balinaların birikim yaptığının ve trendin yukarı döndüğünün en güçlü işaretidir. <b>Buy and hold big Move soon! 🚀🍕</b>")
                     if tg(C, msg):
                         son_macro_sinyalleri[symbol] = time.time()
                         log("MACRO", f"🔥 MAKRO KIRILIM SİNYALİ: {symbol}")
@@ -507,7 +537,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Sept-Engine Bot with Psychology is running!")
+        self.wfile.write(b"Sept-Engine Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
