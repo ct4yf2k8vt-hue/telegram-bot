@@ -22,16 +22,14 @@ C = os.environ.get("CHAT_ID", "1623907197").strip()
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://api.binance.com"
 
-# MOTOR ÇALIŞMA SÜRELERİ
 RAPOR_ARALIGI = 3600       
 CHARTIST_ARALIGI = 3600    
 PUMP_ARALIGI = 60          
 SETUP_ARALIGI = 900        
 FORMASYON_ARALIGI = 1800   
 BOLLINGER_ARALIGI = 3600   
-MACRO_ARALIGI = 7200       # Günlük grafikler için 2 saatte 1 tarama yeterli
+MACRO_ARALIGI = 7200       
 
-# FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_24H_PUMP = 5_000_000  
 MIN_HACIM_ARTISI = 20_000       
@@ -57,7 +55,6 @@ def simdi():
 def log(prefix, m):
     print(f"[{simdi().strftime('%H:%M:%S')}] [{prefix}] {m}", flush=True)
 
-# AKILLI FİYAT FORMATLAYICI (PEPE gibi coinler için 0.0000 sorununu çözer)
 def akilli_fiyat(p):
     if p is None: return "0"
     p = float(p)
@@ -65,6 +62,15 @@ def akilli_fiyat(p):
     if p >= 1: return f"{p:.4f}"
     if p >= 0.01: return f"{p:.6f}"
     return f"{p:.8f}"
+
+# EFSANE PİYASA PSİKOLOJİSİ UYARISI (Görseldeki Mantık)
+PIYASA_PSIKOLOJISI = (
+    "\n\n🧠 <b>PİYASA PSİKOLOJİSİ UYARISI:</b>\n"
+    "📉 <i>'Satsam uçar'</i> (FOMO) korkusuyla erken satma.\n"
+    "🛑 <i>'Tutsam sürünür'</i> diye körü körüne HODL yapma.\n"
+    "🩸 <i>'Alsan çöker'</i> kâbusunu engellemek için <b>STOP-LOSS</b>'a sadık kal!\n"
+    "✅ <b>Kural:</b> Duyguları kapat, seviyelere odaklan. Balinaların yem olma!"
+)
 
 def tg(chat_id, message):
     if not T or not chat_id: return False
@@ -177,11 +183,11 @@ def midas_flow_loop():
                     peak = get_peak_time(t['symbol'])
                     msg += f"{medals[i]} {symbol} {change_str} · {peak} saatte zirve\n"
                     hashtags += f"#{symbol} "
-                msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app\n\n"
-                msg += "⚠️ Hareket — potansiyel hareket, kâr garantisi değildir.\n\n"
-                msg += f"<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #crypto #pump #signals</a>"
+                msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app\n"
+                msg += PIYASA_PSIKOLOJISI
+                msg += f"\n<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #crypto #pump #signals</a>"
                 tg(C, msg)
-                log("RAPOR", f"Saatlik rapor gönderildi. (Piyasa Yönü: {trend_text})")
+                log("RAPOR", f"Saatlik rapor gönderildi.")
             time.sleep(RAPOR_ARALIGI)
         except Exception as e:
             log("RAPOR", f"Hata: {e}")
@@ -220,8 +226,8 @@ def chartist_loop():
                         msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ: {symbol}</b>\n"
                                f"<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
                                f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n🛑 <b>SL:</b> {akilli_fiyat(sl)}\n\n"
-                               f"🎯 <b>Hedefler:</b> TP1: {akilli_fiyat(tp1)} | TP2: {akilli_fiyat(tp2)} | TP3: {akilli_fiyat(tp3)} | TP4: {akilli_fiyat(tp4)}\n\n"
-                               f"⚠️ <i>Nadir gelen büyük fırsat. Kademeli kâr al!</i>")
+                               f"🎯 <b>Hedefler:</b> TP1: {akilli_fiyat(tp1)} | TP2: {akilli_fiyat(tp2)} | TP3: {akilli_fiyat(tp3)}\n"
+                               f"{PIYASA_PSIKOLOJISI}")
                         if tg(C, msg):
                             son_sinyaller[cooldown_key] = time.time()
                             log("CHARTIST", f"🔥 KIRILIM SİNYALİ ({tf.upper()}): {symbol}")
@@ -267,7 +273,8 @@ def pump_loop():
                     msg = (f"{emoji} <b>PUMP SİNYALİ: {symbol} ({yon})</b>\n\n"
                            f"💰 <b>Fiyat:</b> ${p_old} ➔ ${p_new} (<b>{price_change:+.2f}%</b>)\n"
                            f"📊 <b>Hacim Artışı:</b> {vol_increase_usdt:.0f} USDT (<b>{vol_change:+.0f}%</b>)\n\n"
-                           f"💡 <b>Analiz:</b> {aciklama}\n⏱ <b>Zaman:</b> {now_time}")
+                           f"💡 <b>Analiz:</b> {aciklama}\n⏱ <b>Zaman:</b> {now_time}"
+                           f"{PIYASA_PSIKOLOJISI}")
                     if tg(C, msg):
                         son_pump_sinyalleri[symbol] = time.time()
                         log("PUMP", f"🔥 {yon} SİNYALİ: {symbol}")
@@ -278,7 +285,7 @@ def pump_loop():
             time.sleep(30)
 
 # =====================================================
-# 4. MOTOR: SETUP ANALİZİ (POC / VAL) - AKILLI FİYAT EKLENDİ
+# 4. MOTOR: SETUP ANALİZİ (POC / VAL)
 # =====================================================
 def setup_loop():
     log("SETUP", "Profesyonel Setup Analiz Motoru Başladı.")
@@ -312,7 +319,8 @@ def setup_loop():
                            f"{symbol.replace('USDT','')}, <b>{akilli_fiyat(poc)}</b> POC direncine takıldı. Trend 1g {trend_1d}, 1s {trend_1h}. ✊\n\n"
                            f"<b>{akilli_fiyat(val)}</b> seviyesinde güçlü alım duvarı var. 🧊\n\n"
                            f"Anahtar — <b>{akilli_fiyat(poc)}</b> üzerinde kalıcılık. Hedef <b>{akilli_fiyat(target)}</b>. ⚡\n\n"
-                           f"🛡️ Stop {akilli_fiyat(stop)} arkasında.")
+                           f"🛡️ Stop {akilli_fiyat(stop)} arkasında."
+                           f"{PIYASA_PSIKOLOJISI}")
                     if tg(C, msg):
                         son_setup_sinyalleri[symbol] = time.time()
                         log("SETUP", f"🔥 SETUP SİNYALİ: {symbol}")
@@ -365,8 +373,8 @@ def formasyon_loop():
                                    f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
                                    f"📊 <b>Hacim:</b> {current_vol:.0f} (Ortalamanın {current_vol/avg_vol:.1f} katı)\n"
                                    f"🛡️ <b>Destek Bölgesi:</b> {akilli_fiyat(support_zone)}\n\n"
-                                   f"💡 <b>Analiz:</b> Fiyat uzun süredir düşen bir kanal içindeydi. {akilli_fiyat(support_zone)} seviyesindeki güçlü destek bölgesinden tepki aldı ve şu an direnci kırıp yukarı ivme kazanıyor. <b>Buy and hold (Al ve Tut)!</b> 📈\n\n"
-                                   f"<i>Bu tarz sinyaller haftada 1-2 kez gelir, büyük hareket potansiyeli taşır.</i>")
+                                   f"💡 <b>Analiz:</b> Fiyat uzun süredir düşen bir kanal içindeydi. {akilli_fiyat(support_zone)} seviyesindeki güçlü destek bölgesinden tepki aldı ve şu an direnci kırıp yukarı ivme kazanıyor. <b>Buy and hold (Al ve Tut)!</b> 📈\n"
+                                   f"{PIYASA_PSIKOLOJISI}")
                             if tg(C, msg):
                                 son_formasyon_sinyalleri[symbol] = time.time()
                                 log("FORMASYON", f"🔥 KIRILIM SİNYALİ: {symbol}")
@@ -426,7 +434,8 @@ def bollinger_loop():
                                f"🛑 <b>Stop Bant:</b> {akilli_fiyat(sl)} ({sl_pct:+.1f}%)\n\n"
                                f"📊 <b>Bant Durumu:</b> Sıkışma Tespit Edildi\n"
                                f"📈 <b>Hacim:</b> {current_vol:.0f} (Ortalamanın {current_vol/avg_vol:.1f} katı)\n\n"
-                               f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Bu hafta kapanış itibariyle <b>{yon}</b> gerçekleşti ve hacim patladı. Haftalık kırılımlar aylarca sürebilecek büyük trendlerin başlangıcıdır. <b>{'Long' if 'AL' in bb['signal'] else 'Short'} pozisyon açılabilir.</b>")
+                               f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Bu hafta kapanış itibariyle <b>{yon}</b> gerçekleşti ve hacim patladı. Haftalık kırılımlar aylarca sürebilecek büyük trendlerin başlangıcıdır. <b>{'Long' if 'AL' in bb['signal'] else 'Short'} pozisyon açılabilir.</b>"
+                               f"{PIYASA_PSIKOLOJISI}")
                         if tg(C, msg):
                             son_bollinger_sinyalleri[symbol] = time.time()
                             log("BOLLINGER", f"🔥 SQUEEZE KIRILIMI: {symbol} ({yon})")
@@ -449,65 +458,42 @@ def macro_loop():
             if not isinstance(tickers, list):
                 time.sleep(60)
                 continue
-            
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MACRO]
-
             for symbol in adaylar:
-                if symbol in son_macro_sinyalleri and time.time() - son_macro_sinyalleri[symbol] < 172800: continue # 2 gün bekle
-
-                # 1 Günlük (1d) grafikte son 100 günü çek
+                if symbol in son_macro_sinyalleri and time.time() - son_macro_sinyalleri[symbol] < 172800: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=100")
                 if not isinstance(klines, list) or len(klines) < 100: continue
-
                 closes = [float(k[4]) for k in klines]
                 highs = [float(k[2]) for k in klines]
                 lows = [float(k[3]) for k in klines]
                 vols = [float(k[7]) for k in klines]
                 current_price = closes[-1]
-
-                # 50 ve 100 günlük hareketli ortalamaları hesapla (SMA)
                 sma50 = sum(closes[-50:]) / 50
                 sma100 = sum(closes[-100:]) / 100
-                
-                # Önceki günün ortalamaları (Kesişim kontrolü için)
                 prev_sma50 = sum(closes[-51:-1]) / 50
                 prev_sma100 = sum(closes[-101:-1]) / 100
-
                 avg_vol = sum(vols[-20:-1]) / 19
                 current_vol = vols[-1]
-
-                # KIRILIM MANTIĞI:
-                # 1. Fiyat uzun süredir düşüşteydi (SMA50, SMA100'ün altındaydı)
-                # 2. Fiyat şu an SMA50'yi yukarı kırıyor VE SMA50, SMA100'e yaklaşıyor (Dip dönüşü emaresi)
-                # 3. Hacim ortalamanın üstünde
                 is_downtrend = prev_sma50 < prev_sma100
                 is_breakout = current_price > sma50 and closes[-2] <= prev_sma50
-                
                 if is_downtrend and is_breakout and current_vol > (avg_vol * 1.5):
-                    # Hedef: Son 100 günün zirvesi veya %30 yukarısı
                     target = max(highs) 
-                    if target < current_price * 1.20: # Eğer zirve çok yakınsa, %30 koy
-                        target = current_price * 1.30
-                        
+                    if target < current_price * 1.20: target = current_price * 1.30
                     target_pct = ((target - current_price) / current_price) * 100
-                    stop = min(lows[-30:]) * 0.95 # Son 30 günün dibi
+                    stop = min(lows[-30:]) * 0.95 
                     stop_pct = ((stop - current_price) / current_price) * 100
-
                     msg = (f"🛒 <b>MAKRO DİP DÖNÜŞÜ: {symbol.replace('USDT','')}/USDT</b>\n"
                            f"<i>Günlük Trend Kırılımı (Buy & Hold)</i>\n\n"
                            f"📈 <b>Yön:</b> SPOT (Uzun Vade)\n"
                            f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
                            f"🎯 <b>Hedef (Big Move):</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                           f"💡 <b>Analiz:</b> {symbol.replace('USDT','')} uzun süredir düşen bir trenddeydi. Bugün 50 günlük hareketli ortalamayı (SMA50) hacimle yukarı kırdı. Bu, büyük balinaların birikim yaptığının ve trendin yukarı döndüğünün en güçlü işaretidir. <b>Buy and hold big Move soon! 🚀🍕</b>\n\n"
-                           f"<i>Bu sinyal haftada/ayda 1 kez gelir, en sağlam spot fırsatıdır.</i>")
-                    
+                           f"💡 <b>Analiz:</b> {symbol.replace('USDT','')} uzun süredir düşen bir trenddeydi. Bugün 50 günlük hareketli ortalamayı (SMA50) hacimle yukarı kırdı. Bu, büyük balinaların birikim yaptığının ve trendin yukarı döndüğünün en güçlü işaretidir. <b>Buy and hold big Move soon! 🚀🍕</b>"
+                           f"{PIYASA_PSIKOLOJISI}")
                     if tg(C, msg):
                         son_macro_sinyalleri[symbol] = time.time()
                         log("MACRO", f"🔥 MAKRO KIRILIM SİNYALİ: {symbol}")
-
                 time.sleep(0.2)
-
             log("MACRO", "Tarama bitti, 2 saat bekleniyor.")
             time.sleep(MACRO_ARALIGI)
         except Exception as e:
@@ -521,7 +507,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Sept-Engine Bot is running!")
+        self.wfile.write(b"Sept-Engine Bot with Psychology is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -540,6 +526,6 @@ if __name__ == "__main__":
     threading.Thread(target=setup_loop, daemon=True).start()
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=bollinger_loop, daemon=True).start()
-    threading.Thread(target=macro_loop, daemon=True).start() # YENİ: PEPE tarzı Makro Kırılım
+    threading.Thread(target=macro_loop, daemon=True).start()
     
     run_web_server()
