@@ -125,10 +125,49 @@ def get_market_trend(tickers):
     except:
         return "Bilinmiyor", 0, 0, 0
 
+# --- YENİ: CVD VE OI TEYİDİ (Görseldeki Mantık) ---
+def get_cvd_oi_teyit(symbol):
+    try:
+        # 1. Açık Pozisyon (OI) Değişimi
+        oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=15m&limit=2")
+        oi_text = "OI Verisi Yok"
+        oi_artiyor = False
+        if oi_data and len(oi_data) >= 2:
+            oi_old = float(oi_data[0]['sumOpenInterest'])
+            oi_new = float(oi_data[1]['sumOpenInterest'])
+            if oi_old > 0:
+                oi_chg_pct = ((oi_new - oi_old) / oi_old) * 100
+                oi_text = f"{oi_chg_pct:+.2f}%"
+                if oi_chg_pct > 0.5: # OI artıyorsa
+                    oi_artiyor = True
+
+        # 2. Taker Buy/Sell Oranı (CVD Mantığı)
+        taker_data = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=15m&limit=1")
+        taker_text = "Taker Verisi Yok"
+        alici_baskin = False
+        if taker_data and len(taker_data) > 0:
+            buy_vol = float(taker_data[0]['buyVol'])
+            sell_vol = float(taker_data[0]['sellVol'])
+            total = buy_vol + sell_vol
+            if total > 0:
+                buy_pct = (buy_vol / total) * 100
+                taker_text = f"Alıcı: %{buy_pct:.1f} / Satıcı: %{100-buy_pct:.1f}"
+                if buy_pct > 55: # Alıcı baskısı %55'ten fazlaysa
+                    alici_baskin = True
+
+        # Görseldeki gibi hem alıcı baskısı hem OI artışı varsa -> Balina Teyidi
+        if oi_artiyor and alici_baskin:
+            return f"\n🐋 <b>BALİNA TEYİDİ (CVD+OI):</b> Piyasaya YENİ LONG'lar girdi! (OI: {oi_text}, {taker_text})"
+        elif alici_baskin:
+            return f"\n⚖️ <b>Kısmi Teyit:</b> Alıcı baskısı var ama OI artmamış. (OI: {oi_text}, {taker_text})"
+        else:
+            return f"\n⚠️ <b>Zayıf Teyit:</b> Spot/Futures alıcıları zayıf. (OI: {oi_text})"
+    except Exception as e:
+        return ""
+
 # =====================================================
 # 1. MOTOR: MİDAS FLOW (RAPOR + PİYASA YÖNÜ)
 # =====================================================
-
 def get_peak_time(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
     if not isinstance(klines, list): return "0"
@@ -228,7 +267,7 @@ def chartist_loop():
             time.sleep(60)
 
 # =====================================================
-# 3. MOTOR: AKILLI YÖNLÜ PUMP ALARMI
+# 3. MOTOR: AKILLI YÖNLÜ PUMP ALARMI (CVD/OI EKLENDİ)
 # =====================================================
 def pump_loop():
     log("PUMP", "Akıllı Yönlü Pump Motoru Başladı (1m).")
@@ -257,13 +296,19 @@ def pump_loop():
                         yon, emoji, aciklama = "SHORT", "🔴", "Aşırı pump! Düzeltme bekleniyor."
                     else:
                         yon, emoji, aciklama = "LONG", "🟢", "Güçlü momentum! Trend devamı bekleniyor."
+                    
+                    # CVD ve OI Teyidi Al
+                    cvd_oi_teyit = get_cvd_oi_teyit(symbol)
+                    
                     p_old = akilli_fiyat(prev_close)
                     p_new = akilli_fiyat(curr_close)
                     now_time = simdi().strftime('%I:%M:%S %p')
                     msg = (f"{emoji} <b>PUMP SİNYALİ: {symbol} ({yon})</b>\n\n"
                            f"💰 <b>Fiyat:</b> ${p_old} ➔ ${p_new} (<b>{price_change:+.2f}%</b>)\n"
                            f"📊 <b>Hacim Artışı:</b> {vol_increase_usdt:.0f} USDT (<b>{vol_change:+.0f}%</b>)\n\n"
-                           f"💡 <b>Analiz:</b> {aciklama}\n⏱ <b>Zaman:</b> {now_time}")
+                           f"💡 <b>Analiz:</b> {aciklama}"
+                           f"{cvd_oi_teyit}\n\n"
+                           f"⏱ <b>Zaman:</b> {now_time}")
                     if tg(C, msg):
                         son_pump_sinyalleri[symbol] = time.time()
                         log("PUMP", f"🔥 {yon} SİNYALİ: {symbol}")
@@ -319,7 +364,7 @@ def setup_loop():
             time.sleep(60)
 
 # =====================================================
-# 5. MOTOR: FORMASYON VE KIRILIM AVCISI (ÇİFT YÖNLÜ)
+# 5. MOTOR: FORMASYON VE KIRILIM AVCISI (CVD/OI EKLENDİ)
 # =====================================================
 def formasyon_loop():
     log("FORMASYON", "Çift Yönlü Formasyon ve Kırılım Motoru Başladı.")
@@ -351,9 +396,9 @@ def formasyon_loop():
                 is_vol_spike = current_vol > (avg_vol * 2.0)
 
                 if not is_vol_spike:
-                    continue # Hacim patlaması yoksa diğer coine geç
+                    continue 
 
-                # --- LONG SENARYOSU (Düşen Trend Kırılımı) ---
+                # --- LONG SENARYOSU ---
                 high_first_half = max(highs[-40:-20])
                 high_second_half = max(highs[-20:-5])
                 support_zone = min(lows[-20:])
@@ -369,6 +414,8 @@ def formasyon_loop():
                         target_pct = ((target - current_price) / current_price) * 100
                         stop_pct = ((stop - current_price) / current_price) * 100
 
+                        cvd_oi_teyit = get_cvd_oi_teyit(symbol)
+
                         msg = (f"🚀 <b>FORMASYON SİNYALİ (LONG): {symbol.replace('USDT','')}/USDT</b>\n"
                                f"<i>Düşen Trend Direnci Kırıldı + Hacim Patlaması!</i>\n\n"
                                f"📈 <b>Yön:</b> LONG\n"
@@ -376,13 +423,14 @@ def formasyon_loop():
                                f"🎯 <b>Hedef:</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
                                f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
                                f"📊 <b>Hacim:</b> {current_vol/avg_vol:.1f}x\n"
-                               f"🛡️ <b>Destek:</b> {akilli_fiyat(support_zone)}")
+                               f"🛡️ <b>Destek:</b> {akilli_fiyat(support_zone)}"
+                               f"{cvd_oi_teyit}")
                         if tg(C, msg):
                             son_formasyon_sinyalleri[symbol] = time.time()
                             log("FORMASYON", f"🔥 LONG SİNYALİ: {symbol}")
-                        continue # LONG işlemi yapıldıysa aynı mumda SHORT aramaya gerek yok
+                        continue 
 
-                # --- SHORT SENARYOSU (Yükselen Trend Desteğinin Kırılması) ---
+                # --- SHORT SENARYOSU ---
                 low_first_half = min(lows[-40:-20])
                 low_second_half = min(lows[-20:-5])
                 resistance_zone = max(highs[-20:])
@@ -398,6 +446,8 @@ def formasyon_loop():
                         target_pct = ((target - current_price) / current_price) * 100
                         stop_pct = ((stop - current_price) / current_price) * 100
 
+                        cvd_oi_teyit = get_cvd_oi_teyit(symbol)
+
                         msg = (f"🔻 <b>FORMASYON SİNYALİ (SHORT): {symbol.replace('USDT','')}/USDT</b>\n"
                                f"<i>Yükselen Trend Desteği Kırıldı + Hacim Patlaması!</i>\n\n"
                                f"📉 <b>Yön:</b> SHORT\n"
@@ -405,7 +455,8 @@ def formasyon_loop():
                                f"🎯 <b>Hedef:</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
                                f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
                                f"📊 <b>Hacim:</b> {current_vol/avg_vol:.1f}x\n"
-                               f"🛡️ <b>Direnç:</b> {akilli_fiyat(resistance_zone)}")
+                               f"🛡️ <b>Direnç:</b> {akilli_fiyat(resistance_zone)}"
+                               f"{cvd_oi_teyit}")
                         if tg(C, msg):
                             son_formasyon_sinyalleri[symbol] = time.time()
                             log("FORMASYON", f"🔥 SHORT SİNYALİ: {symbol}")
@@ -537,7 +588,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Sept-Engine Bot is running!")
+        self.wfile.write(b"Sept-Engine Bot with CVD/OI is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
