@@ -29,6 +29,7 @@ PUMP_ARALIGI = 60
 SETUP_ARALIGI = 900        
 FORMASYON_ARALIGI = 1800   
 BOLLINGER_ARALIGI = 3600   
+MACRO_ARALIGI = 7200       # Günlük grafikler için 2 saatte 1 tarama yeterli
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -37,12 +38,14 @@ MIN_HACIM_ARTISI = 20_000
 MIN_HACIM_SETUP = 20_000_000    
 MIN_HACIM_FORMASYON = 15_000_000 
 MIN_HACIM_BOLLINGER = 20_000_000 
+MIN_HACIM_MACRO = 10_000_000
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
 son_setup_sinyalleri = {}
 son_formasyon_sinyalleri = {}
 son_bollinger_sinyalleri = {}
+son_macro_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -53,6 +56,15 @@ def simdi():
 
 def log(prefix, m):
     print(f"[{simdi().strftime('%H:%M:%S')}] [{prefix}] {m}", flush=True)
+
+# AKILLI FİYAT FORMATLAYICI (PEPE gibi coinler için 0.0000 sorununu çözer)
+def akilli_fiyat(p):
+    if p is None: return "0"
+    p = float(p)
+    if p >= 1000: return f"{p:.2f}"
+    if p >= 1: return f"{p:.4f}"
+    if p >= 0.01: return f"{p:.6f}"
+    return f"{p:.8f}"
 
 def tg(chat_id, message):
     if not T or not chat_id: return False
@@ -84,8 +96,7 @@ def calculate_ema(prices, period):
     return ema
 
 def calculate_bollinger(closes, period=20, num_std=2):
-    if len(closes) < period:
-        return None
+    if len(closes) < period: return None
     recent_closes = closes[-period:]
     sma = sum(recent_closes) / period
     variance = sum((x - sma) ** 2 for x in recent_closes) / period
@@ -95,10 +106,8 @@ def calculate_bollinger(closes, period=20, num_std=2):
     bandwidth = (upper_band - lower_band) / sma if sma > 0 else 0
     current_close = closes[-1]
     signal = None
-    if current_close > upper_band:
-        signal = "AL (Kırılım)"
-    elif current_close < lower_band:
-        signal = "SAT (Kırılım)"
+    if current_close > upper_band: signal = "AL (Kırılım)"
+    elif current_close < lower_band: signal = "SAT (Kırılım)"
     return {"sma": sma, "upper": upper_band, "lower": lower_band, "bandwidth": bandwidth, "close": current_close, "signal": signal}
 
 def get_market_trend(tickers):
@@ -210,8 +219,8 @@ def chartist_loop():
                         sl = curr_ema200 * 0.97 
                         msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ: {symbol}</b>\n"
                                f"<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
-                               f"💰 <b>Giriş:</b> {current_price:.4f}\n🛑 <b>SL:</b> {sl:.4f}\n\n"
-                               f"🎯 <b>Hedefler:</b> TP1: {tp1:.4f} | TP2: {tp2:.4f} | TP3: {tp3:.4f} | TP4: {tp4:.4f}\n\n"
+                               f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n🛑 <b>SL:</b> {akilli_fiyat(sl)}\n\n"
+                               f"🎯 <b>Hedefler:</b> TP1: {akilli_fiyat(tp1)} | TP2: {akilli_fiyat(tp2)} | TP3: {akilli_fiyat(tp3)} | TP4: {akilli_fiyat(tp4)}\n\n"
                                f"⚠️ <i>Nadir gelen büyük fırsat. Kademeli kâr al!</i>")
                         if tg(C, msg):
                             son_sinyaller[cooldown_key] = time.time()
@@ -252,8 +261,8 @@ def pump_loop():
                         yon, emoji, aciklama = "SHORT", "🔴", "Aşırı pump! Düzeltme bekleniyor."
                     else:
                         yon, emoji, aciklama = "LONG", "🟢", "Güçlü momentum! Trend devamı bekleniyor."
-                    p_old = f"{prev_close:.8f}".rstrip('0').rstrip('.')
-                    p_new = f"{curr_close:.8f}".rstrip('0').rstrip('.')
+                    p_old = akilli_fiyat(prev_close)
+                    p_new = akilli_fiyat(curr_close)
                     now_time = simdi().strftime('%I:%M:%S %p')
                     msg = (f"{emoji} <b>PUMP SİNYALİ: {symbol} ({yon})</b>\n\n"
                            f"💰 <b>Fiyat:</b> ${p_old} ➔ ${p_new} (<b>{price_change:+.2f}%</b>)\n"
@@ -269,7 +278,7 @@ def pump_loop():
             time.sleep(30)
 
 # =====================================================
-# 4. MOTOR: SETUP ANALİZİ (POC / VAL)
+# 4. MOTOR: SETUP ANALİZİ (POC / VAL) - AKILLI FİYAT EKLENDİ
 # =====================================================
 def setup_loop():
     log("SETUP", "Profesyonel Setup Analiz Motoru Başladı.")
@@ -299,11 +308,11 @@ def setup_loop():
                     stop_pct = ((stop - current_price) / current_price) * 100
                     trend_1d = "yukarı" if current_price > float(klines[-24][4]) else "aşağı"
                     trend_1h = "yukarı" if current_price > float(klines[-6][4]) else "aşağı"
-                    msg = (f"<b>#{symbol}</b>\n\nFiyat: <b>{current_price:.4f}</b>\nHedef: <b>{target:.4f}</b> ({target_pct:+.1f}%)\nİptal: <b>{stop:.4f}</b> ({stop_pct:+.1f}%)\n\n"
-                           f"{symbol.replace('USDT','')}, <b>{poc:.4f}</b> POC direncine takıldı. Trend 1g {trend_1d}, 1s {trend_1h}. ✊\n\n"
-                           f"<b>{val:.4f}</b> seviyesinde güçlü alım duvarı var. 🧊\n\n"
-                           f"Anahtar — <b>{poc:.4f}</b> üzerinde kalıcılık. Hedef <b>{target:.4f}</b>. ⚡\n\n"
-                           f"🛡️ Stop {stop:.4f} arkasında.")
+                    msg = (f"<b>#{symbol}</b>\n\nFiyat: <b>{akilli_fiyat(current_price)}</b>\nHedef: <b>{akilli_fiyat(target)}</b> ({target_pct:+.1f}%)\nİptal: <b>{akilli_fiyat(stop)}</b> ({stop_pct:+.1f}%)\n\n"
+                           f"{symbol.replace('USDT','')}, <b>{akilli_fiyat(poc)}</b> POC direncine takıldı. Trend 1g {trend_1d}, 1s {trend_1h}. ✊\n\n"
+                           f"<b>{akilli_fiyat(val)}</b> seviyesinde güçlü alım duvarı var. 🧊\n\n"
+                           f"Anahtar — <b>{akilli_fiyat(poc)}</b> üzerinde kalıcılık. Hedef <b>{akilli_fiyat(target)}</b>. ⚡\n\n"
+                           f"🛡️ Stop {akilli_fiyat(stop)} arkasında.")
                     if tg(C, msg):
                         son_setup_sinyalleri[symbol] = time.time()
                         log("SETUP", f"🔥 SETUP SİNYALİ: {symbol}")
@@ -314,7 +323,7 @@ def setup_loop():
             time.sleep(60)
 
 # =====================================================
-# 5. MOTOR: FORMASYON VE KIRILIM AVCISI (DÜZELTİLMİŞ)
+# 5. MOTOR: FORMASYON VE KIRILIM AVCISI
 # =====================================================
 def formasyon_loop():
     log("FORMASYON", "Formasyon ve Kırılım Motoru Başladı.")
@@ -327,52 +336,40 @@ def formasyon_loop():
                 time.sleep(60)
                 continue
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FORMASYON]
-            
             for symbol in adaylar:
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 21600: continue
-                
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=50")
                 if not isinstance(klines, list) or len(klines) < 50: continue
-                
                 highs = [float(k[2]) for k in klines]
                 lows = [float(k[3]) for k in klines]
                 closes = [float(k[4]) for k in klines]
                 vols = [float(k[7]) for k in klines]
                 current_price = closes[-1]
-                
                 high_first_half = max(highs[-40:-20])
                 high_second_half = max(highs[-20:-5])
                 support_zone = min(lows[-20:])
-                
                 avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else 1
                 current_vol = vols[-1]
-                
                 if high_first_half > high_second_half and current_price > high_second_half and current_price < (support_zone * 1.20):
                     if current_vol > (avg_vol * 1.5):
-                        
                         target = high_first_half
-                        
-                        # MANTIK FİLTRESİ: Sadece hedef yukarıdaysa LONG sinyali ver
                         if target > current_price: 
                             stop = support_zone * 0.98
                             target_pct = ((target - current_price) / current_price) * 100
                             stop_pct = ((stop - current_price) / current_price) * 100
-
                             msg = (f"🚀 <b>FORMASYON SİNYALİ: {symbol.replace('USDT','')}/USDT</b>\n"
                                    f"<i>Düşen Kanal / Kama Kırılımı ve Destek Dönüşü!</i>\n\n"
                                    f"📈 <b>Yön:</b> LONG (Spot Alım)\n"
-                                   f"💰 <b>Giriş (Güncel Fiyat):</b> {current_price:.4f}\n"
-                                   f"🎯 <b>Hedef (Big Move):</b> {target:.4f} (<b>{target_pct:+.1f}%</b>)\n"
-                                   f"🛑 <b>Stop-Loss:</b> {stop:.4f} ({stop_pct:+.1f}%)\n\n"
+                                   f"💰 <b>Giriş (Güncel Fiyat):</b> {akilli_fiyat(current_price)}\n"
+                                   f"🎯 <b>Hedef (Big Move):</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
+                                   f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
                                    f"📊 <b>Hacim:</b> {current_vol:.0f} (Ortalamanın {current_vol/avg_vol:.1f} katı)\n"
-                                   f"🛡️ <b>Destek Bölgesi:</b> {support_zone:.4f}\n\n"
-                                   f"💡 <b>Analiz:</b> Fiyat uzun süredir düşen bir kanal içindeydi. {support_zone:.4f} seviyesindeki güçlü destek bölgesinden tepki aldı ve şu an direnci kırıp yukarı ivme kazanıyor. <b>Buy and hold (Al ve Tut)!</b> 📈\n\n"
+                                   f"🛡️ <b>Destek Bölgesi:</b> {akilli_fiyat(support_zone)}\n\n"
+                                   f"💡 <b>Analiz:</b> Fiyat uzun süredir düşen bir kanal içindeydi. {akilli_fiyat(support_zone)} seviyesindeki güçlü destek bölgesinden tepki aldı ve şu an direnci kırıp yukarı ivme kazanıyor. <b>Buy and hold (Al ve Tut)!</b> 📈\n\n"
                                    f"<i>Bu tarz sinyaller haftada 1-2 kez gelir, büyük hareket potansiyeli taşır.</i>")
-                            
                             if tg(C, msg):
                                 son_formasyon_sinyalleri[symbol] = time.time()
                                 log("FORMASYON", f"🔥 KIRILIM SİNYALİ: {symbol}")
-                
                 time.sleep(0.1)
             time.sleep(FORMASYON_ARALIGI)
         except Exception as e:
@@ -385,7 +382,6 @@ def formasyon_loop():
 def bollinger_loop():
     log("BOLLINGER", "Haftalık Bollinger Bandı Motoru Başladı.")
     time.sleep(60) 
-    
     while True:
         try:
             log("BOLLINGER", "Haftalık Bollinger Sıkışmaları (Squeeze) taranıyor...")
@@ -393,70 +389,129 @@ def bollinger_loop():
             if not isinstance(tickers, list):
                 time.sleep(60)
                 continue
-            
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_BOLLINGER]
-
             for symbol in adaylar:
                 if symbol in son_bollinger_sinyalleri and time.time() - son_bollinger_sinyalleri[symbol] < 259200: continue
-
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1w&limit=50")
                 if not isinstance(klines, list) or len(klines) < 25: continue
-
                 closes = [float(k[4]) for k in klines[:-1]]
                 vols = [float(k[7]) for k in klines[:-1]]
                 current_price = closes[-1]
-
                 if len(closes) < 21: continue
-
                 bb = calculate_bollinger(closes, 20, 2)
                 if not bb: continue
-
                 bandwidth_history = []
                 for i in range(10, 0, -1):
                     past_closes = closes[:-i]
                     past_bb = calculate_bollinger(past_closes, 20, 2)
-                    if past_bb:
-                        bandwidth_history.append(past_bb["bandwidth"])
-
+                    if past_bb: bandwidth_history.append(past_bb["bandwidth"])
                 if not bandwidth_history: continue
-                
                 avg_bandwidth = sum(bandwidth_history) / len(bandwidth_history)
                 is_squeeze = bb["bandwidth"] < (avg_bandwidth * 0.6)
-
                 if is_squeeze:
                     avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 1
                     current_vol = vols[-1]
                     vol_surge = current_vol > (avg_vol * 1.2)
-
                     if bb["signal"] and vol_surge:
                         yon = "AL (Yukarı Kırılım)" if "AL" in bb["signal"] else "SAT (Aşağı Kırılım)"
                         emoji = "🚀" if "AL" in bb["signal"] else "🔴"
-                        
                         target = bb["upper"] if "AL" in bb["signal"] else bb["lower"]
                         target_pct = ((target - current_price) / current_price) * 100
-                        
                         sl = bb["lower"] if "AL" in bb["signal"] else bb["upper"]
                         sl_pct = ((sl - current_price) / current_price) * 100
-
                         msg = (f"{emoji} <b>HAFTALIK BOLLINGER SİNYALİ: {symbol}</b>\n"
                                f"<i>Haftalık Squeeze (Sıkışma) ve Kırılım!</i>\n\n"
-                               f"💰 <b>Kapanış Fiyatı:</b> {current_price:.4f}\n"
-                               f"🎯 <b>Hedef Bant:</b> {target:.4f} (<b>{target_pct:+.1f}%</b>)\n"
-                               f"🛑 <b>Stop Bant:</b> {sl:.4f} ({sl_pct:+.1f}%)\n\n"
+                               f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(current_price)}\n"
+                               f"🎯 <b>Hedef Bant:</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
+                               f"🛑 <b>Stop Bant:</b> {akilli_fiyat(sl)} ({sl_pct:+.1f}%)\n\n"
                                f"📊 <b>Bant Durumu:</b> Sıkışma Tespit Edildi\n"
                                f"📈 <b>Hacim:</b> {current_vol:.0f} (Ortalamanın {current_vol/avg_vol:.1f} katı)\n\n"
                                f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Bu hafta kapanış itibariyle <b>{yon}</b> gerçekleşti ve hacim patladı. Haftalık kırılımlar aylarca sürebilecek büyük trendlerin başlangıcıdır. <b>{'Long' if 'AL' in bb['signal'] else 'Short'} pozisyon açılabilir.</b>")
-                        
                         if tg(C, msg):
                             son_bollinger_sinyalleri[symbol] = time.time()
                             log("BOLLINGER", f"🔥 SQUEEZE KIRILIMI: {symbol} ({yon})")
-
                 time.sleep(0.15) 
-
-            log("BOLLINGER", "Tarama bitti, 1 saat bekleniyor.")
             time.sleep(BOLLINGER_ARALIGI)
         except Exception as e:
             log("BOLLINGER", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# 7. MOTOR: MAKRO DİP DÖNÜŞÜ VE KIRILIM (PEPE GRAFİĞİ)
+# =====================================================
+def macro_loop():
+    log("MACRO", "Makro Kırılım Motoru Başladı (Günlük).")
+    time.sleep(75) 
+    while True:
+        try:
+            log("MACRO", "Günlük dip dönüşleri ve makro kırılımlar taranıyor...")
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list):
+                time.sleep(60)
+                continue
+            
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MACRO]
+
+            for symbol in adaylar:
+                if symbol in son_macro_sinyalleri and time.time() - son_macro_sinyalleri[symbol] < 172800: continue # 2 gün bekle
+
+                # 1 Günlük (1d) grafikte son 100 günü çek
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=100")
+                if not isinstance(klines, list) or len(klines) < 100: continue
+
+                closes = [float(k[4]) for k in klines]
+                highs = [float(k[2]) for k in klines]
+                lows = [float(k[3]) for k in klines]
+                vols = [float(k[7]) for k in klines]
+                current_price = closes[-1]
+
+                # 50 ve 100 günlük hareketli ortalamaları hesapla (SMA)
+                sma50 = sum(closes[-50:]) / 50
+                sma100 = sum(closes[-100:]) / 100
+                
+                # Önceki günün ortalamaları (Kesişim kontrolü için)
+                prev_sma50 = sum(closes[-51:-1]) / 50
+                prev_sma100 = sum(closes[-101:-1]) / 100
+
+                avg_vol = sum(vols[-20:-1]) / 19
+                current_vol = vols[-1]
+
+                # KIRILIM MANTIĞI:
+                # 1. Fiyat uzun süredir düşüşteydi (SMA50, SMA100'ün altındaydı)
+                # 2. Fiyat şu an SMA50'yi yukarı kırıyor VE SMA50, SMA100'e yaklaşıyor (Dip dönüşü emaresi)
+                # 3. Hacim ortalamanın üstünde
+                is_downtrend = prev_sma50 < prev_sma100
+                is_breakout = current_price > sma50 and closes[-2] <= prev_sma50
+                
+                if is_downtrend and is_breakout and current_vol > (avg_vol * 1.5):
+                    # Hedef: Son 100 günün zirvesi veya %30 yukarısı
+                    target = max(highs) 
+                    if target < current_price * 1.20: # Eğer zirve çok yakınsa, %30 koy
+                        target = current_price * 1.30
+                        
+                    target_pct = ((target - current_price) / current_price) * 100
+                    stop = min(lows[-30:]) * 0.95 # Son 30 günün dibi
+                    stop_pct = ((stop - current_price) / current_price) * 100
+
+                    msg = (f"🛒 <b>MAKRO DİP DÖNÜŞÜ: {symbol.replace('USDT','')}/USDT</b>\n"
+                           f"<i>Günlük Trend Kırılımı (Buy & Hold)</i>\n\n"
+                           f"📈 <b>Yön:</b> SPOT (Uzun Vade)\n"
+                           f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
+                           f"🎯 <b>Hedef (Big Move):</b> {akilli_fiyat(target)} (<b>{target_pct:+.1f}%</b>)\n"
+                           f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
+                           f"💡 <b>Analiz:</b> {symbol.replace('USDT','')} uzun süredir düşen bir trenddeydi. Bugün 50 günlük hareketli ortalamayı (SMA50) hacimle yukarı kırdı. Bu, büyük balinaların birikim yaptığının ve trendin yukarı döndüğünün en güçlü işaretidir. <b>Buy and hold big Move soon! 🚀🍕</b>\n\n"
+                           f"<i>Bu sinyal haftada/ayda 1 kez gelir, en sağlam spot fırsatıdır.</i>")
+                    
+                    if tg(C, msg):
+                        son_macro_sinyalleri[symbol] = time.time()
+                        log("MACRO", f"🔥 MAKRO KIRILIM SİNYALİ: {symbol}")
+
+                time.sleep(0.2)
+
+            log("MACRO", "Tarama bitti, 2 saat bekleniyor.")
+            time.sleep(MACRO_ARALIGI)
+        except Exception as e:
+            log("MACRO", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
@@ -466,7 +521,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Hexa-Engine Bot is running!")
+        self.wfile.write(b"Sept-Engine Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -479,12 +534,12 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
-    # Tüm motorları başlat
     threading.Thread(target=midas_flow_loop, daemon=True).start()
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
     threading.Thread(target=setup_loop, daemon=True).start()
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=bollinger_loop, daemon=True).start()
+    threading.Thread(target=macro_loop, daemon=True).start() # YENİ: PEPE tarzı Makro Kırılım
     
     run_web_server()
