@@ -7,6 +7,7 @@ import os
 import threading
 import http.server
 import socketserver
+import math
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
@@ -26,19 +27,22 @@ RAPOR_ARALIGI = 3600
 CHARTIST_ARALIGI = 3600    
 PUMP_ARALIGI = 60          
 SETUP_ARALIGI = 900        
-FORMASYON_ARALIGI = 1800   # YENİ: 30 dakikada bir formasyon tarar (1h grafik için yeterli)
+FORMASYON_ARALIGI = 1800   
+BOLLINGER_ARALIGI = 3600   # Haftalık grafik için 1 saatte 1 tarama yeterli
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_24H_PUMP = 5_000_000  
 MIN_HACIM_ARTISI = 20_000       
 MIN_HACIM_SETUP = 20_000_000    
-MIN_HACIM_FORMASYON = 15_000_000 # Formasyon için min likidite
+MIN_HACIM_FORMASYON = 15_000_000 
+MIN_HACIM_BOLLINGER = 20_000_000 # Haftalık BB için çok likit coinler şart
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
 son_setup_sinyalleri = {}
-son_formasyon_sinyalleri = {} # YENİ
+son_formasyon_sinyalleri = {}
+son_bollinger_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -101,6 +105,51 @@ def get_market_trend(tickers):
         return trend, avg_change, up_count, down_count
     except:
         return "Bilinmiyor", 0, 0, 0
+
+# =====================================================
+# BOLLINGER BANDI HESAPLAYICI (YENİ)
+# =====================================================
+
+def calculate_bollinger(closes, period=20, num_std=2):
+    """Haftalık kapanışlara göre BB hesaplar. Son kapanan mumu ve bant genişliğini döner."""
+    if len(closes) < period:
+        return None
+    
+    # Son 'period' kadar kapanışı al
+    recent_closes = closes[-period:]
+    
+    # SMA (Orta Bant)
+    sma = sum(recent_closes) / period
+    
+    # Standart Sapma
+    variance = sum((x - sma) ** 2 for x in recent_closes) / period
+    std_dev = math.sqrt(variance)
+    
+    # Bantlar
+    upper_band = sma + (num_std * std_dev)
+    lower_band = sma - (num_std * std_dev)
+    
+    # Bant Genişliği (Squeeze ölçümü için)
+    bandwidth = (upper_band - lower_band) / sma
+    
+    # Kapanış fiyatı
+    current_close = closes[-1]
+    
+    # Sinyal belirleme
+    signal = None
+    if current_close > upper_band:
+        signal = "AL (Kırılım)"
+    elif current_close < lower_band:
+        signal = "SAT (Kırılım)"
+    
+    return {
+        "sma": sma,
+        "upper": upper_band,
+        "lower": lower_band,
+        "bandwidth": bandwidth,
+        "close": current_close,
+        "signal": signal
+    }
 
 # =====================================================
 # 1. MOTOR: MİDAS FLOW (RAPOR + PİYASA YÖNÜ)
@@ -297,12 +346,12 @@ def setup_loop():
             time.sleep(60)
 
 # =====================================================
-# 5. MOTOR: FORMASYON VE KIRILIM AVCISI (YENİ)
+# 5. MOTOR: FORMASYON VE KIRILIM AVCISI
 # =====================================================
 
 def formasyon_loop():
     log("FORMASYON", "Formasyon ve Kırılım Motoru Başladı.")
-    time.sleep(45) # Diğer motorlarla çakışmasın diye
+    time.sleep(45) 
     while True:
         try:
             log("FORMASYON", "Düşen kanal ve destek kırılımları taranıyor...")
@@ -310,53 +359,27 @@ def formasyon_loop():
             if not isinstance(tickers, list):
                 time.sleep(60)
                 continue
-            
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FORMASYON]
-
             for symbol in adaylar:
-                if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 21600: # 6 saat bekle
-                    continue
-
-                # 1 Saatlik grafikte son 50 mumu al
+                if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 21600: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=50")
                 if not isinstance(klines, list) or len(klines) < 50: continue
-
                 highs = [float(k[2]) for k in klines]
                 lows = [float(k[3]) for k in klines]
                 closes = [float(k[4]) for k in klines]
                 vols = [float(k[7]) for k in klines]
                 current_price = closes[-1]
-
-                # Basit Düşen Kanal Tespiti:
-                # Son 3 tepe noktası (pivot high) düşüyor mu?
-                # Basitleştirme: Son 30 mumun ilk 15'indeki en yüksek, son 15'indeki en yüksekten büyükse (düşüş trendi)
                 high_first_half = max(highs[-40:-20])
                 high_second_half = max(highs[-20:-5])
-                
-                # Destek Bölgesi (Yeşil Kutu): Son 20 mumun en düşüğü
                 support_zone = min(lows[-20:])
-
-                # Ortalama Hacim
                 avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else 1
                 current_vol = vols[-1]
-
-                # KIRILIM ŞARTLARI:
-                # 1. Düşen trend olmalı (high_first_half > high_second_half)
-                # 2. Fiyat direnci kırmalı (current_price > high_second_half)
-                # 3. Destekten çok uzak olmamalı (current_price < support_zone * 1.15) - Yani daha yeni dönmüş olmalı
-                # 4. Hacim artmalı (current_vol > avg_vol * 1.5)
-                
                 if high_first_half > high_second_half and current_price > high_second_half and current_price < (support_zone * 1.20):
                     if current_vol > (avg_vol * 1.5):
-                        
-                        # Hedef: Düşen kanalın başlangıç noktası (high_first_half) veya fibonacci uzantısı
                         target = high_first_half
                         target_pct = ((target - current_price) / current_price) * 100
-                        
-                        # Stop: Kırılan direncin (veya destek bölgesinin) hemen altı
                         stop = support_zone * 0.98
                         stop_pct = ((stop - current_price) / current_price) * 100
-
                         msg = (f"🚀 <b>FORMASYON SİNYALİ: {symbol.replace('USDT','')}/USDT</b>\n"
                                f"<i>Düşen Kanal / Kama Kırılımı ve Destek Dönüşü!</i>\n\n"
                                f"💰 <b>Giriş (Güncel Fiyat):</b> {current_price:.4f}\n"
@@ -366,17 +389,106 @@ def formasyon_loop():
                                f"🛡️ <b>Destek Bölgesi:</b> {support_zone:.4f}\n\n"
                                f"💡 <b>Analiz:</b> Fiyat uzun süredir düşen bir kanal içindeydi. {support_zone:.4f} seviyesindeki güçlü destek bölgesinden (yeşil kutu) tepki aldı ve şu an direnci kırıp yukarı ivme kazanıyor. <b>Buy and hold!</b> 📈\n\n"
                                f"<i>Bu tarz sinyaller haftada 1-2 kez gelir, büyük hareket potansiyeli taşır.</i>")
-                        
                         if tg(C, msg):
                             son_formasyon_sinyalleri[symbol] = time.time()
                             log("FORMASYON", f"🔥 KIRILIM SİNYALİ: {symbol}")
-                
                 time.sleep(0.1)
-            
-            log("FORMASYON", "Tarama bitti, 30 dk bekleniyor.")
             time.sleep(FORMASYON_ARALIGI)
         except Exception as e:
             log("FORMASYON", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# 6. MOTOR: BOLLINGER BANDI (HAFTALIK SQUEEZE & KIRILIM) - YENİ
+# =====================================================
+
+def bollinger_loop():
+    log("BOLLINGER", "Haftalık Bollinger Bandı Motoru Başladı.")
+    time.sleep(60) # Diğer motorlarla çakışmasın diye
+    
+    while True:
+        try:
+            log("BOLLINGER", "Haftalık Bollinger Sıkışmaları (Squeeze) taranıyor...")
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list):
+                time.sleep(60)
+                continue
+            
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_BOLLINGER]
+
+            for symbol in adaylar:
+                # Aynı coin için 3 gün boyunca yeni sinyal atma
+                if symbol in son_bollinger_sinyalleri and time.time() - son_bollinger_sinyalleri[symbol] < 259200: 
+                    continue
+
+                # Haftalık (1w) grafikte son 50 mumu çek
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1w&limit=50")
+                if not isinstance(klines, list) or len(klines) < 25: continue
+
+                # Son kapanmış haftalık mumu kullan (Yalan kırılımları önler)
+                closes = [float(k[4]) for k in klines[:-1]]
+                vols = [float(k[7]) for k in klines[:-1]]
+                current_price = closes[-1]
+
+                if len(closes) < 21: continue
+
+                # BB Hesapla
+                bb = calculate_bollinger(closes, 20, 2)
+                if not bb: continue
+
+                # Sıkışma (Squeeze) Tespiti: Mevcut bant genişliği son 10 haftanın en düşük seviyelerine yakın mı?
+                # Bunu anlamak için son 10 mumun bant genişliklerini hesaplıyoruz
+                bandwidth_history = []
+                for i in range(10, 0, -1):
+                    past_closes = closes[:-i]
+                    past_bb = calculate_bollinger(past_closes, 20, 2)
+                    if past_bb:
+                        bandwidth_history.append(past_bb["bandwidth"])
+
+                if not bandwidth_history: continue
+                
+                min_bandwidth = min(bandwidth_history)
+                avg_bandwidth = sum(bandwidth_history) / len(bandwidth_history)
+
+                # Eğer mevcut bant genişliği, son 10 haftanın ortalamasının %60'ından küçükse (Sıkışma var)
+                is_squeeze = bb["bandwidth"] < (avg_bandwidth * 0.6)
+
+                if is_squeeze:
+                    # Hacim Teyidi (Son haftanın hacmi ortalamanın üzerinde mi?)
+                    avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 1
+                    current_vol = vols[-1]
+                    vol_surge = current_vol > (avg_vol * 1.2) # %20 hacim artışı
+
+                    if bb["signal"] and vol_surge:
+                        yon = "AL (Yukarı Kırılım)" if "AL" in bb["signal"] else "SAT (Aşağı Kırılım)"
+                        emoji = "🚀" if "AL" in bb["signal"] else "🔴"
+                        
+                        # Hedefler (Bant genişliği kadar hareket beklentisi)
+                        target = bb["upper"] if "AL" in bb["signal"] else bb["lower"]
+                        target_pct = ((target - current_price) / current_price) * 100
+                        
+                        sl = bb["lower"] if "AL" in bb["signal"] else bb["upper"]
+                        sl_pct = ((sl - current_price) / current_price) * 100
+
+                        msg = (f"{emoji} <b>HAFTALIK BOLLINGER SİNYALİ: {symbol}</b>\n"
+                               f"<i>Haftalık Squeeze (Sıkışma) ve Kırılım!</i>\n\n"
+                               f"💰 <b>Kapanış Fiyatı:</b> {current_price:.4f}\n"
+                               f"🎯 <b>Hedef Bant:</b> {target:.4f} (<b>{target_pct:+.1f}%</b>)\n"
+                               f"🛑 <b>Stop Bant:</b> {sl:.4f} ({sl_pct:+.1f}%)\n\n"
+                               f"📊 <b>Bant Durumu:</b> Sıkışma Tespit Edildi (Genişlik: {bb['bandwidth']:.4f})\n"
+                               f"📈 <b>Hacim:</b> {current_vol:.0f} (Ortalamanın {current_vol/avg_vol:.1f} katı)\n\n"
+                               f"💡 <b>Analiz:</b> Fiyat haftalardır daralan bir bant içindeydi. Bu hafta kapanış itibariyle <b>{yon}</b> gerçekleşti ve hacim patladı. Haftalık kırılımlar aylarca sürebilecek büyük trendlerin başlangıcıdır. <b>{'Long' if 'AL' in bb['signal'] else 'Short'} pozisyon açılabilir.</b>")
+                        
+                        if tg(C, msg):
+                            son_bollinger_sinyalleri[symbol] = time.time()
+                            log("BOLLINGER", f"🔥 SQUEEZE KIRILIMI: {symbol} ({yon})")
+
+                time.sleep(0.15) # API'yi yormamak için
+
+            log("BOLLINGER", "Tarama bitti, 1 saat bekleniyor.")
+            time.sleep(BOLLINGER_ARALIGI)
+        except Exception as e:
+            log("BOLLINGER", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
@@ -386,7 +498,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Quint-Engine Bot is running!")
+        self.wfile.write(b"Hexa-Engine Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -403,8 +515,9 @@ if __name__ == "__main__":
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
     threading.Thread(target=setup_loop, daemon=True).start()
-    
-    # YENİ MOTOR: Formasyon Avcısı
     threading.Thread(target=formasyon_loop, daemon=True).start()
+    
+    # YENİ MOTOR: Bollinger Bandı (Haftalık)
+    threading.Thread(target=bollinger_loop, daemon=True).start()
     
     run_web_server()
