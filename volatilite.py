@@ -25,16 +25,17 @@ BASE = "https://api.binance.com"
 # MOTOR ÇALIŞMA SÜRELERİ
 RAPOR_ARALIGI = 3600       
 CHARTIST_ARALIGI = 3600    
-SETUP_ARALIGI = 1800       
+PUMP_ARALIGI = 60          # Anlık pump avcısı 1 dakikada 1 tarama yapar
 BOLLINGER_ARALIGI = 3600   
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
-MIN_HACIM_SETUP = 15_000_000    
 MIN_HACIM_BOLLINGER = 20_000_000 
+MIN_HACIM_PUMP = 5_000_000     # Sahte sinyalleri engellemek için 5 Milyon Dolar barajı
+MIN_HACIM_ARTISI = 50_000      # Hacim en az 50 Bin Dolar artmalı
 
 son_sinyaller = {}
-son_setup_sinyalleri = {}
+son_pump_sinyalleri = {}
 son_bollinger_sinyalleri = {}
 
 # =====================================================
@@ -54,6 +55,12 @@ def akilli_fiyat(p):
     if p >= 1: return f"{p:.4f}"
     if p >= 0.01: return f"{p:.6f}"
     return f"{p:.8f}"
+
+def format_hacim(v):
+    if v >= 1_000_000_000: return f"{v/1_000_000_000:.2f}B"
+    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
+    if v >= 1_000: return f"{v/1_000:.2f}K"
+    return f"{v:.0f}"
 
 def tg(chat_id, message):
     if not T or not chat_id: return False
@@ -249,7 +256,6 @@ def chartist_loop():
                     prev_close = closes[-2]
                     if prev_close <= prev_ema200 and current_price > curr_ema200:
                         sl = curr_ema200 * 0.97 
-                        # YÖN: LONG EKLENDİ
                         msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ (LONG): {symbol}</b>\n"
                                f"<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
                                f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
@@ -265,10 +271,10 @@ def chartist_loop():
             time.sleep(60)
 
 # =====================================================
-# 3. MOTOR: POC / VAH / VAL SETUP ANALİZİ (SHORT)
+# 3. MOTOR: ANLIK PUMP AVCISI (Görseldeki Format)
 # =====================================================
-def setup_loop():
-    log("SETUP", "POC / VAH / VAL Setup Analiz Motoru Başladı.")
+def pump_loop():
+    log("PUMP", "Anlık Pump Avcısı Başladı.")
     time.sleep(30)
     while True:
         try:
@@ -276,70 +282,51 @@ def setup_loop():
             if not isinstance(tickers, list):
                 time.sleep(60)
                 continue
-            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SETUP]
+            
+            # Sahte sinyalleri engellemek için 5M Dolar üzeri hacmi olanlar
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_PUMP]
             
             for symbol in adaylar:
-                if symbol in son_setup_sinyalleri and time.time() - son_setup_sinyalleri[symbol] < 14400: continue
+                if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900: continue # 15 dk bekle
                 
-                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=50")
-                if not isinstance(klines, list) or len(klines) < 50: continue
+                # 5 dakikalık grafikte son 2 kapanmış mum
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=5m&limit=3")
+                if not isinstance(klines, list) or len(klines) < 3: continue
                 
-                highs = [float(k[2]) for k in klines]
-                lows = [float(k[3]) for k in klines]
-                closes = [float(k[4]) for k in klines]
-                vols = [float(k[7]) for k in klines]
+                curr_k, prev_k = klines[-2], klines[-3]
+                curr_close, prev_close = float(curr_k[4]), float(prev_k[4])
+                curr_vol, prev_vol = float(curr_k[7]), float(prev_k[7])
                 
-                current_price = closes[-1]
-                recent_highs = highs[-24:]
-                recent_lows = lows[-24:]
-                recent_vols = vols[-24:]
+                if prev_close == 0 or prev_vol == 0: continue
                 
-                vah = max(recent_highs)
-                val = min(recent_lows)
-                poc_idx = recent_vols.index(max(recent_vols))
-                poc = closes[-24 + poc_idx] 
+                price_change = ((curr_close - prev_close) / prev_close) * 100
+                vol_change = ((curr_vol - prev_vol) / prev_vol) * 100
+                vol_diff = curr_vol - prev_vol
                 
-                # Fiyat POC seviyesine çok yakınsa veya altına sarktıysa (SHORT Senaryosu)
-                if current_price <= poc * 1.01 and current_price < vah:
+                # Sinyal Şartı: Fiyat %3+ ve Hacim %100+ artmış VE Hacim farkı en az 50 Bin Dolar
+                if price_change >= 3.0 and vol_change >= 100.0 and vol_diff >= MIN_HACIM_ARTISI:
                     
-                    low_1h = min(lows[-1:])
-                    low_4h = min(lows[-4:])
-                    
-                    hedefler = sorted(list(set([low_1h, low_4h, val])), reverse=True)
-                    hedefler = [h for h in hedefler if h < current_price]
-                    
-                    if len(hedefler) >= 3:
-                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[2]
-                    elif len(hedefler) == 2:
-                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[1] * 0.98
-                    else:
-                        continue 
-                    
-                    stop = vah * 1.02 
-                    
-                    tp1_pct = ((tp1 - current_price) / current_price) * 100
-                    tp2_pct = ((tp2 - current_price) / current_price) * 100
-                    tp3_pct = ((tp3 - current_price) / current_price) * 100
-                    stop_pct = ((stop - current_price) / current_price) * 100
-
                     coin = symbol.replace("USDT", "")
+                    now_time = simdi().strftime('%I:%M:%S %p')
                     
-                    # YÖN: SHORT EKLENDİ
-                    msg = (f"🔻 <b>SETUP SİNYALİ (SHORT): {symbol}</b>\n\n"
-                           f"Fiyat: <b>{akilli_fiyat(current_price)}</b>\n"
-                           f"Hedefler: <b>{akilli_fiyat(tp1)}</b> ({tp1_pct:+.1f}%) → <b>{akilli_fiyat(tp2)}</b> ({tp2_pct:+.1f}%) → <b>{akilli_fiyat(tp3)}</b> ({tp3_pct:+.1f}%)\n"
-                           f"İptal: <b>{akilli_fiyat(stop)}</b> ({stop_pct:+.1f}%) üzerinde\n\n"
-                           f"{coin}, <b>VAH {akilli_fiyat(vah)}</b> ile <b>VAL {akilli_fiyat(val)}</b> arasında havada asılı kaldı. Merkezde <b>POC {akilli_fiyat(poc)}</b> var ve şu an hakem konumunda. Fiyat <b>{akilli_fiyat(current_price)}</b> ile onun üzerinde tutunmaya çalışıyor ancak yukarı ivme zayıf. 🧊\n\n"
-                           f"Kilit ayrım: POC kaybı aşağıya ilk olarak 1s dip <b>{akilli_fiyat(low_1h)}</b> ve 4s dip <b>{akilli_fiyat(low_4h)}</b> yolunu açar. Akış borsalarda senkronize, zayıflık devam ederse VAL <b>{akilli_fiyat(val)}</b> hedefe girer. 🎯")
+                    # GÖRSELDEKİ BİREBİR FORMAT
+                    msg = (f"🚀 <b>Pump - {coin}/USDT [Binance]</b>\n"
+                           f"💰 <b>Price:</b> {akilli_fiyat(prev_close)} ➔ {akilli_fiyat(curr_close)} (<b>{price_change:+.1f}%</b>)\n"
+                           f"📊 <b>Volume:</b> {format_hacim(curr_vol)} (<b>{vol_change:+.0f}%</b>)\n"
+                           f"Volume increased by {format_hacim(vol_diff)} ⬆️\n"
+                           f"Time: {now_time} 🕐\n\n"
+                           f"🔗 <a href='https://www.binance.com/en/trade/{symbol}?type=spot'>Pair on Binance.</a>\n"
+                           f"🔗 <a href='https://www.bybit.com/en-US/trade/spot/{symbol}'>Pair on Bybit.</a>\n\n"
+                           f"<b>${coin} #{coin}</b>")
                     
                     if tg(C, msg):
-                        son_setup_sinyalleri[symbol] = time.time()
-                        log("SETUP", f"🔥 POC SETUP SİNYALİ: {symbol}")
+                        son_pump_sinyalleri[symbol] = time.time()
+                        log("PUMP", f"🔥 PUMP SİNYALİ: {symbol} ({price_change:+.1f}%)")
                 
-                time.sleep(0.1)
-            time.sleep(SETUP_ARALIGI)
+                time.sleep(0.05)
+            time.sleep(PUMP_ARALIGI)
         except Exception as e:
-            log("SETUP", f"Hata: {e}")
+            log("PUMP", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
@@ -382,7 +369,6 @@ def bollinger_loop():
                 is_squeeze = bb["bandwidth"] < (avg_bandwidth * 0.6)
 
                 if is_squeeze:
-                    # YÖN: LONG VEYA SHORT BELİRLEMESİ
                     yon = "LONG (Yukarı Kırılım)" if "AL" in bb["signal"] else "SHORT (Aşağı Kırılım)"
                     emoji = "🚀" if "AL" in bb["signal"] else "🔴"
                     
@@ -418,7 +404,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Turkish Ultimate Bot is running!")
+        self.wfile.write(b"Ultimate Pump Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -433,7 +419,7 @@ def run_web_server():
 if __name__ == "__main__":
     threading.Thread(target=midas_flow_loop, daemon=True).start()
     threading.Thread(target=chartist_loop, daemon=True).start()
-    threading.Thread(target=setup_loop, daemon=True).start()
+    threading.Thread(target=pump_loop, daemon=True).start()
     threading.Thread(target=bollinger_loop, daemon=True).start()
     
     run_web_server()
