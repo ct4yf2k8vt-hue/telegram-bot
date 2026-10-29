@@ -30,7 +30,7 @@ SETUP_ARALIGI = 900
 FORMASYON_ARALIGI = 1800   
 BOLLINGER_ARALIGI = 3600   
 MACRO_ARALIGI = 7200       
-AGRESIF_ARALIGI = 30       # 30 saniyede bir agresif tarama
+AGRESIF_ARALIGI = 30       
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -40,7 +40,7 @@ MIN_HACIM_SETUP = 20_000_000
 MIN_HACIM_FORMASYON = 15_000_000 
 MIN_HACIM_BOLLINGER = 20_000_000 
 MIN_HACIM_MACRO = 10_000_000
-MIN_HACIM_AGRESIF = 1_000_000   # Agresif mod için 1 Milyon Dolar
+MIN_HACIM_AGRESIF = 1_000_000   
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
@@ -160,14 +160,14 @@ def get_cvd_oi_teyit(symbol):
         if oi_artiyor and alici_baskin:
             return f"\n🐋 <b>BALİNA TEYİDİ (CVD+OI):</b> YENİ LONG'lar girdi! (OI: {oi_text}, {taker_text})"
         elif alici_baskin:
-            return f"\n⚖️ <b>Kısmi Teyit:</b> Alıcı baskısı var ama OI artmamış. (OI: {oi_text})"
+            return f"\n⚖️ <b>Kısmi Teyit:</b> Alıcı baskısı var ama OI artmamış."
         else:
-            return f"\n⚠️ <b>Zayıf Teyit:</b> Alıcılar zayıf. (OI: {oi_text})"
+            return f"\n⚠️ <b>Zayıf Teyit:</b> Alıcılar zayıf."
     except:
         return ""
 
 # =====================================================
-# 1. MOTOR: MİDAS FLOW (RAPOR)
+# 1. MOTOR: MİDAS FLOW (RAPOR + GÜNÜN KAZANANI)
 # =====================================================
 def get_peak_time(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
@@ -186,6 +186,38 @@ def get_peak_time(symbol):
     except:
         return "0"
 
+def get_winner_of_the_day(symbol):
+    klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
+    if not isinstance(klines, list) or len(klines) < 24: return None
+    try:
+        entry_time, peak_time, entry_price, peak_price = 0, 0, float('inf'), 0
+        for k in klines:
+            if float(k[3]) < entry_price:
+                entry_price = float(k[3])
+                entry_time = int(k[0])
+            if float(k[2]) > peak_price:
+                peak_price = float(k[2])
+                peak_time = int(k[0])
+                
+        duration = (peak_time - entry_time) / (1000 * 60 * 60)
+        if duration <= 0: duration = 0.1
+        
+        max_pct = ((peak_price - entry_price) / entry_price) * 100
+        
+        entry_dt = datetime.fromtimestamp(entry_time / 1000, timezone.utc)
+        peak_dt = datetime.fromtimestamp(peak_time / 1000, timezone.utc)
+        
+        return {
+            "entry_time": entry_dt.strftime("%H:%M"),
+            "entry_price": entry_price,
+            "peak_time": peak_dt.strftime("%H:%M"),
+            "peak_price": peak_price,
+            "duration": duration,
+            "max_pct": max_pct
+        }
+    except:
+        return None
+
 def midas_flow_loop():
     log("RAPOR", "Midas Flow Motoru Başladı.")
     time.sleep(5)
@@ -196,25 +228,47 @@ def midas_flow_loop():
             if not isinstance(tickers, list):
                 time.sleep(300)
                 continue
+            
             trend_text, avg_chg, ups, downs = get_market_trend(tickers)
             usdt_pairs = [t for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 5_000_000]
             usdt_pairs.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
             top_5 = usdt_pairs[:5]
+
             if top_5:
                 msg = "🔥 <b>24 saatteki en iyi hareketler</b>\n"
                 msg += f"\n🌍 <b>Piyasa Yönü (24s):</b> {trend_text}\n"
                 msg += f"📊 Ortalama Değişim: %{avg_chg:.2f} | Yükselen: {ups} | Düşen: {downs}\n\n"
                 msg += "sinyal yönündeki maksimum hareket, veritabanımıza göre:\n\n"
+                
                 medals = ["🥇", "🥈", "🥉", "🏅", "⭐️"]
+                hashtags = ""
                 for i, t in enumerate(top_5):
                     symbol = t['symbol'].replace("USDT", "")
                     change = float(t['priceChangePercent'])
                     change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
                     peak = get_peak_time(t['symbol'])
                     msg += f"{medals[i]} {symbol} {change_str} · {peak} saatte zirve\n"
-                msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app"
+                    hashtags += f"#{symbol} "
+
+                msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app\n\n"
+                msg += f"<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #crypto #pump #signals</a>"
                 tg(C, msg)
                 log("RAPOR", "Saatlik rapor gönderildi.")
+                
+                # --- GÜNÜN KAZANANI (YENİ) ---
+                time.sleep(2) # Mesajlar arası kısa bekleme
+                winner_symbol = top_5[0]['symbol']
+                winner_data = get_winner_of_the_day(winner_symbol)
+                
+                if winner_data:
+                    coin = winner_symbol.replace("USDT", "")
+                    win_msg = (f"🏆 <b>Победа дня: {coin} +{winner_data['max_pct']:.0f}%</b>\n\n"
+                               f"{winner_data['entry_time']} UTC — памп-детектор дал сигнал: <b>{coin}USDT LONG</b> по ${akilli_fiyat(winner_data['entry_price'])}\n"
+                               f"{winner_data['peak_time']} UTC — пик ${akilli_fiyat(winner_data['peak_price'])}. +{winner_data['max_pct']:.0f}% от входа за {winner_data['duration']:.2f}ч.\n\n"
+                               f"⚠️ Ход — потенциал движения, не гарантия профита.")
+                    tg(C, win_msg)
+                    log("RAPOR", f"Günün Kazananı gönderildi: {coin}")
+
             time.sleep(RAPOR_ARALIGI)
         except Exception as e:
             log("RAPOR", f"Hata: {e}")
@@ -477,10 +531,10 @@ def macro_loop():
             time.sleep(60)
 
 # =====================================================
-# 8. MOTOR: AGRESİF PUMP (PARTI Tarzı + CVD/OI Teyitli)
+# 8. MOTOR: AGRESİF PUMP (PARTI Tarzı) - CVD/OI ÇIKARILDI
 # =====================================================
 def agresif_pump_loop():
-    log("AGRESIF", "Agresif Pump Avcısı Başladı (1m / 3%+ / CVD+OI Teyitli)")
+    log("AGRESIF", "Agresif Pump Avcısı Başladı (1m / 3%+)")
     time.sleep(15)
     while True:
         try:
@@ -507,13 +561,11 @@ def agresif_pump_loop():
                 vol_change = ((curr_vol - prev_vol) / prev_vol) * 100
 
                 if price_change >= 3.0 and vol_change >= 100.0:
-                    cvd_oi_teyit = get_cvd_oi_teyit(symbol)
                     msg = (f"⚡ <b>AGRESİF PUMP SİNYALİ (LONG): {symbol}</b>\n"
                            f"<i>Hızlı Yükseliş Yakalandı!</i>\n\n"
                            f"📈 <b>Yön:</b> LONG (Momentum)\n"
                            f"💰 <b>Fiyat:</b> ${akilli_fiyat(curr_close)} (<b>{price_change:+.2f}%</b>)\n"
-                           f"📊 <b>Hacim:</b> {vol_change:+.0f}% Artış"
-                           f"{cvd_oi_teyit}\n\n"
+                           f"📊 <b>Hacim:</b> {vol_change:+.0f}% Artış\n\n"
                            f"⚠️ <i>Bu sinyal çok hızlı gelişen pump'lar içindir. Dikkatli işlem yapın!</i>")
                     
                     if tg(C, msg):
@@ -553,8 +605,6 @@ if __name__ == "__main__":
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=bollinger_loop, daemon=True).start()
     threading.Thread(target=macro_loop, daemon=True).start()
-    
-    # 8. Motor (Agresif)
     threading.Thread(target=agresif_pump_loop, daemon=True).start()
     
     run_web_server()
