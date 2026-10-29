@@ -31,7 +31,7 @@ SETUP_ARALIGI = 900        # Setup Analizi (15 Dakika)
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_24H_PUMP = 5_000_000  
 MIN_HACIM_ARTISI = 50_000       
-MIN_HACIM_SETUP = 20_000_000    # Setup için ekstra likit coinler (20M$)
+MIN_HACIM_SETUP = 20_000_000    
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
@@ -142,15 +142,19 @@ def midas_flow_loop():
             time.sleep(60)
 
 # =====================================================
-# 2. MOTOR: DIGITAL CHARTIST (12H EMA200)
+# 2. MOTOR: DIGITAL CHARTIST (ÇOKLU ZAMAN DİLİMİ EMA200)
 # =====================================================
 
 def chartist_loop():
-    log("CHARTIST", "12H EMA200 Motoru Başladı.")
+    log("CHARTIST", "Çoklu Zaman Dilimi EMA200 Motoru Başladı.")
     time.sleep(15)
+    
+    # EKLENEN ZAMAN DİLİMLERİ
+    timeframes = ['8h', '12h', '1d', '3d']
+    
     while True:
         try:
-            log("CHARTIST", "12H EMA200 Kırılımları taranıyor...")
+            log("CHARTIST", "EMA200 Kırılımları taranıyor (8s, 12s, 1g, 3g)...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list):
                 time.sleep(60)
@@ -159,33 +163,42 @@ def chartist_loop():
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_CHARTIST]
 
             for symbol in adaylar:
-                if f"CH_{symbol}" in son_sinyaller and time.time() - son_sinyaller[f"CH_{symbol}"] < 86400: continue
+                # Her zaman dilimi için ayrı ayrı kontrol yapıyoruz
+                for tf in timeframes:
+                    # Aynı coin için aynı zaman diliminde tekrar sinyal atmamak için cooldown kontrolü
+                    cooldown_key = f"CH_{tf}_{symbol}"
+                    if cooldown_key in son_sinyaller and time.time() - son_sinyaller[cooldown_key] < 86400: 
+                        continue
 
-                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=12h&limit=210")
-                if not isinstance(klines, list) or len(klines) < 205: continue
+                    # EMA200 için yeterli mum verisi (limit=250 ideal)
+                    klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=250")
+                    if not isinstance(klines, list) or len(klines) < 205: continue
 
-                closes = [float(k[4]) for k in klines]
-                current_price = closes[-1]
-                ema200 = calculate_ema(closes, 200)
-                
-                if len(ema200) < 2: continue
-                curr_ema200 = ema200[-1]
-                prev_ema200 = ema200[-2]
-                prev_close = closes[-2]
-
-                if prev_close <= prev_ema200 and current_price > curr_ema200:
-                    tp1, tp2, tp3, tp4 = current_price * 1.05, current_price * 1.10, current_price * 1.15, current_price * 1.25
-                    sl = curr_ema200 * 0.97 
-
-                    msg = (f"📈 <b>UZUN VADELİ SPOT: {symbol}</b>\n<i>12 Saatlik EMA200 Kırılımı!</i>\n\n"
-                           f"💰 <b>Giriş:</b> {current_price:.4f}\n🛑 <b>SL:</b> {sl:.4f}\n\n"
-                           f"🎯 <b>Hedefler:</b> TP1: {tp1:.4f} | TP2: {tp2:.4f} | TP3: {tp3:.4f} | TP4: {tp4:.4f}\n\n"
-                           f"⚠️ <i>Nadir gelen büyük fırsat. Kademeli kâr al!</i>")
+                    closes = [float(k[4]) for k in klines]
+                    current_price = closes[-1]
+                    ema200 = calculate_ema(closes, 200)
                     
-                    if tg(C, msg):
-                        son_sinyaller[f"CH_{symbol}"] = time.time()
-                        log("CHARTIST", f"🔥 KIRILIM SİNYALİ: {symbol}")
-                time.sleep(0.05)
+                    if len(ema200) < 2: continue
+                    curr_ema200 = ema200[-1]
+                    prev_ema200 = ema200[-2]
+                    prev_close = closes[-2]
+
+                    # Kırılım tespiti
+                    if prev_close <= prev_ema200 and current_price > curr_ema200:
+                        tp1, tp2, tp3, tp4 = current_price * 1.05, current_price * 1.10, current_price * 1.15, current_price * 1.25
+                        sl = curr_ema200 * 0.97 
+
+                        msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ: {symbol}</b>\n"
+                               f"<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
+                               f"💰 <b>Giriş:</b> {current_price:.4f}\n🛑 <b>SL:</b> {sl:.4f}\n\n"
+                               f"🎯 <b>Hedefler:</b> TP1: {tp1:.4f} | TP2: {tp2:.4f} | TP3: {tp3:.4f} | TP4: {tp4:.4f}\n\n"
+                               f"⚠️ <i>Nadir gelen büyük fırsat. Kademeli kâr al!</i>")
+                        
+                        if tg(C, msg):
+                            son_sinyaller[cooldown_key] = time.time()
+                            log("CHARTIST", f"🔥 KIRILIM SİNYALİ ({tf.upper()}): {symbol}")
+                    
+                    time.sleep(0.05) # API'yi yormamak için
 
             log("CHARTIST", "Tarama bitti, 1 saat bekleniyor.")
             time.sleep(CHARTIST_ARALIGI)
@@ -258,7 +271,7 @@ def pump_loop():
             time.sleep(30)
 
 # =====================================================
-# 4. MOTOR: SETUP ANALİZİ (GÖRSELDEKİ TÜRKÇE FORMAT)
+# 4. MOTOR: SETUP ANALİZİ (POC / VAL)
 # =====================================================
 
 def setup_loop():
@@ -272,48 +285,37 @@ def setup_loop():
                 time.sleep(60)
                 continue
 
-            # Sadece çok likit coinlerde çalışır (20M$ üzeri)
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SETUP]
 
             for symbol in adaylar:
-                if symbol in son_setup_sinyalleri and time.time() - son_setup_sinyalleri[symbol] < 14400: # 4 saat bekle
+                if symbol in son_setup_sinyalleri and time.time() - son_setup_sinyalleri[symbol] < 14400: 
                     continue
 
-                # 1 Saatlik grafikte son 50 mumu çek (Destek/Direnç ve hacim analizi için)
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=50")
                 if not isinstance(klines, list) or len(klines) < 50: continue
 
-                # Son 24 saatin en yüksek ve en düşükleri (POC ve VAL simülasyonu)
                 highs = [float(k[2]) for k in klines[-24:]]
                 lows = [float(k[3]) for k in klines[-24:]]
                 vols = [float(k[7]) for k in klines[-24:]]
                 
-                # Hacmin en yüksek olduğu mumun direnci (POC)
                 poc_idx = vols.index(max(vols))
                 poc = highs[poc_idx] 
-                
-                # Son 24 saatin en düşüğü (VAL)
                 val = min(lows)
                 
                 current_price = float(klines[-1][4])
                 prev_price = float(klines[-2][4])
                 
-                # Fiyat POC'nin hemen altındaysa (Kırılım hazırlığı) ve bugün yükseliyorsa
                 if (poc * 0.98) <= current_price < poc and current_price > prev_price:
                     
-                    # Hedef: POC'nin %15 üzeri
                     target = poc * 1.15
                     target_pct = ((target - current_price) / current_price) * 100
                     
-                    # Stop: VAL'nin %1 altı (Destek kırılırsa)
                     stop = val * 0.99
                     stop_pct = ((stop - current_price) / current_price) * 100
                     
-                    # Trend yönü (1G ve 1S)
                     trend_1d = "yukarı" if current_price > float(klines[-24][4]) else "aşağı"
                     trend_1h = "yukarı" if current_price > float(klines[-6][4]) else "aşağı"
 
-                    # Türkçe Profesyonel Analiz Metni (Görseldeki yapıya benzer)
                     msg = (f"<b>#{symbol}</b>\n\n"
                            f"Fiyat: <b>{current_price:.4f}</b>\n"
                            f"Hedef: <b>{target:.4f}</b> ({target_pct:+.1f}%)\n"
