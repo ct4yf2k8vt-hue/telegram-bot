@@ -22,6 +22,7 @@ C = os.environ.get("CHAT_ID", "1623907197").strip()
 TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://api.binance.com"
 
+# MOTOR ÇALIŞMA SÜRELERİ
 RAPOR_ARALIGI = 3600       
 CHARTIST_ARALIGI = 3600    
 PUMP_ARALIGI = 60          
@@ -29,8 +30,9 @@ SETUP_ARALIGI = 900
 FORMASYON_ARALIGI = 1800   
 BOLLINGER_ARALIGI = 3600   
 MACRO_ARALIGI = 7200       
-AGRESIF_ARALIGI = 30       # YENİ: 30 saniyede bir agresif tarama
+AGRESIF_ARALIGI = 30       # 30 saniyede bir agresif tarama
 
+# FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_24H_PUMP = 5_000_000  
 MIN_HACIM_ARTISI = 20_000       
@@ -38,7 +40,7 @@ MIN_HACIM_SETUP = 20_000_000
 MIN_HACIM_FORMASYON = 15_000_000 
 MIN_HACIM_BOLLINGER = 20_000_000 
 MIN_HACIM_MACRO = 10_000_000
-MIN_HACIM_AGRESIF = 1_000_000   # YENİ: Agresif mod için 1 Milyon Dolar yeterli (PARTI gibi)
+MIN_HACIM_AGRESIF = 1_000_000   # Agresif mod için 1 Milyon Dolar
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
@@ -46,7 +48,7 @@ son_setup_sinyalleri = {}
 son_formasyon_sinyalleri = {}
 son_bollinger_sinyalleri = {}
 son_macro_sinyalleri = {}
-son_agresif_sinyalleri = {}     # YENİ
+son_agresif_sinyalleri = {}     
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -158,9 +160,9 @@ def get_cvd_oi_teyit(symbol):
         if oi_artiyor and alici_baskin:
             return f"\n🐋 <b>BALİNA TEYİDİ (CVD+OI):</b> YENİ LONG'lar girdi! (OI: {oi_text}, {taker_text})"
         elif alici_baskin:
-            return f"\n⚖️ <b>Kısmi Teyit:</b> Alıcı baskısı var ama OI artmamış."
+            return f"\n⚖️ <b>Kısmi Teyit:</b> Alıcı baskısı var ama OI artmamış. (OI: {oi_text})"
         else:
-            return f"\n⚠️ <b>Zayıf Teyit:</b> Alıcılar zayıf."
+            return f"\n⚠️ <b>Zayıf Teyit:</b> Alıcılar zayıf. (OI: {oi_text})"
     except:
         return ""
 
@@ -185,9 +187,11 @@ def get_peak_time(symbol):
         return "0"
 
 def midas_flow_loop():
+    log("RAPOR", "Midas Flow Motoru Başladı.")
     time.sleep(5)
     while True:
         try:
+            log("RAPOR", "Piyasa verileri çekiliyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list):
                 time.sleep(300)
@@ -198,27 +202,34 @@ def midas_flow_loop():
             top_5 = usdt_pairs[:5]
             if top_5:
                 msg = "🔥 <b>24 saatteki en iyi hareketler</b>\n"
-                msg += f"\n🌍 <b>Piyasa Yönü:</b> {trend_text}\n\n"
+                msg += f"\n🌍 <b>Piyasa Yönü (24s):</b> {trend_text}\n"
+                msg += f"📊 Ortalama Değişim: %{avg_chg:.2f} | Yükselen: {ups} | Düşen: {downs}\n\n"
+                msg += "sinyal yönündeki maksimum hareket, veritabanımıza göre:\n\n"
                 medals = ["🥇", "🥈", "🥉", "🏅", "⭐️"]
                 for i, t in enumerate(top_5):
                     symbol = t['symbol'].replace("USDT", "")
                     change = float(t['priceChangePercent'])
+                    change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
                     peak = get_peak_time(t['symbol'])
-                    msg += f"{medals[i]} {symbol} {change:+.0f}% · {peak} saatte zirve\n"
+                    msg += f"{medals[i]} {symbol} {change_str} · {peak} saatte zirve\n"
                 msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app"
                 tg(C, msg)
+                log("RAPOR", "Saatlik rapor gönderildi.")
             time.sleep(RAPOR_ARALIGI)
         except Exception as e:
+            log("RAPOR", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
 # 2. MOTOR: CHARTIST (EMA200)
 # =====================================================
 def chartist_loop():
+    log("CHARTIST", "Çoklu Zaman Dilimi EMA200 Motoru Başladı.")
     time.sleep(15)
     timeframes = ['8h', '12h', '1d', '3d']
     while True:
         try:
+            log("CHARTIST", "EMA200 Kırılımları taranıyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list):
                 time.sleep(60)
@@ -238,23 +249,28 @@ def chartist_loop():
                     prev_close = closes[-2]
                     if prev_close <= prev_ema200 and current_price > curr_ema200:
                         sl = curr_ema200 * 0.97 
-                        msg = (f"📈 <b>UZUN VADELİ SPOT: {symbol}</b>\n<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
+                        msg = (f"📈 <b>UZUN VADELİ SPOT SİNYALİ: {symbol}</b>\n"
+                               f"<i>{tf.upper()} EMA200 Kırılımı!</i>\n\n"
                                f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n🛑 <b>SL:</b> {akilli_fiyat(sl)}\n"
                                f"🎯 <b>Hedef:</b> {akilli_fiyat(current_price * 1.15)}")
                         if tg(C, msg):
                             son_sinyaller[cooldown_key] = time.time()
+                            log("CHARTIST", f"🔥 KIRILIM SİNYALİ ({tf.upper()}): {symbol}")
                     time.sleep(0.05)
             time.sleep(CHARTIST_ARALIGI)
         except Exception as e:
+            log("CHARTIST", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
 # 3. MOTOR: PUMP (1m)
 # =====================================================
 def pump_loop():
+    log("PUMP", "Akıllı Yönlü Pump Motoru Başladı (1m).")
     time.sleep(25)
     while True:
         try:
+            log("PUMP", "Anlık pump fırsatları taranıyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list):
                 time.sleep(30)
@@ -280,18 +296,22 @@ def pump_loop():
                            f"{cvd_oi_teyit}")
                     if tg(C, msg):
                         son_pump_sinyalleri[symbol] = time.time()
+                        log("PUMP", f"🔥 {yon} SİNYALİ: {symbol}")
                 time.sleep(0.05)
             time.sleep(PUMP_ARALIGI)
         except Exception as e:
+            log("PUMP", f"Hata: {e}")
             time.sleep(30)
 
 # =====================================================
 # 4. MOTOR: SETUP (POC)
 # =====================================================
 def setup_loop():
+    log("SETUP", "Profesyonel Setup Analiz Motoru Başladı.")
     time.sleep(35)
     while True:
         try:
+            log("SETUP", "POC Setup'ları taranıyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list):
                 time.sleep(60)
@@ -314,18 +334,22 @@ def setup_loop():
                            f"🛡️ Stop {akilli_fiyat(stop)} arkasında.")
                     if tg(C, msg):
                         son_setup_sinyalleri[symbol] = time.time()
+                        log("SETUP", f"🔥 SETUP SİNYALİ: {symbol}")
                 time.sleep(0.1)
             time.sleep(SETUP_ARALIGI)
         except Exception as e:
+            log("SETUP", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
 # 5. MOTOR: FORMASYON (Çift Yönlü)
 # =====================================================
 def formasyon_loop():
+    log("FORMASYON", "Çift Yönlü Formasyon ve Kırılım Motoru Başladı.")
     time.sleep(45) 
     while True:
         try:
+            log("FORMASYON", "Kırılımlar taranıyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list):
                 time.sleep(60)
@@ -354,6 +378,7 @@ def formasyon_loop():
                                f"Hacim: {vols[-1]/avg_vol:.1f}x {cvd_oi_teyit}")
                         if tg(C, msg):
                             son_formasyon_sinyalleri[symbol] = time.time()
+                            log("FORMASYON", f"🔥 LONG SİNYALİ: {symbol}")
                         continue
                 
                 # SHORT
@@ -367,18 +392,22 @@ def formasyon_loop():
                                f"Hacim: {vols[-1]/avg_vol:.1f}x {cvd_oi_teyit}")
                         if tg(C, msg):
                             son_formasyon_sinyalleri[symbol] = time.time()
+                            log("FORMASYON", f"🔥 SHORT SİNYALİ: {symbol}")
                 time.sleep(0.1)
             time.sleep(FORMASYON_ARALIGI)
         except Exception as e:
+            log("FORMASYON", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
-# 6. MOTOR: BOLLINGER
+# 6. MOTOR: BOLLINGER (Haftalık)
 # =====================================================
 def bollinger_loop():
+    log("BOLLINGER", "Haftalık Bollinger Bandı Motoru Başladı.")
     time.sleep(60) 
     while True:
         try:
+            log("BOLLINGER", "Haftalık Bollinger Sıkışmaları (Squeeze) taranıyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_BOLLINGER]
@@ -390,6 +419,10 @@ def bollinger_loop():
                 current_price = closes[-1]
                 bb = calculate_bollinger(closes, 20, 2)
                 if not bb or not bb["signal"]: continue
+                
+                avg_vol = sum([float(k[7]) for k in klines[:-1]][-21:-1]) / 20
+                if float(klines[-2][7]) < (avg_vol * 1.2): continue
+
                 yon = "AL" if "AL" in bb["signal"] else "SAT"
                 emoji = "🚀" if yon == "AL" else "🔴"
                 target = bb["upper"] if yon == "AL" else bb["lower"]
@@ -398,18 +431,22 @@ def bollinger_loop():
                        f"Kapanış: {akilli_fiyat(current_price)}\nHedef: {akilli_fiyat(target)}\nStop: {akilli_fiyat(sl)}")
                 if tg(C, msg):
                     son_bollinger_sinyalleri[symbol] = time.time()
+                    log("BOLLINGER", f"🔥 SQUEEZE KIRILIMI: {symbol} ({yon})")
                 time.sleep(0.15) 
             time.sleep(BOLLINGER_ARALIGI)
         except Exception as e:
+            log("BOLLINGER", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
-# 7. MOTOR: MAKRO
+# 7. MOTOR: MAKRO (Günlük)
 # =====================================================
 def macro_loop():
+    log("MACRO", "Makro Kırılım Motoru Başladı (Günlük).")
     time.sleep(75) 
     while True:
         try:
+            log("MACRO", "Günlük dip dönüşleri taranıyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MACRO]
@@ -423,6 +460,7 @@ def macro_loop():
                 current_price = closes[-1]
                 sma50 = sum(closes[-50:]) / 50
                 sma100 = sum(closes[-100:]) / 100
+                
                 if sma50 < sma100 and current_price > sma50 and closes[-2] <= (sum(closes[-51:-1]) / 50):
                     target = max(highs) if max(highs) > current_price * 1.20 else current_price * 1.30
                     stop = min(lows[-30:]) * 0.95
@@ -431,16 +469,18 @@ def macro_loop():
                            f"<b>Buy and hold!</b>")
                     if tg(C, msg):
                         son_macro_sinyalleri[symbol] = time.time()
+                        log("MACRO", f"🔥 MAKRO SİNYALİ: {symbol}")
                 time.sleep(0.2)
             time.sleep(MACRO_ARALIGI)
         except Exception as e:
+            log("MACRO", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
-# 8. MOTOR: AGRESİF PUMP AVCISI (YENİ - PARTI TARZI)
+# 8. MOTOR: AGRESİF PUMP (PARTI Tarzı + CVD/OI Teyitli)
 # =====================================================
 def agresif_pump_loop():
-    log("AGRESIF", "Agresif Pump Avcısı Başladı (1m / 3%+)")
+    log("AGRESIF", "Agresif Pump Avcısı Başladı (1m / 3%+ / CVD+OI Teyitli)")
     time.sleep(15)
     while True:
         try:
@@ -449,13 +489,11 @@ def agresif_pump_loop():
                 time.sleep(30)
                 continue
             
-            # Hacim barajını 1 Milyon Dolar'a düşürdük (PARTI gibi coinler için)
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_AGRESIF]
 
             for symbol in adaylar:
-                if symbol in son_agresif_sinyalleri and time.time() - son_agresif_sinyalleri[symbol] < 1800: continue # 30 dk bekle
+                if symbol in son_agresif_sinyalleri and time.time() - son_agresif_sinyalleri[symbol] < 1800: continue 
                 
-                # 1 Dakikalık grafikte son 2 mumu incele
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1m&limit=3")
                 if not isinstance(klines, list) or len(klines) < 3: continue
                 
@@ -465,17 +503,17 @@ def agresif_pump_loop():
                 
                 if prev_close == 0 or prev_vol == 0: continue
                 
-                # 1 dakikada %3 artış VE hacim en az 2 katına çıkmışsa
                 price_change = ((curr_close - prev_close) / prev_close) * 100
                 vol_change = ((curr_vol - prev_vol) / prev_vol) * 100
 
                 if price_change >= 3.0 and vol_change >= 100.0:
-                    # Sadece LONG (Pump) arıyoruz
+                    cvd_oi_teyit = get_cvd_oi_teyit(symbol)
                     msg = (f"⚡ <b>AGRESİF PUMP SİNYALİ (LONG): {symbol}</b>\n"
                            f"<i>Hızlı Yükseliş Yakalandı!</i>\n\n"
                            f"📈 <b>Yön:</b> LONG (Momentum)\n"
                            f"💰 <b>Fiyat:</b> ${akilli_fiyat(curr_close)} (<b>{price_change:+.2f}%</b>)\n"
-                           f"📊 <b>Hacim:</b> {vol_change:+.0f}% Artış\n\n"
+                           f"📊 <b>Hacim:</b> {vol_change:+.0f}% Artış"
+                           f"{cvd_oi_teyit}\n\n"
                            f"⚠️ <i>Bu sinyal çok hızlı gelişen pump'lar içindir. Dikkatli işlem yapın!</i>")
                     
                     if tg(C, msg):
@@ -516,7 +554,7 @@ if __name__ == "__main__":
     threading.Thread(target=bollinger_loop, daemon=True).start()
     threading.Thread(target=macro_loop, daemon=True).start()
     
-    # YENİ: Agresif Avcı
+    # 8. Motor (Agresif)
     threading.Thread(target=agresif_pump_loop, daemon=True).start()
     
     run_web_server()
