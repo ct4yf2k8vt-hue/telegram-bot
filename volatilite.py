@@ -23,10 +23,10 @@ TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://api.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
-RAPOR_ARALIGI = 14400      # 4 Saat (Saniye cinsinden)
+RAPOR_ARALIGI = 14400      # 4 Saat
 CHARTIST_ARALIGI = 3600    # 1 Saat
 PUMP_ARALIGI = 60          # 1 Dakika
-FORMASYON_ARALIGI = 3600   # 1 Saat
+FORMASYON_ARALIGI = 3600   # 1 Saat (1 Günlük grafik taraması)
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -104,9 +104,7 @@ def get_market_trend(tickers):
 
 # --- TRAP RADAR (CVD & OI) FİLTRESİ ---
 def trap_radar_check(symbol):
-    """Trap Radar mantığı ile sahte pump (fakeout) kontrolü yapar."""
     try:
-        # 1. Open Interest (Açık Pozisyon) Kontrolü
         oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
         oi_artiyor = False
         if oi_data and len(oi_data) >= 2:
@@ -114,10 +112,8 @@ def trap_radar_check(symbol):
             oi_new = float(oi_data[1]['sumOpenInterest'])
             if oi_old > 0:
                 oi_chg_pct = ((oi_new - oi_old) / oi_old) * 100
-                if oi_chg_pct > 0.2:
-                    oi_artiyor = True
+                if oi_chg_pct > 0.2: oi_artiyor = True
 
-        # 2. Taker Buy/Sell (CVD) Kontrolü
         taker_data = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=1")
         alici_baskin = False
         if taker_data and len(taker_data) > 0:
@@ -126,20 +122,19 @@ def trap_radar_check(symbol):
             total = buy_vol + sell_vol
             if total > 0:
                 buy_pct = (buy_vol / total) * 100
-                if buy_pct > 55:
-                    alici_baskin = True
+                if buy_pct > 55: alici_baskin = True
 
         if oi_artiyor and alici_baskin:
-            return "🐋 <b>BALİNA TEYİDİ (Gerçek Pump):</b> Piyasaya yeni para girişi (OI) ve agresif alımlar var."
+            return "🐋 <b>BALİNA TEYİDİ (Gerçek Pump):</b> Yeni para girişi ve agresif alımlar var."
         elif not alici_baskin:
-            return "⚠️ <b>DİKKAT: SAHTE PUMP (TUZAK OLABİLİR):</b> Satıcılar gizlice duvar örüyor (Alıcı zayıf)."
+            return "⚠️ <b>DİKKAT: SAHTE PUMP (TUZAK OLABİLİR):</b> Satıcılar gizlice duvar örüyor."
         else:
-            return "⚖️ <b>Kısmi Teyit:</b> Alıcılar var ama Açık Pozisyon (OI) artmıyor. Temkinli olun."
+            return "⚖️ <b>Kısmi Teyit:</b> Alıcılar var ama Açık Pozisyon (OI) artmıyor."
     except:
         return ""
 
 # =====================================================
-# 1. MOTOR: MİDAS FLOW (4 SAATTE BİR)
+# 1. MOTOR: MİDAS FLOW
 # =====================================================
 def get_peak_time(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
@@ -148,15 +143,12 @@ def get_peak_time(symbol):
         entry_time, peak_time, entry_price, peak_price = 0, 0, float('inf'), 0
         for k in klines:
             if float(k[3]) < entry_price:
-                entry_price = float(k[3])
-                entry_time = int(k[0])
+                entry_price = float(k[3]); entry_time = int(k[0])
             if float(k[2]) > peak_price:
-                peak_price = float(k[2])
-                peak_time = int(k[0])
+                peak_price = float(k[2]); peak_time = int(k[0])
         duration = (peak_time - entry_time) / (1000 * 60 * 60)
         return f"{max(duration, 0.1):.1f}"
-    except:
-        return "0"
+    except: return "0"
 
 def get_winner_of_the_day(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
@@ -165,26 +157,18 @@ def get_winner_of_the_day(symbol):
         entry_time, peak_time, entry_price, peak_price = 0, 0, float('inf'), 0
         for k in klines:
             if float(k[3]) < entry_price:
-                entry_price = float(k[3])
-                entry_time = int(k[0])
+                entry_price = float(k[3]); entry_time = int(k[0])
             if float(k[2]) > peak_price:
-                peak_price = float(k[2])
-                peak_time = int(k[0])
+                peak_price = float(k[2]); peak_time = int(k[0])
         duration = (peak_time - entry_time) / (1000 * 60 * 60)
         if duration <= 0: duration = 0.1
         max_pct = ((peak_price - entry_price) / entry_price) * 100
         entry_dt = datetime.fromtimestamp(entry_time / 1000, timezone.utc)
         peak_dt = datetime.fromtimestamp(peak_time / 1000, timezone.utc)
-        return {
-            "entry_time": entry_dt.strftime("%H:%M"),
-            "entry_price": entry_price,
-            "peak_time": peak_dt.strftime("%H:%M"),
-            "peak_price": peak_price,
-            "duration": duration,
-            "max_pct": max_pct
-        }
-    except:
-        return None
+        return {"entry_time": entry_dt.strftime("%H:%M"), "entry_price": entry_price,
+                "peak_time": peak_dt.strftime("%H:%M"), "peak_price": peak_price,
+                "duration": duration, "max_pct": max_pct}
+    except: return None
 
 def midas_flow_loop():
     log("RAPOR", "Midas Flow Motoru Başladı (4 Saatlik Mod).")
@@ -192,9 +176,7 @@ def midas_flow_loop():
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
-            if not isinstance(tickers, list):
-                time.sleep(300)
-                continue
+            if not isinstance(tickers, list): time.sleep(300); continue
             
             trend_text, avg_chg, ups, downs = get_market_trend(tickers)
             usdt_pairs = [t for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 5_000_000]
@@ -225,7 +207,6 @@ def midas_flow_loop():
                 time.sleep(2) 
                 winner_symbol = top_5[0]['symbol']
                 winner_data = get_winner_of_the_day(winner_symbol)
-                
                 if winner_data:
                     coin = winner_symbol.replace("USDT", "")
                     win_msg = (f"🏆 <b>Günün Kazananı: {coin} +{winner_data['max_pct']:.0f}%</b>\n\n"
@@ -233,8 +214,6 @@ def midas_flow_loop():
                                f"{winner_data['peak_time']} UTC — zirve ${akilli_fiyat(winner_data['peak_price'])}. Girişten itibaren +{winner_data['max_pct']:.0f}% ({winner_data['duration']:.2f} saatte).\n\n"
                                f"⚠️ Hareket — potansiyel harekettir, kâr garantisi değildir.")
                     tg(C, win_msg)
-                    log("RAPOR", f"Günün Kazananı gönderildi: {coin}")
-
             time.sleep(RAPOR_ARALIGI)
         except Exception as e:
             log("RAPOR", f"Hata: {e}")
@@ -250,9 +229,7 @@ def chartist_loop():
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
-            if not isinstance(tickers, list):
-                time.sleep(60)
-                continue
+            if not isinstance(tickers, list): time.sleep(60); continue
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_CHARTIST]
             for symbol in adaylar:
                 for tf in timeframes:
@@ -291,9 +268,7 @@ def pump_loop():
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
-            if not isinstance(tickers, list):
-                time.sleep(60)
-                continue
+            if not isinstance(tickers, list): time.sleep(60); continue
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_PUMP]
             for symbol in adaylar:
                 if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900: continue
@@ -312,10 +287,7 @@ def pump_loop():
                 vol_diff = curr_vol - prev_vol
                 
                 if price_change >= 3.0 and vol_change >= 100.0 and vol_diff >= 50_000:
-                    
-                    # TRAP RADAR KONTROLÜ (Sahte mi, Gerçek mi?)
                     trap_radar_sonuc = trap_radar_check(symbol)
-                    
                     coin = symbol.replace("USDT", "")
                     now_time = simdi().strftime('%I:%M:%S %p')
                     
@@ -332,7 +304,6 @@ def pump_loop():
                     if tg(C, msg):
                         son_pump_sinyalleri[symbol] = time.time()
                         log("PUMP", f"🔥 PUMP SİNYALİ: {symbol} ({price_change:+.1f}%)")
-                
                 time.sleep(0.05)
             time.sleep(PUMP_ARALIGI)
         except Exception as e:
@@ -340,7 +311,7 @@ def pump_loop():
             time.sleep(60)
 
 # =====================================================
-# 4. MOTOR: FORMASYON AVCISI (1 GÜNLÜK GRAFİK)
+# 4. MOTOR: YAPISAL DÖNÜŞ VE FORMASYON AVCISI (MSS / CHoCH)
 # =====================================================
 def find_pivots(highs, lows, window=3):
     pivot_highs = []
@@ -351,7 +322,7 @@ def find_pivots(highs, lows, window=3):
     return pivot_highs, pivot_lows
 
 def formasyon_loop():
-    log("FORMASYON", "1 Günlük Formasyon Avcısı Başladı.")
+    log("FORMASYON", "MSS (Yapısal Dönüş) ve Formasyon Avcısı Başladı.")
     time.sleep(45) 
     while True:
         try:
@@ -380,34 +351,38 @@ def formasyon_loop():
                 formasyon_adi = ""
                 yon = ""
                 emoji = ""
-                
-                # İKİLİ TEPE (M Formasyonu - SHORT)
-                if abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.03:
-                    neckline = last_l[-1][1]
-                    if current_price < neckline:
+                hedef = 0
+                stop = 0
+
+                # --- MİNİK YAPISAL DÖNÜŞ (MSS) MANTIĞI ---
+                # Yükselen trend (HH, HL) -> Düşen trende (LH, LL) dönüş
+                is_uptrend = (last_h[1][1] > last_h[0][1]) and (last_l[1][1] > last_l[0][1])
+                break_of_structure = current_price < last_l[1][1] # Son HL kırıldı mı?
+                lower_high_formed = last_h[2][1] < last_h[1][1] # Daha düşük tepe oluştu mu?
+
+                if is_uptrend and break_of_structure and lower_high_formed:
+                    sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bearish)"; yon = "SHORT"; emoji = "🔻"
+                    hedef = last_l[1][1] - (last_h[1][1] - last_l[1][1]) # Yapı yüksekliği kadar düşüş
+                    stop = last_h[2][1] * 1.02 # Son LH'ın üstü
+
+                # Düşen trend (LH, LL) -> Yükselen trende (HH, HL) dönüş
+                elif (last_h[1][1] < last_h[0][1]) and (last_l[1][1] < last_l[0][1]):
+                    break_of_structure = current_price > last_h[1][1] # Son LH kırıldı mı?
+                    higher_low_formed = last_l[2][1] > last_l[1][1] # Daha yüksek dip oluştu mu?
+                    
+                    if break_of_structure and higher_low_formed:
+                        sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bullish)"; yon = "LONG"; emoji = "🚀"
+                        hedef = last_h[1][1] + (last_h[1][1] - last_l[1][1])
+                        stop = last_l[2][1] * 0.98
+
+                # --- EKSTRA: Klasik Formasyonlar (M, W, OBO) ---
+                if not sinyal:
+                    if abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.03 and current_price < last_l[-1][1]:
                         sinyal = True; formasyon_adi = "İkili Tepe (M)"; yon = "SHORT"; emoji = "🔻"
-                        hedef = neckline - (last_h[1][1] - neckline); stop = last_h[2][1] * 1.02
-                
-                # İKİLİ DİP (W Formasyonu - LONG)
-                elif abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.03:
-                    neckline = last_h[-1][1]
-                    if current_price > neckline:
+                        hedef = last_l[-1][1] - (last_h[1][1] - last_l[-1][1]); stop = last_h[2][1] * 1.02
+                    elif abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.03 and current_price > last_h[-1][1]:
                         sinyal = True; formasyon_adi = "İkili Dip (W)"; yon = "LONG"; emoji = "🚀"
-                        hedef = neckline + (neckline - last_l[1][1]); stop = last_l[2][1] * 0.98
-
-                # OMUZ-BAŞ-OMUZ (SHORT)
-                elif last_h[1][1] > last_h[0][1] and last_h[1][1] > last_h[2][1] and abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.05:
-                    neckline = min(lows[last_h[0][0]:last_h[2][0]])
-                    if current_price < neckline:
-                        sinyal = True; formasyon_adi = "Omuz-Baş-Omuz"; yon = "SHORT"; emoji = "🔻"
-                        hedef = neckline - (last_h[1][1] - neckline); stop = last_h[2][1] * 1.02
-
-                # TERS OMUZ-BAŞ-OMUZ (LONG)
-                elif last_l[1][1] < last_l[0][1] and last_l[1][1] < last_l[2][1] and abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.05:
-                    neckline = max(highs[last_l[0][0]:last_l[2][0]]) 
-                    if current_price > neckline:
-                        sinyal = True; formasyon_adi = "Ters Omuz-Baş-Omuz"; yon = "LONG"; emoji = "🚀"
-                        hedef = neckline + (neckline - last_l[1][1]); stop = last_l[2][1] * 0.98
+                        hedef = last_h[-1][1] + (last_h[-1][1] - last_l[1][1]); stop = last_l[2][1] * 0.98
 
                 if sinyal:
                     hedef_pct = ((hedef - current_price) / current_price) * 100
@@ -417,12 +392,13 @@ def formasyon_loop():
                     elif yon == "SHORT" and hedef < current_price and stop > current_price: pass
                     else: continue
 
-                    msg = (f"{emoji} <b>FORMASYON SİNYALİ ({yon}): {symbol}</b>\n"
+                    msg = (f"{emoji} <b>YAPISAL SİNYAL ({yon}): {symbol}</b>\n"
                            f"<i>1 Günlük Grafik - {formasyon_adi}</i>\n\n"
                            f"💰 <b>Giriş (Kırılım):</b> {akilli_fiyat(current_price)}\n"
                            f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                           f"📊 <b>Açıklama:</b> Fiyat 1 günlük grafikte <b>{formasyon_adi}</b> formasyonunu tamamladı. Kırılım gerçekleşti, formasyon yüksekliği kadar hareket bekleniyor.")
+                           f"📊 <b>Açıklama:</b> Fiyat 1 günlük grafikte <b>{formasyon_adi}</b> tamamladı. Kırılan yapı teyit edildi, formasyon hedefi doğrultusunda hareket bekleniyor.\n"
+                           f"⚠️ <i>Kırılan seviye bir uyarıdır, teyit (LH/LL) alındı!</i>")
                     if tg(C, msg):
                         son_formasyon_sinyalleri[symbol] = time.time()
                         log("FORMASYON", f"🔥 SİNYAL: {symbol} ({yon} - {formasyon_adi})")
@@ -440,7 +416,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Trap Radar Bot is running!")
+        self.wfile.write(b"MSS Trap Radar Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
