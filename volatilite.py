@@ -357,31 +357,26 @@ def formasyon_loop():
                 hedef = 0
                 stop = 0
 
-                # --- MİNİK YAPISAL DÖNÜŞ (MSS) MANTIĞI ---
-                
-                # 1. LONG SENARYOSU (Yükseliş Dönüşü)
+                # Değişkenleri if bloğundan önce tanımlıyoruz
                 is_downtrend = (last_h[1][1] < last_h[0][1]) and (last_l[1][1] < last_l[0][1])
                 break_of_structure_up = current_price > last_h[1][1]
                 higher_low_formed = last_l[2][1] > last_l[1][1] 
-                
-                # FİLTRE: Fiyat EMA99'un üzerindeyse LONG'a izin ver
-                if is_downtrend and break_of_structure_up and higher_low_formed:
-                    if current_price > ema99: 
-                        sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bullish)"; yon = "LONG"; emoji = "🚀"
-                        hedef = last_h[1][1] + (last_h[1][1] - last_l[1][1])
-                        stop = last_l[2][1] * 0.98
 
-                # 2. SHORT SENARYOSU (Düşüş Dönüşü)
                 is_uptrend = (last_h[1][1] > last_h[0][1]) and (last_l[1][1] > last_l[0][1])
                 break_of_structure_down = current_price < last_l[1][1]
                 lower_high_formed = last_h[2][1] < last_h[1][1]
-                
-                # FİLTRE: Fiyat EMA99'un altındaysa SHORT'a izin ver
-                elif is_uptrend and break_of_structure_down and lower_high_formed:
-                    if current_price < ema99: 
-                        sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bearish)"; yon = "SHORT"; emoji = "🔻"
-                        hedef = last_l[1][1] - (last_h[1][1] - last_l[1][1])
-                        stop = last_h[2][1] * 1.02
+
+                # 1. LONG SENARYOSU (Yükseliş Dönüşü) - EMA99 Filtreli
+                if is_downtrend and break_of_structure_up and higher_low_formed and current_price > ema99:
+                    sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bullish)"; yon = "LONG"; emoji = "🚀"
+                    hedef = last_h[1][1] + (last_h[1][1] - last_l[1][1])
+                    stop = last_l[2][1] * 0.98
+
+                # 2. SHORT SENARYOSU (Düşüş Dönüşü) - EMA99 Filtreli
+                elif is_uptrend and break_of_structure_down and lower_high_formed and current_price < ema99:
+                    sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bearish)"; yon = "SHORT"; emoji = "🔻"
+                    hedef = last_l[1][1] - (last_h[1][1] - last_l[1][1])
+                    stop = last_h[2][1] * 1.02
 
                 # --- EKSTRA: Klasik Formasyonlar (M, W, OBO) ---
                 if not sinyal:
