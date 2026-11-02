@@ -23,10 +23,10 @@ TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://api.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
-RAPOR_ARALIGI = 3600       
-CHARTIST_ARALIGI = 3600    
-PUMP_ARALIGI = 60          
-FORMASYON_ARALIGI = 3600   
+RAPOR_ARALIGI = 14400      # 4 Saat (Saniye cinsinden)
+CHARTIST_ARALIGI = 3600    # 1 Saat
+PUMP_ARALIGI = 60          # 1 Dakika
+FORMASYON_ARALIGI = 3600   # 1 Saat
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -102,7 +102,7 @@ def get_market_trend(tickers):
     except:
         return "Bilinmiyor", 0, 0, 0
 
-# --- YENİ: TRAP RADAR (CVD & OI) FİLTRESİ ---
+# --- TRAP RADAR (CVD & OI) FİLTRESİ ---
 def trap_radar_check(symbol):
     """Trap Radar mantığı ile sahte pump (fakeout) kontrolü yapar."""
     try:
@@ -114,7 +114,7 @@ def trap_radar_check(symbol):
             oi_new = float(oi_data[1]['sumOpenInterest'])
             if oi_old > 0:
                 oi_chg_pct = ((oi_new - oi_old) / oi_old) * 100
-                if oi_chg_pct > 0.2: # OI artıyorsa yeni pozisyonlar var
+                if oi_chg_pct > 0.2:
                     oi_artiyor = True
 
         # 2. Taker Buy/Sell (CVD) Kontrolü
@@ -126,10 +126,9 @@ def trap_radar_check(symbol):
             total = buy_vol + sell_vol
             if total > 0:
                 buy_pct = (buy_vol / total) * 100
-                if buy_pct > 55: # Alıcılar baskınsa
+                if buy_pct > 55:
                     alici_baskin = True
 
-        # Karar Mekanizması
         if oi_artiyor and alici_baskin:
             return "🐋 <b>BALİNA TEYİDİ (Gerçek Pump):</b> Piyasaya yeni para girişi (OI) ve agresif alımlar var."
         elif not alici_baskin:
@@ -140,7 +139,7 @@ def trap_radar_check(symbol):
         return ""
 
 # =====================================================
-# 1. MOTOR: MİDAS FLOW (EN İYİ 5 + GÜNÜN KAZANANI)
+# 1. MOTOR: MİDAS FLOW (4 SAATTE BİR)
 # =====================================================
 def get_peak_time(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
@@ -188,7 +187,7 @@ def get_winner_of_the_day(symbol):
         return None
 
 def midas_flow_loop():
-    log("RAPOR", "Midas Flow Motoru Başladı.")
+    log("RAPOR", "Midas Flow Motoru Başladı (4 Saatlik Mod).")
     time.sleep(5)
     while True:
         try:
@@ -221,7 +220,7 @@ def midas_flow_loop():
                 msg += "\nTüm sinyal akışı — panelde 👉 midasflow.ai/app\n\n"
                 msg += f"<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow #kripto #pump #sinyal</a>"
                 tg(C, msg)
-                log("RAPOR", "Saatlik rapor gönderildi.")
+                log("RAPOR", "4 Saatlik rapor gönderildi.")
                 
                 time.sleep(2) 
                 winner_symbol = top_5[0]['symbol']
@@ -325,14 +324,14 @@ def pump_loop():
                            f"📊 <b>Volume:</b> {vol_change:+.0f}% Artış\n"
                            f"Volume increased by {vol_diff:.0f} ⬆️\n"
                            f"Time: {now_time} 🕐\n\n"
-                           f"{trap_radar_sonuc}\n\n" # Trap Radar sonucu buraya ekleniyor
+                           f"{trap_radar_sonuc}\n\n"
                            f"🔗 <a href='https://www.binance.com/en/trade/{symbol}?type=spot'>Pair on Binance.</a>\n"
                            f"🔗 <a href='https://www.bybit.com/en-US/trade/spot/{symbol}'>Pair on Bybit.</a>\n\n"
                            f"<b>${coin} #{coin}</b>")
                     
                     if tg(C, msg):
                         son_pump_sinyalleri[symbol] = time.time()
-                        log("PUMP", f"🔥 PUMP SİNYALİ: {symbol} ({price_change:+.1f}%) - {trap_radar_sonuc[:20]}...")
+                        log("PUMP", f"🔥 PUMP SİNYALİ: {symbol} ({price_change:+.1f}%)")
                 
                 time.sleep(0.05)
             time.sleep(PUMP_ARALIGI)
