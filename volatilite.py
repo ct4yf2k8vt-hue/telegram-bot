@@ -26,16 +26,19 @@ BASE = "https://api.binance.com"
 RAPOR_ARALIGI = 14400      # 4 Saat (Midas Flow)
 CHARTIST_ARALIGI = 3600    # 1 Saat (EMA200)
 PUMP_ARALIGI = 60          # 1 Dakika (Anlık Pump)
-FORMASYON_ARALIGI = 3600   # 1 Saat (Formasyon & MSS)
+FORMASYON_ARALIGI = 3600   # 1 Saat (Formasyon)
+BOLLINGER_ARALIGI = 3600   # 1 Saat (Bollinger)
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_PUMP = 5_000_000     
 MIN_HACIM_FORMASYON = 10_000_000 
+MIN_HACIM_BOLLINGER = 10_000_000 
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
 son_formasyon_sinyalleri = {}
+son_bollinger_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -84,6 +87,19 @@ def calculate_ema(prices, period):
         ema.append(price * k + ema[-1] * (1 - k))
     return ema
 
+# --- SADECE BOLLINGER MOTORU İÇİN HESAPLAMA ---
+def calculate_bollinger(closes, period=20, num_std=2):
+    if len(closes) < period: return None
+    recent_closes = closes[-period:]
+    sma = sum(recent_closes) / period
+    variance = sum((x - sma) ** 2 for x in recent_closes) / period
+    std_dev = math.sqrt(variance)
+    upper_band = sma + (num_std * std_dev)
+    lower_band = sma - (num_std * std_dev)
+    bandwidth = (upper_band - lower_band) / sma if sma > 0 else 0
+    current_close = closes[-1]
+    return {"sma": sma, "upper": upper_band, "lower": lower_band, "bandwidth": bandwidth, "close": current_close}
+
 def get_market_trend(tickers):
     try:
         sorted_tickers = sorted(tickers, key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)[:100]
@@ -102,7 +118,6 @@ def get_market_trend(tickers):
     except:
         return "Bilinmiyor", 0, 0, 0
 
-# --- TRAP RADAR (CVD & OI) FİLTRESİ ---
 def trap_radar_check(symbol):
     try:
         oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
@@ -134,7 +149,7 @@ def trap_radar_check(symbol):
         return ""
 
 # =====================================================
-# 1. MOTOR: MİDAS FLOW (4 SAATTE BİR)
+# 1. MOTOR: MİDAS FLOW
 # =====================================================
 def get_peak_time(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
@@ -171,7 +186,7 @@ def get_winner_of_the_day(symbol):
     except: return None
 
 def midas_flow_loop():
-    log("RAPOR", "Midas Flow Motoru Başladı (4 Saatlik Mod).")
+    log("RAPOR", "Midas Flow Motoru Başladı.")
     time.sleep(5)
     while True:
         try:
@@ -220,7 +235,7 @@ def midas_flow_loop():
             time.sleep(60)
 
 # =====================================================
-# 2. MOTOR: CHARTIST (EMA200 KIRILIMI - LONG)
+# 2. MOTOR: CHARTIST (EMA200)
 # =====================================================
 def chartist_loop():
     log("CHARTIST", "Uzun Vadeli EMA200 Motoru Başladı.")
@@ -260,7 +275,7 @@ def chartist_loop():
             time.sleep(60)
 
 # =====================================================
-# 3. MOTOR: ANLIK PUMP AVCISI (TRAP RADAR ENTEGRELİ)
+# 3. MOTOR: ANLIK PUMP AVCISI (TRAP RADAR)
 # =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı (Trap Radar Entegreli) Başladı.")
@@ -311,7 +326,7 @@ def pump_loop():
             time.sleep(60)
 
 # =====================================================
-# 4. MOTOR: YAPISAL DÖNÜŞ VE FORMASYON AVCISI (FİLTRELİ)
+# 4. MOTOR: SADECE FORMASYONLAR (Fiyat Yapısı ve Kırılım)
 # =====================================================
 def find_pivots(highs, lows, window=3):
     pivot_highs = []
@@ -322,7 +337,7 @@ def find_pivots(highs, lows, window=3):
     return pivot_highs, pivot_lows
 
 def formasyon_loop():
-    log("FORMASYON", "MSS (Yapısal Dönüş) ve Formasyon Avcısı Başladı (Trend Filtreli).")
+    log("FORMASYON", "Saf Formasyon ve Yapısal Dönüş (MSS) Motoru Başladı.")
     time.sleep(45) 
     while True:
         try:
@@ -339,10 +354,16 @@ def formasyon_loop():
                 highs = [float(k[2]) for k in klines]
                 lows = [float(k[3]) for k in klines]
                 closes = [float(k[4]) for k in klines]
+                vols = [float(k[7]) for k in klines]
                 current_price = closes[-1]
                 
-                # --- YENİ: ANA TREND FİLTRESİ (EMA99) ---
+                # Trend Filtresi (Sadece yönü belirlemek için)
                 ema99 = calculate_ema(closes, 99)[-1] 
+                
+                # Hacim Teyidi (Formasyon kırılımları için şart)
+                avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 1
+                current_vol = vols[-1]
+                is_vol_teyit = current_vol > (avg_vol * 1.2)
                 
                 p_highs, p_lows = find_pivots(highs, lows)
                 if len(p_highs) < 3 or len(p_lows) < 3: continue
@@ -357,35 +378,47 @@ def formasyon_loop():
                 hedef = 0
                 stop = 0
 
-                # Değişkenleri if bloğundan önce tanımlıyoruz
-                is_downtrend = (last_h[1][1] < last_h[0][1]) and (last_l[1][1] < last_l[0][1])
-                break_of_structure_up = current_price > last_h[1][1]
-                higher_low_formed = last_l[2][1] > last_l[1][1] 
+                # --- 1. OMUZ-BAŞ-OMUZ (SHORT) ---
+                if last_h[1][1] > last_h[0][1] and last_h[1][1] > last_h[2][1] and abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.05:
+                    neckline = min(lows[last_h[0][0]:last_h[2][0]])
+                    if current_price < neckline and current_price < ema99 and is_vol_teyit:
+                        sinyal = True; formasyon_adi = "Omuz-Baş-Omuz"; yon = "SHORT"; emoji = "🔻"
+                        hedef = neckline - (last_h[1][1] - neckline); stop = last_h[2][1] * 1.02
 
-                is_uptrend = (last_h[1][1] > last_h[0][1]) and (last_l[1][1] > last_l[0][1])
-                break_of_structure_down = current_price < last_l[1][1]
-                lower_high_formed = last_h[2][1] < last_h[1][1]
+                # --- 2. TERS OMUZ-BAŞ-OMUZ (LONG) ---
+                elif last_l[1][1] < last_l[0][1] and last_l[1][1] < last_l[2][1] and abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.05:
+                    neckline = max(highs[last_l[0][0]:last_l[2][0]])
+                    if current_price > neckline and current_price > ema99 and is_vol_teyit:
+                        sinyal = True; formasyon_adi = "Ters Omuz-Baş-Omuz"; yon = "LONG"; emoji = "🚀"
+                        hedef = neckline + (neckline - last_l[1][1]); stop = last_l[2][1] * 0.98
 
-                # 1. LONG SENARYOSU (Yükseliş Dönüşü) - EMA99 Filtreli
-                if is_downtrend and break_of_structure_up and higher_low_formed and current_price > ema99:
-                    sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bullish)"; yon = "LONG"; emoji = "🚀"
-                    hedef = last_h[1][1] + (last_h[1][1] - last_l[1][1])
-                    stop = last_l[2][1] * 0.98
+                # --- 3. ÇİFT DİP (W) ---
+                elif abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.03:
+                    neckline = last_h[-1][1]
+                    if current_price > neckline and current_price > ema99 and is_vol_teyit:
+                        sinyal = True; formasyon_adi = "Çift Dip (W)"; yon = "LONG"; emoji = "🚀"
+                        hedef = neckline + (neckline - last_l[1][1]); stop = last_l[2][1] * 0.98
 
-                # 2. SHORT SENARYOSU (Düşüş Dönüşü) - EMA99 Filtreli
-                elif is_uptrend and break_of_structure_down and lower_high_formed and current_price < ema99:
-                    sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bearish)"; yon = "SHORT"; emoji = "🔻"
-                    hedef = last_l[1][1] - (last_h[1][1] - last_l[1][1])
-                    stop = last_h[2][1] * 1.02
+                # --- 4. ÇİFT TEPE (M) ---
+                elif abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.03:
+                    neckline = last_l[-1][1]
+                    if current_price < neckline and current_price < ema99 and is_vol_teyit:
+                        sinyal = True; formasyon_adi = "Çift Tepe (M)"; yon = "SHORT"; emoji = "🔻"
+                        hedef = neckline - (last_h[1][1] - neckline); stop = last_h[2][1] * 1.02
 
-                # --- EKSTRA: Klasik Formasyonlar (M, W, OBO) ---
+                # --- 5. SİMETRİK ÜÇGEN / BAYRAK / KAMA (Sıkışma & Kırılım) ---
                 if not sinyal:
-                    if abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.03 and current_price < last_l[-1][1] and current_price < ema99:
-                        sinyal = True; formasyon_adi = "İkili Tepe (M)"; yon = "SHORT"; emoji = "🔻"
-                        hedef = last_l[-1][1] - (last_h[1][1] - last_l[-1][1]); stop = last_h[2][1] * 1.02
-                    elif abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.03 and current_price > last_h[-1][1] and current_price > ema99:
-                        sinyal = True; formasyon_adi = "İkili Dip (W)"; yon = "LONG"; emoji = "🚀"
-                        hedef = last_h[-1][1] + (last_h[-1][1] - last_l[1][1]); stop = last_l[2][1] * 0.98
+                    last_20_high = max(highs[-20:])
+                    last_20_low = min(lows[-20:])
+                    range_pct = ((last_20_high - last_20_low) / last_20_low) * 100
+                    
+                    if range_pct < 15: # 20 gün boyunca dar bir bantta sıkışma
+                        if current_price > last_20_high and current_price > ema99 and is_vol_teyit:
+                            sinyal = True; formasyon_adi = "Sıkışma ve Yukarı Kırılım (Bayrak)"; yon = "LONG"; emoji = "🚀"
+                            hedef = current_price + (last_20_high - last_20_low); stop = last_20_low * 0.98
+                        elif current_price < last_20_low and current_price < ema99 and is_vol_teyit:
+                            sinyal = True; formasyon_adi = "Sıkışma ve Aşağı Kırılım (Ters Bayrak)"; yon = "SHORT"; emoji = "🔻"
+                            hedef = current_price - (last_20_high - last_20_low); stop = last_20_high * 1.02
 
                 if sinyal:
                     hedef_pct = ((hedef - current_price) / current_price) * 100
@@ -395,14 +428,14 @@ def formasyon_loop():
                     elif yon == "SHORT" and hedef < current_price and stop > current_price: pass
                     else: continue
 
-                    msg = (f"{emoji} <b>YAPISAL SİNYAL ({yon}): {symbol}</b>\n"
+                    msg = (f"{emoji} <b>FORMASYON SİNYALİ ({yon}): {symbol}</b>\n"
                            f"<i>1 Günlük Grafik - {formasyon_adi}</i>\n\n"
                            f"💰 <b>Giriş (Kırılım):</b> {akilli_fiyat(current_price)}\n"
                            f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                           f"📊 <b>Trend Filtresi (EMA99):</b> {akilli_fiyat(ema99)}\n"
-                           f"📊 <b>Açıklama:</b> Fiyat 1 günlük grafikte <b>{formasyon_adi}</b> tamamladı. Ana trend filtresi (EMA99) onaylı, hareket bekleniyor.\n"
-                           f"⚠️ <i>Kırılan seviye bir uyarıdır, teyit alındı!</i>")
+                           f"📊 <b>Trend Filtresi:</b> {'Yükseliş' if current_price > ema99 else 'Düşüş'}\n"
+                           f"📊 <b>Hacim Teyidi:</b> Alındı ({current_vol/avg_vol:.1f}x)\n"
+                           f"⚠️ <i>Formasyon tamamlandı, kırılım teyit edildi.</i>")
                     if tg(C, msg):
                         son_formasyon_sinyalleri[symbol] = time.time()
                         log("FORMASYON", f"🔥 SİNYAL: {symbol} ({yon} - {formasyon_adi})")
@@ -414,13 +447,123 @@ def formasyon_loop():
             time.sleep(60)
 
 # =====================================================
+# 5. MOTOR: SADECE BOLLINGER (Metindeki Tüm Kurallar)
+# =====================================================
+def bollinger_loop():
+    log("BOLLINGER", "Bollinger Bant ve Sıkışma Motoru Başladı (Gelişmiş).")
+    time.sleep(60) 
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_BOLLINGER]
+            
+            for symbol in adaylar:
+                if symbol in son_bollinger_sinyalleri and time.time() - son_bollinger_sinyalleri[symbol] < 86400: continue
+                
+                # Haftalık (1w) ve Günlük (1d) veri çek
+                klines_1d = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=50")
+                klines_1w = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1w&limit=50")
+                
+                if not isinstance(klines_1d, list) or len(klines_1d) < 25: continue
+                
+                # 1 Günlük Kapanış ve Hacim (Kapanış Bekle Kuralı)
+                closes_1d = [float(k[4]) for k in klines_1d[:-1]] 
+                vols_1d = [float(k[7]) for k in klines_1d[:-1]]
+                current_price = closes_1d[-1]
+                current_vol = vols_1d[-1]
+                
+                # Hacim Teyidi
+                avg_vol = sum(vols_1d[-21:-1]) / 20 if len(vols_1d) >= 21 else 1
+                if current_vol <= (avg_vol * 1.2): continue # Hacim artmamışsa geç
+
+                # Bollinger Hesapla
+                bb = calculate_bollinger(closes_1d, 20, 2)
+                if not bb: continue
+                
+                # Sıkışma Kontrolü
+                bandwidth_history = []
+                for i in range(10, 0, -1):
+                    past_closes = closes_1d[:-i]
+                    past_bb = calculate_bollinger(past_closes, 20, 2)
+                    if past_bb: bandwidth_history.append(past_bb["bandwidth"])
+                
+                if not bandwidth_history: continue
+                avg_bandwidth = sum(bandwidth_history) / len(bandwidth_history)
+                is_squeeze = bb["bandwidth"] < (avg_bandwidth * 0.6) # Bantlar son 10 günün %40'ı kadar dar
+                
+                sinyal = None
+                yon = ""
+                emoji = ""
+                
+                # 1. SIKIŞMA KIRILIMI (Squeeze Breakout)
+                if is_squeeze:
+                    if current_price > bb["upper"]: # Üst bandı kırdı
+                        sinyal = True; yon = "LONG (Yukarı Kırılım)"; emoji = "🚀"
+                        hedef = bb["upper"] + (bb["upper"] - bb["lower"]) # Bant genişliği kadar yukarı
+                        stop = bb["sma"]
+                    elif current_price < bb["lower"]: # Alt bandı kırdı
+                        sinyal = True; yon = "SHORT (Aşağı Kırılım)"; emoji = "🔻"
+                        hedef = bb["lower"] - (bb["upper"] - bb["lower"])
+                        stop = bb["sma"]
+                
+                # 2. W DİP (Çift Dip + BB Kuralı)
+                # Metin: İlk dip alt bandın dışında, ikinci dip içinde
+                p_highs, p_lows = find_pivots([float(k[2]) for k in klines_1d], [float(k[3]) for k in klines_1d])
+                if not sinyal and len(p_lows) >= 2:
+                    last_l = p_lows[-2:]
+                    if abs(last_l[0][1] - last_l[1][1]) / last_l[0][1] < 0.03:
+                        # İlk dip dışarıda, ikinci dip içeride
+                        if last_l[0][1] < bb["lower"] and last_l[1][1] > bb["lower"] and current_price > bb["sma"]:
+                            sinyal = True; yon = "LONG (W Dip)"; emoji = "🚀"
+                            hedef = bb["upper"]; stop = last_l[1][1] * 0.98
+
+                # 3. M TEPE (Çift Tepe + BB Kuralı)
+                # Metin: İlk tepe üst bandın dışında, ikinci tepe içinde
+                if not sinyal and len(p_highs) >= 2:
+                    last_h = p_highs[-2:]
+                    if abs(last_h[0][1] - last_h[1][1]) / last_h[0][1] < 0.03:
+                        # İlk tepe dışarıda, ikinci tepe içeride
+                        if last_h[0][1] > bb["upper"] and last_h[1][1] < bb["upper"] and current_price < bb["sma"]:
+                            sinyal = True; yon = "SHORT (M Tepe)"; emoji = "🔻"
+                            hedef = bb["lower"]; stop = last_h[1][1] * 1.02
+
+                if sinyal:
+                    hedef_pct = ((hedef - current_price) / current_price) * 100
+                    stop_pct = ((stop - current_price) / current_price) * 100
+                    
+                    if yon.startswith("LONG") and hedef > current_price and stop < current_price: pass
+                    elif yon.startswith("SHORT") and hedef < current_price and stop > current_price: pass
+                    else: continue
+
+                    msg = (f"{emoji} <b>BOLLINGER SİNYALİ ({yon}): {symbol}</b>\n"
+                           f"<i>Günlük Grafik - Bollinger Stratejisi</i>\n\n"
+                           f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(current_price)}\n"
+                           f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
+                           f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
+                           f"📊 <b>Orta Bant (SMA20):</b> {akilli_fiyat(bb['sma'])}\n"
+                           f"📊 <b>Üst Bant:</b> {akilli_fiyat(bb['upper'])}\n"
+                           f"📊 <b>Alt Bant:</b> {akilli_fiyat(bb['lower'])}\n"
+                           f"📈 <b>Hacim Teyidi:</b> Alındı ({current_vol/avg_vol:.1f}x)\n\n"
+                           f"💡 <b>Analiz:</b> {'Bantlar aşırı sıkıştı (Squeeze), kırılım gerçekleşti.' if is_squeeze else 'W/M formasyonu Bollinger bantlarıyla uyumlu (İlk tepe/dip dışarıda, ikincisi içeride).'} 🧠")
+                    
+                    if tg(C, msg):
+                        son_bollinger_sinyalleri[symbol] = time.time()
+                        log("BOLLINGER", f"🔥 SİNYAL: {symbol} ({yon})")
+                time.sleep(0.15) 
+            time.sleep(BOLLINGER_ARALIGI)
+        except Exception as e:
+            log("BOLLINGER", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
 # RENDER WEB SUNUCUSU
 # =====================================================
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"MSS Trap Radar Bot is running!")
+        self.wfile.write(b"Ultimate Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -437,5 +580,6 @@ if __name__ == "__main__":
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
     threading.Thread(target=formasyon_loop, daemon=True).start()
+    threading.Thread(target=bollinger_loop, daemon=True).start()
     
     run_web_server()
