@@ -23,10 +23,10 @@ TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://api.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
-RAPOR_ARALIGI = 14400      # 4 Saat
-CHARTIST_ARALIGI = 3600    # 1 Saat
-PUMP_ARALIGI = 60          # 1 Dakika
-FORMASYON_ARALIGI = 3600   # 1 Saat (1 Günlük grafik taraması)
+RAPOR_ARALIGI = 14400      # 4 Saat (Midas Flow)
+CHARTIST_ARALIGI = 3600    # 1 Saat (EMA200)
+PUMP_ARALIGI = 60          # 1 Dakika (Anlık Pump)
+FORMASYON_ARALIGI = 3600   # 1 Saat (Formasyon & MSS)
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -134,7 +134,7 @@ def trap_radar_check(symbol):
         return ""
 
 # =====================================================
-# 1. MOTOR: MİDAS FLOW
+# 1. MOTOR: MİDAS FLOW (4 SAATTE BİR)
 # =====================================================
 def get_peak_time(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
@@ -311,7 +311,7 @@ def pump_loop():
             time.sleep(60)
 
 # =====================================================
-# 4. MOTOR: YAPISAL DÖNÜŞ VE FORMASYON AVCISI (MSS / CHoCH)
+# 4. MOTOR: YAPISAL DÖNÜŞ VE FORMASYON AVCISI (FİLTRELİ)
 # =====================================================
 def find_pivots(highs, lows, window=3):
     pivot_highs = []
@@ -322,7 +322,7 @@ def find_pivots(highs, lows, window=3):
     return pivot_highs, pivot_lows
 
 def formasyon_loop():
-    log("FORMASYON", "MSS (Yapısal Dönüş) ve Formasyon Avcısı Başladı.")
+    log("FORMASYON", "MSS (Yapısal Dönüş) ve Formasyon Avcısı Başladı (Trend Filtreli).")
     time.sleep(45) 
     while True:
         try:
@@ -334,12 +334,15 @@ def formasyon_loop():
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 86400: continue
                 
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=100")
-                if not isinstance(klines, list) or len(klines) < 50: continue
+                if not isinstance(klines, list) or len(klines) < 100: continue
                 
                 highs = [float(k[2]) for k in klines]
                 lows = [float(k[3]) for k in klines]
                 closes = [float(k[4]) for k in klines]
                 current_price = closes[-1]
+                
+                # --- YENİ: ANA TREND FİLTRESİ (EMA99) ---
+                ema99 = calculate_ema(closes, 99)[-1] 
                 
                 p_highs, p_lows = find_pivots(highs, lows)
                 if len(p_highs) < 3 or len(p_lows) < 3: continue
@@ -355,32 +358,37 @@ def formasyon_loop():
                 stop = 0
 
                 # --- MİNİK YAPISAL DÖNÜŞ (MSS) MANTIĞI ---
-                # Yükselen trend (HH, HL) -> Düşen trende (LH, LL) dönüş
-                is_uptrend = (last_h[1][1] > last_h[0][1]) and (last_l[1][1] > last_l[0][1])
-                break_of_structure = current_price < last_l[1][1] # Son HL kırıldı mı?
-                lower_high_formed = last_h[2][1] < last_h[1][1] # Daha düşük tepe oluştu mu?
-
-                if is_uptrend and break_of_structure and lower_high_formed:
-                    sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bearish)"; yon = "SHORT"; emoji = "🔻"
-                    hedef = last_l[1][1] - (last_h[1][1] - last_l[1][1]) # Yapı yüksekliği kadar düşüş
-                    stop = last_h[2][1] * 1.02 # Son LH'ın üstü
-
-                # Düşen trend (LH, LL) -> Yükselen trende (HH, HL) dönüş
-                elif (last_h[1][1] < last_h[0][1]) and (last_l[1][1] < last_l[0][1]):
-                    break_of_structure = current_price > last_h[1][1] # Son LH kırıldı mı?
-                    higher_low_formed = last_l[2][1] > last_l[1][1] # Daha yüksek dip oluştu mu?
-                    
-                    if break_of_structure and higher_low_formed:
+                
+                # 1. LONG SENARYOSU (Yükseliş Dönüşü)
+                is_downtrend = (last_h[1][1] < last_h[0][1]) and (last_l[1][1] < last_l[0][1])
+                break_of_structure_up = current_price > last_h[1][1]
+                higher_low_formed = last_l[2][1] > last_l[1][1] 
+                
+                # FİLTRE: Fiyat EMA99'un üzerindeyse LONG'a izin ver
+                if is_downtrend and break_of_structure_up and higher_low_formed:
+                    if current_price > ema99: 
                         sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bullish)"; yon = "LONG"; emoji = "🚀"
                         hedef = last_h[1][1] + (last_h[1][1] - last_l[1][1])
                         stop = last_l[2][1] * 0.98
 
+                # 2. SHORT SENARYOSU (Düşüş Dönüşü)
+                is_uptrend = (last_h[1][1] > last_h[0][1]) and (last_l[1][1] > last_l[0][1])
+                break_of_structure_down = current_price < last_l[1][1]
+                lower_high_formed = last_h[2][1] < last_h[1][1]
+                
+                # FİLTRE: Fiyat EMA99'un altındaysa SHORT'a izin ver
+                elif is_uptrend and break_of_structure_down and lower_high_formed:
+                    if current_price < ema99: 
+                        sinyal = True; formasyon_adi = "Piyasa Yapısı Değişimi (MSS - Bearish)"; yon = "SHORT"; emoji = "🔻"
+                        hedef = last_l[1][1] - (last_h[1][1] - last_l[1][1])
+                        stop = last_h[2][1] * 1.02
+
                 # --- EKSTRA: Klasik Formasyonlar (M, W, OBO) ---
                 if not sinyal:
-                    if abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.03 and current_price < last_l[-1][1]:
+                    if abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.03 and current_price < last_l[-1][1] and current_price < ema99:
                         sinyal = True; formasyon_adi = "İkili Tepe (M)"; yon = "SHORT"; emoji = "🔻"
                         hedef = last_l[-1][1] - (last_h[1][1] - last_l[-1][1]); stop = last_h[2][1] * 1.02
-                    elif abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.03 and current_price > last_h[-1][1]:
+                    elif abs(last_l[0][1] - last_l[2][1]) / last_l[0][1] < 0.03 and current_price > last_h[-1][1] and current_price > ema99:
                         sinyal = True; formasyon_adi = "İkili Dip (W)"; yon = "LONG"; emoji = "🚀"
                         hedef = last_h[-1][1] + (last_h[-1][1] - last_l[1][1]); stop = last_l[2][1] * 0.98
 
@@ -397,8 +405,9 @@ def formasyon_loop():
                            f"💰 <b>Giriş (Kırılım):</b> {akilli_fiyat(current_price)}\n"
                            f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                           f"📊 <b>Açıklama:</b> Fiyat 1 günlük grafikte <b>{formasyon_adi}</b> tamamladı. Kırılan yapı teyit edildi, formasyon hedefi doğrultusunda hareket bekleniyor.\n"
-                           f"⚠️ <i>Kırılan seviye bir uyarıdır, teyit (LH/LL) alındı!</i>")
+                           f"📊 <b>Trend Filtresi (EMA99):</b> {akilli_fiyat(ema99)}\n"
+                           f"📊 <b>Açıklama:</b> Fiyat 1 günlük grafikte <b>{formasyon_adi}</b> tamamladı. Ana trend filtresi (EMA99) onaylı, hareket bekleniyor.\n"
+                           f"⚠️ <i>Kırılan seviye bir uyarıdır, teyit alındı!</i>")
                     if tg(C, msg):
                         son_formasyon_sinyalleri[symbol] = time.time()
                         log("FORMASYON", f"🔥 SİNYAL: {symbol} ({yon} - {formasyon_adi})")
