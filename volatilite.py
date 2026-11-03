@@ -29,6 +29,8 @@ PUMP_ARALIGI = 60          # 1 Dakika
 FORMASYON_ARALIGI = 3600   # 1 Saat
 BOLLINGER_ARALIGI = 3600   # 1 Saat
 ICHIMOKU_ARALIGI = 3600    # 1 Saat
+EMA_RIBBON_ARALIGI = 3600  # 1 Saat
+MACD_ARALIGI = 3600        # 1 Saat
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -36,12 +38,16 @@ MIN_HACIM_PUMP = 5_000_000
 MIN_HACIM_FORMASYON = 10_000_000 
 MIN_HACIM_BOLLINGER = 10_000_000 
 MIN_HACIM_ICHIMOKU = 10_000_000 
+MIN_HACIM_EMA_RIBBON = 10_000_000 
+MIN_HACIM_MACD = 10_000_000 
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
 son_formasyon_sinyalleri = {}
 son_bollinger_sinyalleri = {}
 son_ichimoku_sinyalleri = {}
+son_ema_ribbon_sinyalleri = {}
+son_macd_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -89,6 +95,28 @@ def calculate_ema(prices, period):
     for price in prices[period:]:
         ema.append(price * k + ema[-1] * (1 - k))
     return ema
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    if len(prices) < slow + signal: return None, None, None, None
+    
+    ema_fast = calculate_ema(prices, fast)
+    ema_slow = calculate_ema(prices, slow)
+    
+    if not ema_fast or not ema_slow: return None, None, None, None
+    
+    min_len = min(len(ema_fast), len(ema_slow))
+    macd_line = [ema_fast[-min_len+i] - ema_slow[-min_len+i] for i in range(min_len)]
+    
+    signal_line = calculate_ema(macd_line, signal)
+    
+    if not signal_line: return None, None, None, None
+    
+    current_macd = macd_line[-1]
+    current_signal = signal_line[-1]
+    prev_macd = macd_line[-2]
+    prev_signal = signal_line[-2]
+    
+    return current_macd, current_signal, prev_macd, prev_signal
 
 def calculate_bollinger(closes, period=20, num_std=2):
     if len(closes) < period: return None
@@ -549,10 +577,10 @@ def bollinger_loop():
             time.sleep(60)
 
 # =====================================================
-# 6. MOTOR: ICHIMOKU BULUTU (SÜPER ZIRHLI - YÖN TEYİTLİ)
+# 6. MOTOR: ICHIMOKU BULUTU (ZIRHLI)
 # =====================================================
 def ichimoku_loop():
-    log("ICHIMOKU", "Süper Zırhlı Ichimoku Motoru Başladı.")
+    log("ICHIMOKU", "Zırhlı Ichimoku Bulut Motoru Başladı.")
     time.sleep(75) 
     while True:
         try:
@@ -574,12 +602,11 @@ def ichimoku_loop():
                 curr_close = closes[-2]
                 prev_close = closes[-3]
                 
-                # Hacim Teyidi
                 avg_vol = sum(vols[-21:-1]) / 20
                 curr_vol = vols[-2]
                 is_vol_teyit = curr_vol > avg_vol
                 
-                if not is_vol_teyit: continue # Hacim yoksa geç
+                if not is_vol_teyit: continue 
                 
                 def calc_tenkan(idx): return (max(highs[idx-8:idx+1]) + min(lows[idx-8:idx+1])) / 2
                 def calc_kijun(idx): return (max(highs[idx-25:idx+1]) + min(lows[idx-25:idx+1])) / 2
@@ -608,18 +635,12 @@ def ichimoku_loop():
                 stop = 0
                 hedef = 0
 
-                # --- SÜPER ZIRH: KIRILIM + TREND YÖNÜ (TENKAN/KIJUN) + KALINLIK ---
-                
-                # 1. LONG Kırılımı
-                # Şartlar: Fiyat bulut üstüne çıktı + Kijun üstünde + Tenkan > Kijun (Yukarı Kesişim) + Bulut kalın
                 if prev_close <= cloud_top_prev and curr_close > cloud_top_curr and curr_close > kijun_curr and tenkan_curr > kijun_curr:
                     if cloud_thickness > (curr_close * 0.005):
                         sinyal = True; yon = "LONG (Bulut Üstü Kırılım)"; emoji = "🚀"
                         stop = min(kijun_curr, cloud_bottom_curr) * 0.99 
                         hedef = curr_close + (cloud_thickness * 2) 
 
-                # 2. SHORT Kırılımı
-                # Şartlar: Fiyat bulut altına indi + Kijun altında + Tenkan < Kijun (Aşağı Kesişim) + Bulut kalın
                 elif prev_close >= cloud_bottom_prev and curr_close < cloud_bottom_curr and curr_close < kijun_curr and tenkan_curr < kijun_curr:
                     if cloud_thickness > (curr_close * 0.005):
                         sinyal = True; yon = "SHORT (Bulut Altı Kırılım)"; emoji = "🔻"
@@ -630,7 +651,7 @@ def ichimoku_loop():
                     hedef_pct = ((hedef - curr_close) / curr_close) * 100
                     stop_pct = ((stop - curr_close) / curr_close) * 100
                     
-                    if abs(hedef_pct) < 1.0: continue # Hedef çok küçükse iptal
+                    if abs(hedef_pct) < 1.0: continue 
 
                     msg = (f"{emoji} <b>ICHIMOKU SİNYALİ ({yon}): {symbol}</b>\n"
                            f"<i>1 Saatlik Grafik - Ichimoku Bulut Kırılımı</i>\n\n"
@@ -650,6 +671,150 @@ def ichimoku_loop():
             time.sleep(ICHIMOKU_ARALIGI)
         except Exception as e:
             log("ICHIMOKU", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# 7. MOTOR: EMA DİZİLİMİ (EMA RIBBON)
+# =====================================================
+def ema_ribbon_loop():
+    log("EMA_RIBBON", "EMA Dizilimi (EMA Ribbon) Motoru Başladı.")
+    time.sleep(90) 
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_EMA_RIBBON]
+            
+            for symbol in adaylar:
+                if symbol in son_ema_ribbon_sinyalleri and time.time() - son_ema_ribbon_sinyalleri[symbol] < 86400: continue
+                
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=200")
+                if not isinstance(klines, list) or len(klines) < 200: continue
+                
+                closes = [float(k[4]) for k in klines[:-1]]
+                vols = [float(k[7]) for k in klines[:-1]]
+                current_price = closes[-1]
+                current_vol = vols[-1]
+                
+                avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 1
+                if current_vol <= (avg_vol * 1.2): continue 
+                
+                ema7 = calculate_ema(closes, 7)[-1]
+                ema25 = calculate_ema(closes, 25)[-1]
+                ema99 = calculate_ema(closes, 99)[-1]
+                ema200 = calculate_ema(closes, 200)[-1]
+                
+                is_bullish_alignment = (current_price > ema7 > ema25 > ema99 > ema200)
+                is_bearish_alignment = (current_price < ema7 < ema25 < ema99 < ema200)
+
+                sinyal = None
+                yon = ""
+                emoji = ""
+                stop = 0
+                hedef = 0
+
+                if is_bullish_alignment:
+                    sinyal = True; yon = "LONG (Güçlü Boğa Trendi)"; emoji = "🚀"
+                    stop = ema25 * 0.95 
+                    hedef = current_price * 1.20 
+
+                elif is_bearish_alignment:
+                    sinyal = True; yon = "SHORT (Güçlü Ayı Trendi)"; emoji = "🔻"
+                    stop = ema25 * 1.05 
+                    hedef = current_price * 0.80 
+
+                if sinyal:
+                    hedef_pct = ((hedef - current_price) / current_price) * 100
+                    stop_pct = ((stop - current_price) / current_price) * 100
+                    
+                    msg = (f"{emoji} <b>EMA DİZİLİMİ SİNYALİ ({yon}): {symbol}</b>\n"
+                           f"<i>1 Günlük Grafik - Çoklu EMA Dizilimi</i>\n\n"
+                           f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(current_price)}\n"
+                           f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
+                           f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
+                           f"📊 <b>EMA Dizilimi:</b>\n"
+                           f"EMA7: {akilli_fiyat(ema7)} | EMA25: {akilli_fiyat(ema25)}\n"
+                           f"EMA99: {akilli_fiyat(ema99)} | EMA200: {akilli_fiyat(ema200)}\n"
+                           f"📈 <b>Hacim Teyidi:</b> Alındı ({current_vol/avg_vol:.1f}x)\n\n"
+                           f"💡 <b>Analiz:</b> Fiyat ve tüm hareketli ortalamalar mükemmel bir {'yukarı' if yon.startswith('LONG') else 'aşağı'} yönlü dizilim oluşturdu. Trendin güçlü olduğu teyit edildi. 🧠")
+                    
+                    if tg(C, msg):
+                        son_ema_ribbon_sinyalleri[symbol] = time.time()
+                        log("EMA_RIBBON", f"🔥 SİNYAL: {symbol} ({yon})")
+                
+                time.sleep(0.1)
+            time.sleep(EMA_RIBBON_ARALIGI)
+        except Exception as e:
+            log("EMA_RIBBON", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# 8. MOTOR: MACD KIRILIM VE MOMENTUM (GÜNLÜK)
+# =====================================================
+def macd_loop():
+    log("MACD", "MACD Kırılım ve Momentum Motoru Başladı (Günlük).")
+    time.sleep(105) 
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MACD]
+            
+            for symbol in adaylar:
+                if symbol in son_macd_sinyalleri and time.time() - son_macd_sinyalleri[symbol] < 14400: continue
+                
+                # GÜNLÜK (1d) GRAFİK
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=100")
+                if not isinstance(klines, list) or len(klines) < 80: continue
+                
+                closes = [float(k[4]) for k in klines[:-1]]
+                vols = [float(k[7]) for k in klines[:-1]]
+                current_price = closes[-1]
+                current_vol = vols[-1]
+                
+                avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 1
+                if current_vol <= (avg_vol * 1.1): continue 
+                
+                macd_res = calculate_macd(closes)
+                if not macd_res or len(macd_res) < 4: continue
+                curr_macd, curr_signal, prev_macd, prev_signal = macd_res
+                
+                sinyal = None
+                yon = ""
+                emoji = ""
+                
+                if prev_macd <= prev_signal and curr_macd > curr_signal:
+                    sinyal = True; yon = "LONG (MACD Yukarı Kesişim)"; emoji = "🚀"
+                    hedef = current_price * 1.10 # Günlükte hedef daha büyük olmalı
+                    stop = current_price * 0.97
+
+                elif prev_macd >= prev_signal and curr_macd < curr_signal:
+                    sinyal = True; yon = "SHORT (MACD Aşağı Kesişim)"; emoji = "🔻"
+                    hedef = current_price * 0.90
+                    stop = current_price * 1.03
+
+                if sinyal:
+                    hedef_pct = ((hedef - current_price) / current_price) * 100
+                    stop_pct = ((stop - current_price) / current_price) * 100
+                    
+                    msg = (f"{emoji} <b>MACD SİNYALİ ({yon}): {symbol}</b>\n"
+                           f"<i>1 Günlük Grafik - MACD Momentum Kırılımı</i>\n\n"
+                           f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(current_price)}\n"
+                           f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
+                           f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
+                           f"📊 <b>MACD Çizgisi:</b> {curr_macd:.5f}\n"
+                           f"📊 <b>Sinyal Çizgisi:</b> {curr_signal:.5f}\n"
+                           f"📈 <b>Hacim Teyidi:</b> Alındı ({current_vol/avg_vol:.1f}x)\n\n"
+                           f"💡 <b>Analiz:</b> MACD çizgisi sinyal çizgisini {'yukarı' if yon.startswith('LONG') else 'aşağı'} yönlü kesti. Momentum {'artıyor' if yon.startswith('LONG') else 'zayıflıyor'}. 🧠")
+                    
+                    if tg(C, msg):
+                        son_macd_sinyalleri[symbol] = time.time()
+                        log("MACD", f"🔥 SİNYAL: {symbol} ({yon})")
+                
+                time.sleep(0.1)
+            time.sleep(MACD_ARALIGI)
+        except Exception as e:
+            log("MACD", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
@@ -678,5 +843,7 @@ if __name__ == "__main__":
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=bollinger_loop, daemon=True).start()
     threading.Thread(target=ichimoku_loop, daemon=True).start()
+    threading.Thread(target=ema_ribbon_loop, daemon=True).start()
+    threading.Thread(target=macd_loop, daemon=True).start()
     
     run_web_server()
