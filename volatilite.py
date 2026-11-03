@@ -253,11 +253,10 @@ def chartist_loop():
                     cooldown_key = f"CH_{tf}_{symbol}"
                     if cooldown_key in son_sinyaller and time.time() - son_sinyaller[cooldown_key] < 86400: continue
                     
-                    # EMA200 için 500 mum çekiyoruz (Daha doğru hesap için)
                     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=500")
                     if not isinstance(klines, list) or len(klines) < 205: continue
                     
-                    closes = [float(k[4]) for k in klines[:-1]] # Son kapanmış mumlar
+                    closes = [float(k[4]) for k in klines[:-1]]
                     current_price = closes[-1]
                     prev_close = closes[-2]
                     
@@ -266,13 +265,8 @@ def chartist_loop():
                     curr_ema200 = ema200[-1]
                     prev_ema200 = ema200[-2]
                     
-                    # Sinyal Şartları (Fakeout Kalkanı)
                     if prev_close <= prev_ema200 and current_price > curr_ema200:
-                        
-                        # ZIRH 1: Kapanış EMA200'ün en az %1 üzerinde olmalı (Sadece değip geçmesin)
                         if current_price > (curr_ema200 * 1.01):
-                            
-                            # ZIRH 2: Hacim Teyidi (Son mumun hacmi ortalamanın üzerinde olmalı)
                             vols = [float(k[7]) for k in klines[:-1]]
                             avg_vol = sum(vols[-21:-1]) / 20
                             curr_vol = vols[-1]
@@ -555,10 +549,10 @@ def bollinger_loop():
             time.sleep(60)
 
 # =====================================================
-# 6. MOTOR: ICHIMOKU BULUTU (KÜTÜPHANESİZ)
+# 6. MOTOR: ICHIMOKU BULUTU (SÜPER ZIRHLI - YÖN TEYİTLİ)
 # =====================================================
 def ichimoku_loop():
-    log("ICHIMOKU", "Ichimoku Bulut Motoru Başladı.")
+    log("ICHIMOKU", "Süper Zırhlı Ichimoku Motoru Başladı.")
     time.sleep(75) 
     while True:
         try:
@@ -575,9 +569,17 @@ def ichimoku_loop():
                 highs = [float(k[2]) for k in klines]
                 lows = [float(k[3]) for k in klines]
                 closes = [float(k[4]) for k in klines]
+                vols = [float(k[7]) for k in klines]
                 
                 curr_close = closes[-2]
                 prev_close = closes[-3]
+                
+                # Hacim Teyidi
+                avg_vol = sum(vols[-21:-1]) / 20
+                curr_vol = vols[-2]
+                is_vol_teyit = curr_vol > avg_vol
+                
+                if not is_vol_teyit: continue # Hacim yoksa geç
                 
                 def calc_tenkan(idx): return (max(highs[idx-8:idx+1]) + min(lows[idx-8:idx+1])) / 2
                 def calc_kijun(idx): return (max(highs[idx-25:idx+1]) + min(lows[idx-25:idx+1])) / 2
@@ -595,6 +597,7 @@ def ichimoku_loop():
                 
                 cloud_top_curr = max(span_a_curr, span_b_curr)
                 cloud_bottom_curr = min(span_a_curr, span_b_curr)
+                cloud_thickness = cloud_top_curr - cloud_bottom_curr
                 
                 cloud_top_prev = max(span_a_prev, span_b_prev)
                 cloud_bottom_prev = min(span_a_prev, span_b_prev)
@@ -605,28 +608,39 @@ def ichimoku_loop():
                 stop = 0
                 hedef = 0
 
-                if prev_close <= cloud_top_prev and curr_close > cloud_top_curr:
-                    sinyal = True; yon = "LONG (Bulut Üstü Kırılım)"; emoji = "🚀"
-                    stop = min(kijun_curr, cloud_bottom_curr) * 0.99 
-                    hedef = curr_close + (cloud_top_curr - cloud_bottom_curr) * 2 
+                # --- SÜPER ZIRH: KIRILIM + TREND YÖNÜ (TENKAN/KIJUN) + KALINLIK ---
+                
+                # 1. LONG Kırılımı
+                # Şartlar: Fiyat bulut üstüne çıktı + Kijun üstünde + Tenkan > Kijun (Yukarı Kesişim) + Bulut kalın
+                if prev_close <= cloud_top_prev and curr_close > cloud_top_curr and curr_close > kijun_curr and tenkan_curr > kijun_curr:
+                    if cloud_thickness > (curr_close * 0.005):
+                        sinyal = True; yon = "LONG (Bulut Üstü Kırılım)"; emoji = "🚀"
+                        stop = min(kijun_curr, cloud_bottom_curr) * 0.99 
+                        hedef = curr_close + (cloud_thickness * 2) 
 
-                elif prev_close >= cloud_bottom_prev and curr_close < cloud_bottom_curr:
-                    sinyal = True; yon = "SHORT (Bulut Altı Kırılım)"; emoji = "🔻"
-                    stop = max(kijun_curr, cloud_top_curr) * 1.01 
-                    hedef = curr_close - (cloud_top_curr - cloud_bottom_curr) * 2
+                # 2. SHORT Kırılımı
+                # Şartlar: Fiyat bulut altına indi + Kijun altında + Tenkan < Kijun (Aşağı Kesişim) + Bulut kalın
+                elif prev_close >= cloud_bottom_prev and curr_close < cloud_bottom_curr and curr_close < kijun_curr and tenkan_curr < kijun_curr:
+                    if cloud_thickness > (curr_close * 0.005):
+                        sinyal = True; yon = "SHORT (Bulut Altı Kırılım)"; emoji = "🔻"
+                        stop = max(kijun_curr, cloud_top_curr) * 1.01 
+                        hedef = curr_close - (cloud_thickness * 2)
 
                 if sinyal:
                     hedef_pct = ((hedef - curr_close) / curr_close) * 100
                     stop_pct = ((stop - curr_close) / curr_close) * 100
                     
+                    if abs(hedef_pct) < 1.0: continue # Hedef çok küçükse iptal
+
                     msg = (f"{emoji} <b>ICHIMOKU SİNYALİ ({yon}): {symbol}</b>\n"
                            f"<i>1 Saatlik Grafik - Ichimoku Bulut Kırılımı</i>\n\n"
                            f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(curr_close)}\n"
                            f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
                            f"☁️ <b>Bulut (Kumo) Bölgesi:</b> {akilli_fiyat(cloud_bottom_curr)} - {akilli_fiyat(cloud_top_curr)}\n"
-                           f"📈 <b>Tenkan-sen:</b> {akilli_fiyat(tenkan_curr)} | <b>Kijun-sen:</b> {akilli_fiyat(kijun_curr)}\n\n"
-                           f"💡 <b>Analiz:</b> Fiyat Ichimoku bulutunu {'yukarı' if yon.startswith('LONG') else 'aşağı'} yönlü kırarak trend dönüşünü teyit etti. 🧠")
+                           f"📈 <b>Tenkan-sen:</b> {akilli_fiyat(tenkan_curr)} | <b>Kijun-sen:</b> {akilli_fiyat(kijun_curr)}\n"
+                           f"📊 <b>Hacim Teyidi:</b> Alındı\n\n"
+                           f"💡 <b>Analiz:</b> Fiyat bulutu ve Kijun-sen'i kırdı, Tenkan/Kijun yönü teyit etti. 🧠")
                     
                     if tg(C, msg):
                         son_ichimoku_sinyalleri[symbol] = time.time()
