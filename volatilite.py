@@ -28,6 +28,7 @@ PUMP_ARALIGI = 60          # 1 Dakika
 FORMASYON_ARALIGI = 3600   # 1 Saat
 EMA_RIBBON_ARALIGI = 3600  # 1 Saat
 MACD_ARALIGI = 3600        # 1 Saat
+MIDAS_SETUP_ARALIGI = 7200 # 2 Saat (Yeni Motor)
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -35,12 +36,14 @@ MIN_HACIM_PUMP = 5_000_000
 MIN_HACIM_FORMASYON = 10_000_000 
 MIN_HACIM_EMA_RIBBON = 10_000_000 
 MIN_HACIM_MACD = 10_000_000 
+MIN_HACIM_MIDAS_SETUP = 15_000_000 
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
 son_formasyon_sinyalleri = {}
 son_ema_ribbon_sinyalleri = {}
 son_macd_sinyalleri = {}
+son_midas_setup_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -160,7 +163,7 @@ def trap_radar_check(symbol):
         return ""
 
 # =====================================================
-# 1. MOTOR: MİDAS FLOW
+# 1. MOTOR: MİDAS FLOW (RAPOR)
 # =====================================================
 def get_peak_time(symbol):
     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=24")
@@ -246,7 +249,7 @@ def midas_flow_loop():
             time.sleep(60)
 
 # =====================================================
-# 2. MOTOR: CHARTIST (EMA200 KIRILIMI - ZIRHLI)
+# 2. MOTOR: CHARTIST (EMA200)
 # =====================================================
 def chartist_loop():
     log("CHARTIST", "Zırhlı EMA200 Motoru Başladı.")
@@ -605,13 +608,120 @@ def macd_loop():
             time.sleep(60)
 
 # =====================================================
+# 7. MOTOR: MIDAS SETUP (FIBO VE EMİR DEFTERİ ANALİZİ)
+# =====================================================
+def midas_setup_loop():
+    log("MIDAS_SETUP", "Midas Setup (Fibo & Order Book) Motoru Başladı.")
+    time.sleep(120)
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MIDAS_SETUP]
+            
+            for symbol in adaylar:
+                if symbol in son_midas_setup_sinyalleri and time.time() - son_midas_setup_sinyalleri[symbol] < 14400: continue
+                
+                # 4 Saatlik ve 1 Günlük trend yönünü belirle
+                klines_4h = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=4h&limit=50")
+                klines_1d = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=50")
+                
+                if not isinstance(klines_4h, list) or not isinstance(klines_1d, list): continue
+                if len(klines_4h) < 50 or len(klines_1d) < 50: continue
+                
+                closes_4h = [float(k[4]) for k in klines_4h]
+                closes_1d = [float(k[4]) for k in klines_1d]
+                current_price = closes_4h[-1]
+                
+                ema99_4h = calculate_ema(closes_4h, 99)[-1] if len(closes_4h) >= 99 else current_price
+                ema99_1d = calculate_ema(closes_1d, 99)[-1] if len(closes_1d) >= 99 else current_price
+                
+                is_4h_down = current_price < ema99_4h
+                is_1d_down = current_price < ema99_1d
+                
+                # Kontra-Trend Kontrolü (4s ve 1g düşüşteyse ama anlık yukarı tepki varsa)
+                if is_4h_down and is_1d_down:
+                    
+                    # Son 24 saatin en yüksek ve en düşüğünü bul (Fibo için)
+                    highs_24h = [float(k[2]) for k in klines_4h[-6:]] # 6 * 4h = 24h
+                    lows_24h = [float(k[3]) for k in klines_4h[-6:]]
+                    
+                    high_24h = max(highs_24h)
+                    low_24h = min(lows_24h)
+                    
+                    if high_24h == low_24h: continue
+                    
+                    # Fibonacci Seviyeleri
+                    diff = high_24h - low_24h
+                    fib_618 = high_24h - (diff * 0.618)
+                    fib_50 = high_24h - (diff * 0.50)
+                    fib_382 = high_24h - (diff * 0.382)
+                    
+                    # Fiyat Fibo 0.618'e çok yakınsa (Tetikleyici)
+                    if abs(current_price - fib_618) / current_price < 0.02:
+                        
+                        # Emir Defteri (Order Book) Duvarlarını Bul
+                        depth = gj(f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=100")
+                        if not depth: continue
+                        
+                        bids = depth['bids']
+                        asks = depth['asks']
+                        
+                        max_bid = max([float(b[0]) * float(b[1]) for b in bids]) if bids else 0
+                        max_ask = max([float(a[0]) * float(a[1]) for a in asks]) if asks else 0
+                        
+                        # Duvarların fiyatlarını bul
+                        bid_wall_price = 0
+                        ask_wall_price = 0
+                        for b in bids:
+                            if float(b[0]) * float(b[1]) == max_bid:
+                                bid_wall_price = float(b[0])
+                                break
+                        for a in asks:
+                            if float(a[0]) * float(a[1]) == max_ask:
+                                ask_wall_price = float(a[0])
+                                break
+                                
+                        # Hedefler ve Stop
+                        tp1 = fib_50
+                        tp2 = fib_382
+                        tp3 = high_24h
+                        
+                        stop_loss = low_24h * 0.99 # Desteğin hemen altı
+                        
+                        tp1_pct = ((tp1 - current_price) / current_price) * 100
+                        tp2_pct = ((tp2 - current_price) / current_price) * 100
+                        tp3_pct = ((tp3 - current_price) / current_price) * 100
+                        stop_pct = ((stop_loss - current_price) / current_price) * 100
+                        
+                        coin = symbol.replace("USDT", "")
+                        
+                        msg = (f"<b>#{symbol}</b>\n\n"
+                               f"Fiyat: <b>{akilli_fiyat(current_price)}</b>\n"
+                               f"Hedefler: <b>{akilli_fiyat(tp1)}</b> ({tp1_pct:+.1f}%) → <b>{akilli_fiyat(tp2)}</b> ({tp2_pct:+.1f}%) → <b>{akilli_fiyat(tp3)}</b> ({tp3_pct:+.1f}%)\n"
+                               f"İptal: <b>{akilli_fiyat(stop_loss)}</b> ({stop_pct:+.1f}%) altında\n\n"
+                               f"{coin} kontra trendde. Trend 4s/1g aşağı 📉, piyasa akışı LONG seçti ⚡. Kilit hakem — Fib 0.618 {akilli_fiyat(fib_618)}.\n\n"
+                               f"Fiyat iyice yaklaştı. Tetikleyicinin üzerinde <b>${max_ask/1000:.1f}k satış duvarı</b> (ask-wall) var 🧱. Oradan Fib 0.5 hedefine <b>{akilli_fiyat(tp1)}</b> ({tp1_pct:+.1f}%) — tek adım. Ardından Fib 0.382 <b>{akilli_fiyat(tp2)}</b> ({tp2_pct:+.1f}%). 🎯\n\n"
+                               f"Dibi tutan <b>${max_bid/1000:.1f}k alım duvarı</b> (bid-wall) ve destek bölgesi 🛡️. İptal: <b>{akilli_fiyat(stop_loss)}</b> (destek, {stop_pct:+.1f}%) — çok sıkı. Duvar yok, stop tamamen yapısal. 🧠")
+                        
+                        if tg(C, msg):
+                            son_midas_setup_sinyalleri[symbol] = time.time()
+                            log("MIDAS_SETUP", f"🔥 SETUP SİNYALİ: {symbol}")
+                
+                time.sleep(0.1)
+            time.sleep(MIDAS_SETUP_ARALIGI)
+        except Exception as e:
+            log("MIDAS_SETUP", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
 # RENDER WEB SUNUCUSU
 # =====================================================
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Ultimate Bot is running!")
+        self.wfile.write(b"Midas Flow Ultimate Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -630,5 +740,8 @@ if __name__ == "__main__":
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=ema_ribbon_loop, daemon=True).start()
     threading.Thread(target=macd_loop, daemon=True).start()
+    
+    # Yeni Eklenen Motor: Midas Setup (Fibo & Order Book)
+    threading.Thread(target=midas_setup_loop, daemon=True).start()
     
     run_web_server()
