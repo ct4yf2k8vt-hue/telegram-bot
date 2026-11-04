@@ -7,7 +7,6 @@ import os
 import threading
 import http.server
 import socketserver
-import math
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
@@ -27,7 +26,6 @@ RAPOR_ARALIGI = 14400      # 4 Saat
 CHARTIST_ARALIGI = 3600    # 1 Saat
 PUMP_ARALIGI = 60          # 1 Dakika
 FORMASYON_ARALIGI = 3600   # 1 Saat
-BOLLINGER_ARALIGI = 3600   # 1 Saat
 EMA_RIBBON_ARALIGI = 3600  # 1 Saat
 MACD_ARALIGI = 3600        # 1 Saat
 
@@ -35,14 +33,12 @@ MACD_ARALIGI = 3600        # 1 Saat
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_PUMP = 5_000_000     
 MIN_HACIM_FORMASYON = 10_000_000 
-MIN_HACIM_BOLLINGER = 10_000_000 
 MIN_HACIM_EMA_RIBBON = 10_000_000 
 MIN_HACIM_MACD = 10_000_000 
 
 son_sinyaller = {}
 son_pump_sinyalleri = {}
 son_formasyon_sinyalleri = {}
-son_bollinger_sinyalleri = {}
 son_ema_ribbon_sinyalleri = {}
 son_macd_sinyalleri = {}
 
@@ -114,18 +110,6 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     prev_signal = signal_line[-2]
     
     return current_macd, current_signal, prev_macd, prev_signal
-
-def calculate_bollinger(closes, period=20, num_std=2):
-    if len(closes) < period: return None
-    recent_closes = closes[-period:]
-    sma = sum(recent_closes) / period
-    variance = sum((x - sma) ** 2 for x in recent_closes) / period
-    std_dev = math.sqrt(variance)
-    upper_band = sma + (num_std * std_dev)
-    lower_band = sma - (num_std * std_dev)
-    bandwidth = (upper_band - lower_band) / sma if sma > 0 else 0
-    current_close = closes[-1]
-    return {"sma": sma, "upper": upper_band, "lower": lower_band, "bandwidth": bandwidth, "close": current_close}
 
 def get_market_trend(tickers):
     try:
@@ -478,103 +462,7 @@ def formasyon_loop():
             time.sleep(60)
 
 # =====================================================
-# 5. MOTOR: BOLLINGER (Squeeze & W/M)
-# =====================================================
-def bollinger_loop():
-    log("BOLLINGER", "Bollinger Bant ve Sıkışma Motoru Başladı.")
-    time.sleep(60) 
-    while True:
-        try:
-            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
-            if not isinstance(tickers, list): time.sleep(60); continue
-            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_BOLLINGER]
-            
-            for symbol in adaylar:
-                if symbol in son_bollinger_sinyalleri and time.time() - son_bollinger_sinyalleri[symbol] < 86400: continue
-                
-                klines_1d = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=50")
-                if not isinstance(klines_1d, list) or len(klines_1d) < 25: continue
-                
-                closes_1d = [float(k[4]) for k in klines_1d[:-1]] 
-                vols_1d = [float(k[7]) for k in klines_1d[:-1]]
-                current_price = closes_1d[-1]
-                current_vol = vols_1d[-1]
-                
-                avg_vol = sum(vols_1d[-21:-1]) / 20 if len(vols_1d) >= 21 else 1
-                if current_vol <= (avg_vol * 1.2): continue 
-
-                bb = calculate_bollinger(closes_1d, 20, 2)
-                if not bb: continue
-                
-                bandwidth_history = []
-                for i in range(10, 0, -1):
-                    past_closes = closes_1d[:-i]
-                    past_bb = calculate_bollinger(past_closes, 20, 2)
-                    if past_bb: bandwidth_history.append(past_bb["bandwidth"])
-                
-                if not bandwidth_history: continue
-                avg_bandwidth = sum(bandwidth_history) / len(bandwidth_history)
-                is_squeeze = bb["bandwidth"] < (avg_bandwidth * 0.6)
-                
-                sinyal = None
-                yon = ""
-                emoji = ""
-                
-                if is_squeeze:
-                    if current_price > bb["upper"]: 
-                        sinyal = True; yon = "LONG (Yukarı Kırılım)"; emoji = "🚀"
-                        hedef = bb["upper"] + (bb["upper"] - bb["lower"])
-                        stop = bb["sma"]
-                    elif current_price < bb["lower"]: 
-                        sinyal = True; yon = "SHORT (Aşağı Kırılım)"; emoji = "🔻"
-                        hedef = bb["lower"] - (bb["upper"] - bb["lower"])
-                        stop = bb["sma"]
-                
-                p_highs, p_lows = find_pivots([float(k[2]) for k in klines_1d], [float(k[3]) for k in klines_1d])
-                if not sinyal and len(p_lows) >= 2:
-                    last_l = p_lows[-2:]
-                    if abs(last_l[0][1] - last_l[1][1]) / last_l[0][1] < 0.03:
-                        if last_l[0][1] < bb["lower"] and last_l[1][1] > bb["lower"] and current_price > bb["sma"]:
-                            sinyal = True; yon = "LONG (W Dip)"; emoji = "🚀"
-                            hedef = bb["upper"]; stop = last_l[1][1] * 0.98
-
-                if not sinyal and len(p_highs) >= 2:
-                    last_h = p_highs[-2:]
-                    if abs(last_h[0][1] - last_h[1][1]) / last_h[0][1] < 0.03:
-                        if last_h[0][1] > bb["upper"] and last_h[1][1] < bb["upper"] and current_price < bb["sma"]:
-                            sinyal = True; yon = "SHORT (M Tepe)"; emoji = "🔻"
-                            hedef = bb["lower"]; stop = last_h[1][1] * 1.02
-
-                if sinyal:
-                    hedef_pct = ((hedef - current_price) / current_price) * 100
-                    stop_pct = ((stop - current_price) / current_price) * 100
-                    
-                    if yon.startswith("LONG") and hedef > current_price and stop < current_price: pass
-                    elif yon.startswith("SHORT") and hedef < current_price and stop > current_price: pass
-                    else: continue
-
-                    msg = (f"{emoji} <b>BOLLINGER SİNYALİ ({yon}): {symbol}</b>\n"
-                           f"<i>Günlük Grafik - Bollinger Stratejisi</i>\n\n"
-                           f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(current_price)}\n"
-                           f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
-                           f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                           f"📊 <b>Orta Bant (SMA20):</b> {akilli_fiyat(bb['sma'])}\n"
-                           f"📊 <b>Üst Bant:</b> {akilli_fiyat(bb['upper'])}\n"
-                           f"📊 <b>Alt Bant:</b> {akilli_fiyat(bb['lower'])}\n"
-                           f"📈 <b>Hacim Teyidi:</b> Alındı ({current_vol/avg_vol:.1f}x)\n\n"
-                           f"💡 <b>Analiz:</b> {'Bantlar aşırı sıkıştı, kırılım gerçekleşti.' if is_squeeze else 'W/M formasyonu Bollinger bantlarıyla uyumlu.'} 🧠")
-                    
-                    if tg(C, msg):
-                        son_bollinger_sinyalleri[symbol] = time.time()
-                        log("BOLLINGER", f"🔥 SİNYAL: {symbol} ({yon})")
-                time.sleep(0.15) 
-            time.sleep(BOLLINGER_ARALIGI)
-        except Exception as e:
-            log("BOLLINGER", f"Hata: {e}")
-            time.sleep(60)
-
-# =====================================================
-# 6. MOTOR: EMA DİZİLİMİ (EMA RIBBON)
+# 5. MOTOR: EMA DİZİLİMİ (EMA RIBBON)
 # =====================================================
 def ema_ribbon_loop():
     log("EMA_RIBBON", "EMA Dizilimi (EMA Ribbon) Motoru Başladı.")
@@ -649,7 +537,7 @@ def ema_ribbon_loop():
             time.sleep(60)
 
 # =====================================================
-# 7. MOTOR: MACD KIRILIM VE MOMENTUM (GÜNLÜK)
+# 6. MOTOR: MACD KIRILIM VE MOMENTUM (GÜNLÜK)
 # =====================================================
 def macd_loop():
     log("MACD", "MACD Kırılım ve Momentum Motoru Başladı (Günlük).")
@@ -740,7 +628,6 @@ if __name__ == "__main__":
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
     threading.Thread(target=formasyon_loop, daemon=True).start()
-    threading.Thread(target=bollinger_loop, daemon=True).start()
     threading.Thread(target=ema_ribbon_loop, daemon=True).start()
     threading.Thread(target=macd_loop, daemon=True).start()
     
