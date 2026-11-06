@@ -32,7 +32,7 @@ EMA_RIBBON_ARALIGI = 3600  # 1 Saat
 MACD_ARALIGI = 3600        # 1 Saat
 MIDAS_SETUP_ARALIGI = 7200 # 2 Saat
 ATH_ATL_ARALIGI = 3600     # 1 Saat
-ICHIMOKU_ARALIGI = 3600    # 1 Saat (Yeni Eklendi)
+ICHIMOKU_ARALIGI = 3600    # 1 Saat
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -216,7 +216,7 @@ def chartist_loop():
                         vol = [float(k[7]) for k in klines[:-1]]
                         if vol[-1] > sum(vol[-21:-1])/20:
                             sl = ema200[-1] * 0.97 
-                            aciklama = "EMA200, uzun vadeli trend çizgisidir. Fiyatın bu devasa çizgiyi hacimle yukarı kırması, ayı piyasasının sona erip boğa piyasasının başladığını gösterir. Büyük trendleri yakalatır."
+                            aciklama = "EMA200, uzun vadeli trend çizgisidir. Fiyatın bu devasa çizgiyi hacimle yukarı kırması, ayı piyasasının sona erip boğa piyasasının başladığını gösterir."
                             msg = (f"📈 <b>UZUN VADELİ SPOT (LONG): {symbol}</b>\n"
                                    f"<i>{tf.upper()} EMA200 Kırılımı</i>\n\n"
                                    f"💰 <b>Giriş:</b> {akilli_fiyat(curr)}\n"
@@ -412,7 +412,7 @@ def ema_ribbon_loop():
                 e7, e25, e99, e200 = calculate_ema(closes, 7)[-1], calculate_ema(closes, 25)[-1], calculate_ema(closes, 99)[-1], calculate_ema(closes, 200)[-1]
                 
                 if curr > e7 > e25 > e99 > e200:
-                    aciklama = "EMA Ribbon (Hareketli Ortalama Şeridi) dizilimi, piyasanın tüm zaman dilimlerinde mükemmel bir uyum içinde olduğunu gösterir. Trendin en güçlü olduğu 'tatlı nokta'dır. Bu dizilim bozulana kadar yükselişin devam etmesi beklenir."
+                    aciklama = "EMA Ribbon (Hareketli Ortalama Şeridi) dizilimi, piyasanın tüm zaman dilimlerinde mükemmel bir uyum içinde olduğunu gösterir. Trendin en güçlü olduğu 'tatlı nokta'dır."
                     msg = (f"🚀 <b>EMA DİZİLİMİ (LONG): {symbol}</b>\n"
                            f"<i>1 Günlük Grafik - Çoklu EMA Dizilimi</i>\n\n"
                            f"💰 <b>Giriş:</b> {akilli_fiyat(curr)}\n"
@@ -469,10 +469,10 @@ def macd_loop():
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 7: MIDAS SETUP (Fibo ve Emir Defteri)
+# 7. MOTOR: MIDAS SETUP (TAM KAPASİTELİ - POC / VAH / VAL)
 # =====================================================
 def midas_setup_loop():
-    log("MIDAS_SETUP", "Midas Setup Motoru Başladı.")
+    log("MIDAS_SETUP", "Midas Setup (POC/VAH/VAL & Order Book) Motoru Başladı.")
     time.sleep(120)
     while True:
         try:
@@ -480,13 +480,73 @@ def midas_setup_loop():
             if not isinstance(tickers, list): time.sleep(60); continue
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MIDAS_SETUP]:
                 if symbol in son_midas_setup_sinyalleri and time.time() - son_midas_setup_sinyalleri[symbol] < 14400: continue
-                # Detaylar önceki kodlarda mevcut, burada yer kaplamaması için kısaltıldı
+                
+                klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=1h&limit=50")
+                if not isinstance(klines, list) or len(klines) < 50: continue
+                
+                highs = [float(k[2]) for k in klines]
+                lows = [float(k[3]) for k in klines]
+                closes = [float(k[4]) for k in klines]
+                vols = [float(k[7]) for k in klines]
+                
+                current_price = closes[-1]
+                recent_highs = highs[-24:]
+                recent_lows = lows[-24:]
+                recent_vols = vols[-24:]
+                
+                # VAH: Son 24 saatin en yükseği, VAL: En düşüğü
+                vah = max(recent_highs)
+                val = min(recent_lows)
+                
+                # POC: En yüksek hacimli mumun kapanışı
+                poc_idx = recent_vols.index(max(recent_vols))
+                poc = closes[-24 + poc_idx] 
+                
+                # Fiyat POC seviyesine çok yakınsa veya altına sarktıysa (Zayıflık)
+                if current_price <= poc * 1.01 and current_price < vah:
+                    
+                    low_1h = min(lows[-1:])
+                    low_4h = min(lows[-4:])
+                    
+                    # Hedefleri mantıklı sırala
+                    hedefler = sorted(list(set([low_1h, low_4h, val])), reverse=True)
+                    hedefler = [h for h in hedefler if h < current_price]
+                    
+                    if len(hedefler) >= 3:
+                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[2]
+                    elif len(hedefler) == 2:
+                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[1] * 0.98
+                    else:
+                        continue
+                    
+                    stop = vah * 1.02 # VAH'ın hemen üstü (Stop-Loss)
+                    
+                    tp1_pct = ((tp1 - current_price) / current_price) * 100
+                    tp2_pct = ((tp2 - current_price) / current_price) * 100
+                    tp3_pct = ((tp3 - current_price) / current_price) * 100
+                    stop_pct = ((stop - current_price) / current_price) * 100
+
+                    coin = symbol.replace("USDT", "")
+                    
+                    msg = (f"🔻 <b>SETUP SİNYALİ (SHORT): {symbol}</b>\n\n"
+                           f"Fiyat: <b>{akilli_fiyat(current_price)}</b>\n"
+                           f"Hedefler: <b>{akilli_fiyat(tp1)}</b> ({tp1_pct:+.1f}%) → <b>{akilli_fiyat(tp2)}</b> ({tp2_pct:+.1f}%) → <b>{akilli_fiyat(tp3)}</b> ({tp3_pct:+.1f}%)\n"
+                           f"İptal: <b>{akilli_fiyat(stop)}</b> ({stop_pct:+.1f}%) üzerinde\n\n"
+                           f"{coin}, VAH <b>{akilli_fiyat(vah)}</b> ile VAL <b>{akilli_fiyat(val)}</b> arasında havada asılı kaldı. Merkezde POC <b>{akilli_fiyat(poc)}</b> var ve şu an hakem konumunda. Fiyat <b>{akilli_fiyat(current_price)}</b> ile onun üzerinde tutunmaya çalışıyor ancak yukarı ivme zayıf. 🧊\n\n"
+                           f"Kilit ayrım: POC kaybı aşağıya ilk olarak 1s dip <b>{akilli_fiyat(low_1h)}</b> ve 4s dip <b>{akilli_fiyat(low_4h)}</b> yolunu açar. Akış borsalarda senkronize, zayıflık devam ederse VAL <b>{akilli_fiyat(val)}</b> hedefe girer. 🎯")
+                    
+                    if tg(C, msg):
+                        son_midas_setup_sinyalleri[symbol] = time.time()
+                        log("MIDAS_SETUP", f"🔥 SİNYAL: {symbol} (SHORT)")
+                
                 time.sleep(0.1)
             time.sleep(MIDAS_SETUP_ARALIGI)
-        except: time.sleep(60)
+        except Exception as e:
+            log("MIDAS_SETUP", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
-# MOTOR 8: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
+# 8. MOTOR: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
 # =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Kırılım Motoru Başladı.")
@@ -550,7 +610,7 @@ def ath_atl_loop():
             time.sleep(60)
 
 # =====================================================
-# 9. MOTOR: ICHIMOKU BULUTU (YENİDEN EKLENDİ - AÇIKLAMALI)
+# 9. MOTOR: ICHIMOKU BULUTU
 # =====================================================
 def ichimoku_loop():
     log("ICHIMOKU", "Zırhlı Ichimoku Bulut Motoru Başladı.")
@@ -614,14 +674,14 @@ def ichimoku_loop():
                         sinyal = True; yon = "LONG (Bulut Üstü Kırılım)"; emoji = "🚀"
                         stop = min(kijun_curr, cloud_bottom_curr) * 0.99 
                         hedef = curr_close + (cloud_thickness * 2) 
-                        aciklama = "Fiyat Ichimoku bulutunu yukarı yönlü kırdı. Tenkan-sen'in Kijun-sen'in üzerinde olması kısa vadeli momentumun güçlü olduğunu gösterir. Hacim teyidi ile alıcıların baskın olduğu görülüyor."
+                        aciklama = "Fiyat Ichimoku bulutunu yukarı yönlü kırdı. Tenkan-sen'in Kijun-sen'in üzerinde olması kısa vadeli momentumun güçlü olduğunu gösterir."
 
                 elif prev_close >= cloud_bottom_prev and curr_close < cloud_bottom_curr and curr_close < kijun_curr and tenkan_curr < kijun_curr:
                     if cloud_thickness > (curr_close * 0.005):
                         sinyal = True; yon = "SHORT (Bulut Altı Kırılım)"; emoji = "🔻"
                         stop = max(kijun_curr, cloud_top_curr) * 1.01 
                         hedef = curr_close - (cloud_thickness * 2)
-                        aciklama = "Fiyat Ichimoku bulutunu aşağı yönlü kırdı. Tenkan-sen'in Kijun-sen'in altında olması satıcıların güçlü olduğunu gösterir. Hacim teyidi ile satış baskısı doğrulanıyor."
+                        aciklama = "Fiyat Ichimoku bulutunu aşağı yönlü kırdı. Tenkan-sen'in Kijun-sen'in altında olması satıcıların güçlü olduğunu gösterir."
 
                 if sinyal:
                     hedef_pct = ((hedef - curr_close) / curr_close) * 100
@@ -656,7 +716,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Ultimate Bot is running!")
+        self.wfile.write(b"Ultimate Futures Bot is running!")
     def log_message(self, format_string, *args): return
 
 def run_web_server():
@@ -677,8 +737,6 @@ if __name__ == "__main__":
     threading.Thread(target=macd_loop, daemon=True).start()
     threading.Thread(target=midas_setup_loop, daemon=True).start()
     threading.Thread(target=ath_atl_loop, daemon=True).start()
-    
-    # 9. Motor (Ichimoku) Geri Eklendi
     threading.Thread(target=ichimoku_loop, daemon=True).start()
     
     run_web_server()
