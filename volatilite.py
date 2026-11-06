@@ -7,7 +7,7 @@ import os
 import threading
 import http.server
 import socketserver
-import statistics # YENİ: Bollinger Standart Sapma için
+import statistics
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
@@ -33,8 +33,8 @@ MIDAS_SETUP_ARALIGI = 7200 # 2 Saat
 ATH_ATL_ARALIGI = 3600     # 1 Saat
 DIGITAL_CHARTIST_ARALIGI = 3600 # 1 Saat
 SMA200_ARALIGI = 3600      # 1 Saat
-BOLLINGER_ARALIGI = 3600   # 1 Saat (Yeni)
-ICHIMOKU_ARALIGI = 3600    # 1 Saat (Yeni)
+BOLLINGER_ARALIGI = 3600   # 1 Saat
+ICHIMOKU_ARALIGI = 3600    # 1 Saat
 
 # FİLTRELER (Hacim)
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -46,8 +46,8 @@ MIN_HACIM_MIDAS_SETUP = 15_000_000
 MIN_HACIM_ATH_ATL = 5_000_000 
 MIN_HACIM_DIGITAL = 10_000_000 
 MIN_HACIM_SMA200 = 15_000_000  
-MIN_HACIM_BOLLINGER = 10_000_000 # Yeni
-MIN_HACIM_ICHIMOKU = 10_000_000  # Yeni
+MIN_HACIM_BOLLINGER = 10_000_000 
+MIN_HACIM_ICHIMOKU = 10_000_000  
 
 # SİNYAL HAFIZALARI (Aynı sinyalin tekrarlanmasını önler)
 son_sinyaller = {}
@@ -59,8 +59,8 @@ son_midas_setup_sinyalleri = {}
 son_ath_atl_sinyalleri = {}
 son_chartist_sinyalleri = {} 
 son_sma200_sinyalleri = {}   
-son_bollinger_sinyalleri = {} # Yeni
-son_ichimoku_sinyalleri = {}  # Yeni
+son_bollinger_sinyalleri = {} 
+son_ichimoku_sinyalleri = {}  
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -135,7 +135,6 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     if not signal_line: return None, None, None, None
     return macd_line[-1], signal_line[-1], macd_line[-2], signal_line[-2]
 
-# YENİ: Bollinger Bantları Hesaplama
 def calculate_bollinger(prices, period=20, std_dev=2):
     if len(prices) < period: return None, None, None
     sma = sum(prices[-period:]) / period
@@ -144,16 +143,12 @@ def calculate_bollinger(prices, period=20, std_dev=2):
     lower_band = sma - (std_dev * std)
     return upper_band, sma, lower_band
 
-# YENİ: Ichimoku Bulutu (Kumo) Hesaplama (Basitleştirilmiş)
 def calculate_ichimoku(highs, lows, closes):
     if len(closes) < 52: return None, None
-    # Tenkan-sen (9), Kijun-sen (26), Senkou Span B (52)
     tenkan = (max(highs[-9:]) + min(lows[-9:])) / 2
     kijun = (max(highs[-26:]) + min(lows[-26:])) / 2
     senkou_a = (tenkan + kijun) / 2
     senkou_b = (max(highs[-52:]) + min(lows[-52:])) / 2
-    
-    # Bulutun üst ve alt sınırları
     cloud_top = max(senkou_a, senkou_b)
     cloud_bottom = min(senkou_a, senkou_b)
     return cloud_top, cloud_bottom
@@ -175,6 +170,29 @@ def get_market_trend(tickers):
         return trend, avg_change, up_count, down_count
     except:
         return "Bilinmiyor", 0, 0, 0
+
+# YENİ: BALİNA / TUZAK RADARI
+def trap_radar_check(symbol):
+    try:
+        oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
+        oi_artiyor = False
+        if oi_data and len(oi_data) >= 2:
+            oi_old = float(oi_data[0]['sumOpenInterest'])
+            oi_new = float(oi_data[1]['sumOpenInterest'])
+            if oi_old > 0 and ((oi_new - oi_old) / oi_old) * 100 > 0.2: oi_artiyor = True
+
+        taker_data = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=1")
+        alici_baskin = False
+        if taker_data and len(taker_data) > 0:
+            buy_vol = float(taker_data[0]['buyVol'])
+            sell_vol = float(taker_data[0]['sellVol'])
+            total = buy_vol + sell_vol
+            if total > 0 and (buy_vol / total) * 100 > 55: alici_baskin = True
+
+        if oi_artiyor and alici_baskin: return "🐋 <b>BALİNA TEYİDİ (Gerçek Pump)</b>"
+        elif not alici_baskin: return "⚠️ <b>DİKKAT: SAHTE PUMP (TUZAK OLABİLİR)</b>"
+        else: return "⚖️ <b>Kısmi Teyit</b>"
+    except: return "⚖️ <b>Kısmi Teyit</b>"
 
 # =====================================================
 # MOTOR 1: MİDAS FLOW (RAPOR)
@@ -203,7 +221,8 @@ def midas_flow_loop():
                     change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
                     msg += f"{medals[i]} {symbol} {change_str}\n"
                     hashtags += f"#{symbol} "
-                msg += f"\n<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow</a>"
+                msg += f"\n💡 <b>Açıklama:</b> Son 24 saatin en çok kazandıranları ve genel piyasa yönünü özetler. Piyasadaki genel hakimiyeti (Boğa/Ayı) anlamak için kullanılır."
+                msg += f"\n\n<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow</a>"
                 tg(C, msg)
             time.sleep(RAPOR_ARALIGI)
         except: time.sleep(60)
@@ -230,14 +249,18 @@ def chartist_loop():
                     if len(ema200) >= 2 and prev <= ema200[-2] and curr > ema200[-1] and curr > ema200[-1]*1.01:
                         vol = [float(k[7]) for k in klines[:-1]]
                         if vol[-1] > sum(vol[-21:-1])/20:
-                            msg = f"📈 <b>UZUN VADELİ SPOT (ALIŞ): {symbol}</b>\n<i>{tf.upper()} EMA200 Yukarı Kırılımı</i>\n💰 Fiyat: {akilli_fiyat(curr)}"
+                            msg = (f"📈 <b>UZUN VADELİ SPOT (ALIŞ): {symbol}</b>\n"
+                                   f"<i>{tf.upper()} EMA200 Yukarı Kırılımı</i>\n\n"
+                                   f"💰 Fiyat: {akilli_fiyat(curr)}\n"
+                                   f"📊 Hacim: Ortalamanın üzerinde (Teyitli)\n\n"
+                                   f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk devasa ortalamayı (EMA200) hacimle yukarı kırdı. Bu, uzun vadeli yatırımcıların (kurumsalların) bölgeye girdiğini ve trendin kalıcı olarak yön değiştirebileceğini gösterir.")
                             tg(C, msg); son_sinyaller[cooldown_key] = time.time()
                 time.sleep(0.05)
             time.sleep(CHARTIST_ARALIGI)
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 3: PUMP AVCISI
+# MOTOR 3: PUMP AVCISI (Trap Radar Destekli)
 # =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı.")
@@ -254,8 +277,18 @@ def pump_loop():
                 cc, pc = float(curr_k[4]), float(prev_k[4])
                 cv, pv = float(curr_k[7]), float(prev_k[7])
                 if pc == 0 or pv == 0: continue
+                
                 if ((cc-pc)/pc)*100 >= 3.0 and ((cv-pv)/pv)*100 >= 100.0 and (cv-pv) >= 50_000:
-                    msg = f"🚀 <b>Anlık Pump Tespit Edildi: {symbol}</b>\n💰 Fiyat: {akilli_fiyat(cc)}"
+                    hacim_artis_orani = ((cv-pv)/pv)*100
+                    teyit = trap_radar_check(symbol)
+                    
+                    msg = (f"🚀 <b>Pump - {symbol}</b>\n"
+                           f"💰 Fiyat: {akilli_fiyat(cc)} (+%{((cc-pc)/pc)*100:.2f})\n"
+                           f"📊 Hacim Artışı: +%{hacim_artis_orani:.0f}\n"
+                           f"Volume increased by {int(cv-pv)} ⬆️\n\n"
+                           f"{teyit}\n\n"
+                           f"💡 <b>Açıklama:</b> 5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Ancak Trap Radar sayesinde bu hareketin arkasında gerçek balinaların mı yoksa küçük yatırımcıyı çekmek isteyen sahte botların mı olduğunu analiz ettik. Açık Pozisyon (OI) ve Alıcı baskısı (CVD) verileri bu hareketin niteliğini belirler.")
+                    
                     tg(C, msg); son_pump_sinyalleri[symbol] = time.time()
                 time.sleep(0.05)
             time.sleep(PUMP_ARALIGI)
@@ -278,7 +311,10 @@ def formasyon_loop():
                 closes = [float(k[4]) for k in klines]
                 curr = closes[-1]
                 if curr > max(closes[-20:-5]): 
-                    msg = f"🚀 <b>FORMASYON KIRILIMI (ALIŞ): {symbol}</b>\n<i>20 Günlük Direnç Kırıldı</i>"
+                    msg = (f"🚀 <b>FORMASYON KIRILIMI (ALIŞ): {symbol}</b>\n"
+                           f"<i>20 Günlük Direnç Kırıldı</i>\n\n"
+                           f"💰 Fiyat: {akilli_fiyat(curr)}\n\n"
+                           f"💡 <b>Açıklama:</b> Piyasa Yapısı Değişimi (MSS) gerçekleşti. Fiyat, son 20 günün en yüksek direncini kırarak yeni bir yükseliş trendi (Higher High) başlattı. Alıcılar kontrolü ele geçirmiş durumda.")
                     tg(C, msg); son_formasyon_sinyalleri[symbol] = time.time()
                 time.sleep(0.1)
             time.sleep(FORMASYON_ARALIGI)
@@ -302,7 +338,11 @@ def ema_ribbon_loop():
                 curr = closes[-1]
                 e7, e25, e99, e200 = calculate_ema(closes, 7)[-1], calculate_ema(closes, 25)[-1], calculate_ema(closes, 99)[-1], calculate_ema(closes, 200)[-1]
                 if curr > e7 > e25 > e99 > e200:
-                    msg = f"🚀 <b>EMA DİZİLİMİ (GÜÇLÜ ALIŞ): {symbol}</b>\n<i>Tüm Ortalamalar Yukarı Yönlü Sıralı</i>"
+                    msg = (f"🚀 <b>EMA DİZİLİMİ (GÜÇLÜ ALIŞ): {symbol}</b>\n"
+                           f"<i>Tüm Ortalamalar Yukarı Yönlü Sıralı</i>\n\n"
+                           f"💰 Fiyat: {akilli_fiyat(curr)}\n"
+                           f"📊 Dizilim: 7 > 25 > 99 > 200\n\n"
+                           f"💡 <b>Açıklama:</b> Kusursuz bir Boğa (Yükseliş) dizilimi tespit edildi. Kısa, orta ve uzun vadeli tüm ortalamalar birbirini destekliyor. Bu formasyon, trendin en güçlü ve en istikrarlı olduğu evreyi işaret eder.")
                     tg(C, msg); son_ema_ribbon_sinyalleri[symbol] = time.time()
                 time.sleep(0.1)
             time.sleep(EMA_RIBBON_ARALIGI)
@@ -327,7 +367,10 @@ def macd_loop():
                 if not macd_res: continue
                 cm, cs, pm, ps = macd_res
                 if pm <= ps and cm > cs:
-                    msg = f"🚀 <b>MACD AL SİNYALİ: {symbol}</b>\n<i>Günlük Grafikte MACD Yukarı Kesti</i>"
+                    msg = (f"🚀 <b>MACD AL SİNYALİ: {symbol}</b>\n"
+                           f"<i>Günlük Grafikte MACD Yukarı Kesti</i>\n\n"
+                           f"💰 Fiyat: {akilli_fiyat(closes[-1])}\n\n"
+                           f"💡 <b>Açıklama:</b> MACD indikatörü, Sinyal çizgisini aşağıdan yukarı yönlü kesti (Golden Cross). Momentumun (ivmenin) satıcılardan alıcılara geçtiğini ve trendin yönünün yukarı döndüğünü gösteren klasik ve güvenilir bir alış sinyalidir.")
                     tg(C, msg); son_macd_sinyalleri[symbol] = time.time()
                 time.sleep(0.1)
             time.sleep(MACD_ARALIGI)
@@ -355,7 +398,10 @@ def midas_setup_loop():
                 curr = closes[-1]
                 
                 if curr > max(highs[-20:]) and vols[-1] > sum(vols[-21:-1])/20:
-                    msg = f"⚡ <b>#{symbol} SETUP (ALIŞ)</b>\n<i>4 Saatlik Hacimli Kırılım</i>\n💰 Fiyat: {akilli_fiyat(curr)}"
+                    msg = (f"⚡ <b>#{symbol} SETUP (ALIŞ)</b>\n"
+                           f"<i>4 Saatlik Hacimli Kırılım</i>\n\n"
+                           f"💰 Fiyat: {akilli_fiyat(curr)}\n\n"
+                           f"💡 <b>Açıklama:</b> 4 saatlik grafikte son 20 periyodun (yaklaşık 3 günün) direnci hacimle aşıldı. Kısa ve orta vadeli traderların (günlükçülerin) dikkatini çeken, hızlı hareket potansiyeli yüksek bir kırılımdır.")
                     if tg(C, msg):
                         son_midas_setup_sinyalleri[symbol] = time.time()
                 time.sleep(0.1)
@@ -420,7 +466,7 @@ def ath_atl_loop():
                            f"🛑 <b>Zarar Kes (Stop):</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
                            f"📊 <b>Kırılan Tarihi Seviye:</b> {akilli_fiyat(ath if yon.startswith('YÜKSELİŞ') else atl)}\n"
                            f"📈 <b>Hacim Patlaması:</b> {current_vol/avg_vol:.1f}x (Teyitli)\n\n"
-                           f"💡 <b>Analiz:</b> {coin} fiyatı geçmişteki en {'yüksek' if yon.startswith('YÜKSELİŞ') else 'düşük'} seviyesini hacimle kırdı.")
+                           f"💡 <b>Açıklama:</b> {coin} fiyatı, geçmişteki en {'yüksek' if yon.startswith('YÜKSELİŞ') else 'düşük'} seviyesini hacimle kırdı. Psikolojik bir eşik olan bu seviyenin aşılması, yeni bir {'boğa' if yon.startswith('YÜKSELİŞ') else 'ayı'} trendinin (makro trend) başlangıcı olabilir. Grafikte devasa bir boşluk (Fiyat keşfi) oluşabilir.")
                     
                     if tg(C, msg):
                         son_ath_atl_sinyalleri[symbol] = time.time()
@@ -476,7 +522,8 @@ def digital_chartist_loop():
                             kazanc = ((hedef - curr) / curr) * 100
                             msg += f"🎯 {akilli_fiyat(hedef)} (+%{kazanc:.1f})\n"
                             
-                        msg += f"\n⚠️ <i>Lütfen sıkı bir zarar kes (stop-loss) kullanmayı ve risk yönetimini elden bırakmayın.</i>"
+                        msg += f"\n💡 <b>Açıklama:</b> Fiyat, 30 günlük güçlü bir direnci kırarak formasyonu (üçgen/kama/kanal) yukarı yönlü tamamladı. Kırılımın sahte olmaması için hacim kontrolü yapıldı. Belirlenen Fibonacci hedefleri, kırılım sonrası oluşabilecek yükseliş dalgasının potansiyel durma noktalarıdır."
+                        msg += f"\n\n⚠️ <i>Lütfen sıkı bir zarar kes (stop-loss) kullanmayı ve risk yönetimini elden bırakmayın.</i>"
                         msg += f"\n💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}"
                         
                         if tg(C, msg):
@@ -524,8 +571,8 @@ def sma200_loop():
                         msg = (f"🚀 <b>SMA200 YUKARI KIRILIM (ALIŞ): {symbol}</b>\n"
                                f"<i>{tf.upper()} Grafik - Boğa Sinyali</i>\n\n"
                                f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
-                               f"📈 SMA200 Seviyesi: {akilli_fiyat(c_sma)}\n"
-                               f"✅ <i>Fiyat 200 periyotlu ortalamayı yukarı kırdı. Trend yön değiştiriyor olabilir.</i>")
+                               f"📈 SMA200 Seviyesi: {akilli_fiyat(c_sma)}\n\n"
+                               f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk basit ortalamanın (SMA200) üzerine çıktı. SMA200, kurumsal yatırımcıların ortalama maliyet çizgisi olarak kabul edilir. Bu çizginin üzerine çıkılması, piyasanın genel olarak 'Al' bölgesine geçtiğini gösterir.")
                         if tg(C, msg):
                             son_sma200_sinyalleri[cooldown_key] = time.time()
                             log("SMA200", f"Yukarı Kırılım: {symbol} ({tf})")
@@ -534,8 +581,8 @@ def sma200_loop():
                         msg = (f"💀 <b>SMA200 AŞAĞI KIRILIM (SATIŞ): {symbol}</b>\n"
                                f"<i>{tf.upper()} Grafik - Ayı Sinyali</i>\n\n"
                                f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
-                               f"📉 SMA200 Seviyesi: {akilli_fiyat(c_sma)}\n"
-                               f"⚠️ <i>Fiyat 200 periyotlu ortalamanın altına sarktı. Satış baskısı artabilir.</i>")
+                               f"📉 SMA200 Seviyesi: {akilli_fiyat(c_sma)}\n\n"
+                               f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk ortalamanın (SMA200) altına sarktı. Bu, büyük yatırımcıların bölgeden çıktığını ve piyasanın genel olarak 'Sat' (Ayı) bölgesine geçtiğini gösterir. Düşüş trendi hız kazanabilir.")
                         if tg(C, msg):
                             son_sma200_sinyalleri[cooldown_key] = time.time()
                             log("SMA200", f"Aşağı Kırılım: {symbol} ({tf})")
@@ -547,10 +594,10 @@ def sma200_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 11: BOLLINGER BANTLARI
+# MOTOR 11: BOLLINGER BANTLARI (HAFTALIK)
 # =====================================================
 def bollinger_loop():
-    log("BOLLINGER", "Bollinger Bantları Motoru Başladı.")
+    log("BOLLINGER", "Bollinger Bantları Motoru (Haftalık) Başladı.")
     time.sleep(210)
     while True:
         try:
@@ -558,7 +605,7 @@ def bollinger_loop():
             if not isinstance(tickers, list): time.sleep(60); continue
             
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_BOLLINGER]:
-                for tf in ['4h', '1d']:
+                for tf in ['1w']: # Sadece haftalık
                     cooldown_key = f"BOLL_{tf}_{symbol}"
                     if cooldown_key in son_bollinger_sinyalleri and time.time() - son_bollinger_sinyalleri[cooldown_key] < 43200: continue
                     
@@ -571,23 +618,21 @@ def bollinger_loop():
                     upper, mid, lower = calculate_bollinger(closes)
                     if not upper or not lower: continue
                     
-                    # Fiyat üst bandı yukarı kırdıysa (Volatilite patlaması)
                     if curr > upper and closes[-2] <= upper:
-                        msg = (f"🔥 <b>BOLLINGER ÜST BANT KIRILIMI: {symbol}</b>\n"
-                               f"<i>{tf.upper()} Grafik - Volatilite Patlaması</i>\n\n"
+                        msg = (f"🔥 <b>BOLLINGER ÜST BANT KIRILIMI (HAFTALIK): {symbol}</b>\n"
+                               f"<i>Haftalık Grafik - Volatilite Patlaması</i>\n\n"
                                f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
-                               f"📈 Üst Bant: {akilli_fiyat(upper)}\n"
-                               f"🚀 <i>Fiyat üst bandı hacimle yukarı kırdı, güçlü bir alım dalgası gelebilir.</i>")
+                               f"📈 Üst Bant: {akilli_fiyat(upper)}\n\n"
+                               f"💡 <b>Açıklama:</b> Fiyat, Bollinger üst bandını yukarı yönlü kırdı. Bu durum genellikle bir 'Volatilite Patlaması' (Squeeze) sonrası yaşanır ve güçlü bir alım dalgasının, trend başlangıcının habercisidir. Haftalık kırılımlar büyük trendleri işaret eder.")
                         if tg(C, msg):
                             son_bollinger_sinyalleri[cooldown_key] = time.time()
                             
-                    # Fiyat alt banda değip yukarı döndüyse (Tepki Alımı)
                     elif curr < lower and closes[-2] >= lower:
-                        msg = (f"🩸 <b>BOLLINGER ALT BANT DESTEĞİ: {symbol}</b>\n"
-                               f"<i>{tf.upper()} Grafik - Aşırı Satım</i>\n\n"
+                        msg = (f"🩸 <b>BOLLINGER ALT BANT DESTEĞİ (HAFTALIK): {symbol}</b>\n"
+                               f"<i>Haftalık Grafik - Aşırı Satım</i>\n\n"
                                f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
-                               f"📉 Alt Bant: {akilli_fiyat(lower)}\n"
-                               f"⚖️ <i>Fiyat alt banda değdi. Tepki alımı (bounce) gelebilir, dikkatli olun.</i>")
+                               f"📉 Alt Bant: {akilli_fiyat(lower)}\n\n"
+                               f"💡 <b>Açıklama:</b> Fiyat, haftalık alt banda değerek tepki verdi. Bu bölgeler 'Aşırı Satım' noktalarıdır. Fiyatın buradan yukarı yönlü bir tepki alımı (Bounce) yapma ihtimali yüksektir. Haftalık destekler uzun vadede çok güçlüdür.")
                         if tg(C, msg):
                             son_bollinger_sinyalleri[cooldown_key] = time.time()
                             
@@ -598,10 +643,10 @@ def bollinger_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 12: ICHIMOKU BULUTU (KUMO KIRILIMI)
+# MOTOR 12: ICHIMOKU BULUTU (HAFTALIK)
 # =====================================================
 def ichimoku_loop():
-    log("ICHIMOKU", "Ichimoku Bulut Motoru Başladı.")
+    log("ICHIMOKU", "Ichimoku Bulut Motoru (Haftalık) Başladı.")
     time.sleep(240)
     while True:
         try:
@@ -609,7 +654,7 @@ def ichimoku_loop():
             if not isinstance(tickers, list): time.sleep(60); continue
             
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ICHIMOKU]:
-                for tf in ['12h', '1d']: # Genelde 12s ve 1g kullanılır
+                for tf in ['1w']: # Sadece haftalık
                     cooldown_key = f"ICHI_{tf}_{symbol}"
                     if cooldown_key in son_ichimoku_sinyalleri and time.time() - son_ichimoku_sinyalleri[cooldown_key] < 86400: continue
                     
@@ -624,13 +669,12 @@ def ichimoku_loop():
                     cloud_top, cloud_bottom = calculate_ichimoku(highs, lows, closes)
                     if not cloud_top or not cloud_bottom: continue
                     
-                    # Fiyat Bulutun (Direncin) üzerine çıktıysa (Kumo Breakout)
                     if curr > cloud_top and prev <= cloud_top:
-                        msg = (f"☁️ <b>ICHIMOKU BULUTU KIRILIMI (ALIŞ): {symbol}</b>\n"
-                               f"<i>{tf.upper()} Grafik - Kumo Breakout</i>\n\n"
+                        msg = (f"☁️ <b>ICHIMOKU BULUTU KIRILIMI (HAFTALIK): {symbol}</b>\n"
+                               f"<i>Haftalık Grafik - Kumo Breakout</i>\n\n"
                                f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
-                               f"☁️ Bulut Direnci: {akilli_fiyat(cloud_top)}\n"
-                               f"🚀 <i>Fiyat Ichimoku bulutunu yukarı yönlü kırdı. Trendin yönü yukarı dönebilir.</i>")
+                               f"☁️ Bulut Direnci: {akilli_fiyat(cloud_top)}\n\n"
+                               f"💡 <b>Açıklama:</b> Fiyat, Japon trend sistemi olan Ichimoku'nun en önemli parçası 'Kumo' (Bulut) direncini yukarı yönlü kırdı. Haftalık bulutun üzerine çıkılması, piyasanın makro anlamda 'Boğa' bölgesine girdiğini ve artık bulutun devasa bir destek görevi göreceğini gösterir.")
                         if tg(C, msg):
                             son_ichimoku_sinyalleri[cooldown_key] = time.time()
                             log("ICHIMOKU", f"Bulut Kırılımı: {symbol} ({tf})")
@@ -671,7 +715,7 @@ if __name__ == "__main__":
     threading.Thread(target=ath_atl_loop, daemon=True).start()
     threading.Thread(target=digital_chartist_loop, daemon=True).start()
     threading.Thread(target=sma200_loop, daemon=True).start()
-    threading.Thread(target=bollinger_loop, daemon=True).start()  # YENİ
-    threading.Thread(target=ichimoku_loop, daemon=True).start()   # YENİ
+    threading.Thread(target=bollinger_loop, daemon=True).start()
+    threading.Thread(target=ichimoku_loop, daemon=True).start()
     
     run_web_server()
