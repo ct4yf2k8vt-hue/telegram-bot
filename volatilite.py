@@ -8,6 +8,7 @@ import threading
 import http.server
 import socketserver
 import statistics
+import random
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
@@ -23,19 +24,19 @@ TR_Saati = timezone(timedelta(hours=3))
 BASE = "https://api.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
-RAPOR_ARALIGI = 14400      # 4 Saat
-CHARTIST_ARALIGI = 3600    # 1 Saat
-PUMP_ARALIGI = 60          # 1 Dakika
-FORMASYON_ARALIGI = 3600   # 1 Saat
-EMA_RIBBON_ARALIGI = 3600  # 1 Saat
-MACD_ARALIGI = 3600        # 1 Saat
-MIDAS_SETUP_ARALIGI = 7200 # 2 Saat
-ATH_ATL_ARALIGI = 3600     # 1 Saat
-DIGITAL_CHARTIST_ARALIGI = 3600 # 1 Saat
-SMA200_ARALIGI = 3600      # 1 Saat
-BOLLINGER_ARALIGI = 3600   # 1 Saat
-ICHIMOKU_ARALIGI = 3600    # 1 Saat
-FVG_KONFLUANS_ARALIGI = 3600 # 1 Saat (YENİ)
+RAPOR_ARALIGI = 14400      
+CHARTIST_ARALIGI = 3600    
+PUMP_ARALIGI = 60          
+FORMASYON_ARALIGI = 3600   
+EMA_RIBBON_ARALIGI = 3600  
+MACD_ARALIGI = 3600        
+MIDAS_SETUP_ARALIGI = 7200 
+ATH_ATL_ARALIGI = 3600     
+DIGITAL_CHARTIST_ARALIGI = 3600 
+SMA200_ARALIGI = 3600      
+BOLLINGER_ARALIGI = 3600   
+ICHIMOKU_ARALIGI = 3600    
+FVG_KONFLUANS_ARALIGI = 3600 
 
 # FİLTRELER (Hacim)
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -49,9 +50,9 @@ MIN_HACIM_DIGITAL = 10_000_000
 MIN_HACIM_SMA200 = 15_000_000  
 MIN_HACIM_BOLLINGER = 10_000_000 
 MIN_HACIM_ICHIMOKU = 10_000_000  
-MIN_HACIM_FVG = 10_000_000 # YENİ
+MIN_HACIM_FVG = 10_000_000 
 
-# SİNYAL HAFIZALARI (Aynı sinyalin tekrarlanmasını önler)
+# SİNYAL HAFIZALARI
 son_sinyaller = {}
 son_pump_sinyalleri = {}
 son_formasyon_sinyalleri = {}
@@ -63,7 +64,7 @@ son_chartist_sinyalleri = {}
 son_sma200_sinyalleri = {}   
 son_bollinger_sinyalleri = {} 
 son_ichimoku_sinyalleri = {}  
-son_fvg_sinyalleri = {}       # YENİ
+son_fvg_sinyalleri = {}       
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -174,7 +175,6 @@ def get_market_trend(tickers):
     except:
         return "Bilinmiyor", 0, 0, 0
 
-# YENİ: BALİNA / TUZAK RADARI
 def trap_radar_check(symbol):
     try:
         oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
@@ -284,14 +284,12 @@ def pump_loop():
                 if ((cc-pc)/pc)*100 >= 3.0 and ((cv-pv)/pv)*100 >= 100.0 and (cv-pv) >= 50_000:
                     hacim_artis_orani = ((cv-pv)/pv)*100
                     teyit = trap_radar_check(symbol)
-                    
                     msg = (f"🚀 <b>Pump - {symbol}</b>\n"
                            f"💰 Fiyat: {akilli_fiyat(cc)} (+%{((cc-pc)/pc)*100:.2f})\n"
                            f"📊 Hacim Artışı: +%{hacim_artis_orani:.0f}\n"
                            f"Volume increased by {int(cv-pv)} ⬆️\n\n"
                            f"{teyit}\n\n"
                            f"💡 <b>Açıklama:</b> 5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Ancak Trap Radar sayesinde bu hareketin arkasında gerçek balinaların mı yoksa küçük yatırımcıyı çekmek isteyen sahte botların mı olduğunu analiz ettik. Açık Pozisyon (OI) ve Alıcı baskısı (CVD) verileri bu hareketin niteliğini belirler.")
-                    
                     tg(C, msg); son_pump_sinyalleri[symbol] = time.time()
                 time.sleep(0.05)
             time.sleep(PUMP_ARALIGI)
@@ -689,10 +687,10 @@ def ichimoku_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 13: FVG KONFLUANS MOTORU (ÇİFT YÖNLÜ)
+# MOTOR 13: BINANCE KILLERS CLONE (FVG & KONFLUANS)
 # =====================================================
-def fvg_konfluans_loop():
-    log("FVG", "FVG ve Konfluans Motoru Başladı.")
+def binance_killers_loop():
+    log("BINANCE_KILLERS", "FVG ve Konfluans Motoru Başladı.")
     time.sleep(270)
     while True:
         try:
@@ -702,83 +700,112 @@ def fvg_konfluans_loop():
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FVG]:
                 if symbol in son_fvg_sinyalleri and time.time() - son_fvg_sinyalleri[symbol] < 14400: continue
                 
-                for tf in ['4h', '8h', '1d']:
+                for tf in ['4h', '8h']:
                     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=100")
                     if not isinstance(klines, list) or len(klines) < 50: continue
                     
-                    # Mum verilerini al
-                    highs = [float(k[2]) for k in klines]
-                    lows = [float(k[3]) for k in klines]
-                    closes = [float(k[4]) for k in klines]
+                    highs = [float(k[2]) for k in klines[:-1]]
+                    lows = [float(k[3]) for k in klines[:-1]]
+                    closes = [float(k[4]) for k in klines[:-1]]
+                    vols = [float(k[7]) for k in klines[:-1]]
                     
                     curr = closes[-1]
+                    current_vol = vols[-1]
+                    avg_vol = sum(vols[-20:]) / 20
                     
-                    # Basit bir trend yönü belirleme (EMA 20 ve 50)
-                    ema20 = calculate_ema(closes[:-1], 20)
-                    ema50 = calculate_ema(closes[:-1], 50)
-                    if not ema20 or not ema50: continue
+                    if current_vol < avg_vol * 1.2: continue # Hacim teyidi
                     
-                    trend_up = ema20[-1] > ema50[-1]
-                    trend_down = ema20[-1] < ema50[-1]
+                    # Yatay Destek/Direnç
+                    yatay_direnc = max(highs[-30:])
+                    yatay_destek = min(lows[-30:])
                     
-                    # Yatay Destek / Direnç (Son 20 mum)
-                    yatay_direnc = max(highs[-20:-1])
-                    yatay_destek = min(lows[-20:-1])
+                    # Yükselen/Düşen Trend Kontrolü (Higher Lows / Lower Highs)
+                    trend_up = lows[-10] > lows[-20] > lows[-30]
+                    trend_down = highs[-10] < highs[-20] < highs[-30]
                     
-                    # FVG Tespiti (Son 3 mum üzerinden)
-                    # Boğa FVG: 1. mumun tepe noktası ile 3. mumun dip noktası arasında boşluk
-                    # Ayı FVG: 1. mumun dip noktası ile 3. mumun tepe noktası arasında boşluk
-                    
-                    # Son 3 mumu al (kapanmış olanlar)
-                    # FVG genelde geri çekilme (pullback) sırasında test edilir.
-                    # O yüzden son 10 mum içinde oluşmuş bir FVG'yi arıyoruz.
-                    
-                    bullish_fvg_level = None
-                    bearish_fvg_level = None
+                    # FVG Arama
+                    bullish_fvg = None
+                    bearish_fvg = None
                     
                     for i in range(len(closes)-10, len(closes)-2):
-                        # Boğa FVG (Yukarı yönlü hareket boşluğu - Destek görevi görür)
-                        if lows[i+2] > highs[i]:
-                            bullish_fvg_level = (highs[i] + lows[i+2]) / 2 # FVG'nin ortası
-                        
-                        # Ayı FVG (Aşağı yönlü hareket boşluğu - Direnç görevi görür)
-                        if highs[i+2] < lows[i]:
-                            bearish_fvg_level = (lows[i] + highs[i+2]) / 2 # FVG'nin ortası
+                        # Boğa FVG (Destek)
+                        if lows[i+2] > highs[i]: 
+                            bullish_fvg = (highs[i] + lows[i+2]) / 2
+                        # Ayı FVG (Direnç)
+                        if highs[i+2] < lows[i]: 
+                            bearish_fvg = (lows[i] + highs[i+2]) / 2
 
-                    # LONG SENARYOSU: Yükselen trend + Fiyat Destek/FVG üzerinde
-                    if trend_up and bullish_fvg_level:
-                        # Fiyat FVG bölgesine mi yaklaştı? (Yüzde 1.5 tolerans)
-                        if abs(curr - bullish_fvg_level) / curr < 0.015 and abs(curr - yatay_destek) / curr < 0.03:
-                            msg = (f"⚖️ <b>FVG KONFLUANS (LONG): {symbol}</b>\n"
-                                   f"<i>{tf.upper()} Grafik - Boğa FVG & Destek Uyumu</i>\n\n"
-                                   f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
-                                   f"🎯 FVG Destek Bölgesi: ~{akilli_fiyat(bullish_fvg_level)}\n"
-                                   f"📊 Yatay Destek: ~{akilli_fiyat(yatay_destek)}\n\n"
-                                   f"💡 <b>Açıklama:</b> Fiyat, yükselen bir trend içinde. Yukarı yönlü hareket sırasında oluşan <b>Adil Değer Boşluğu (FVG)</b> bölgesine geri çekildi. Bu bölge, devasa bir <b>yatay destek</b> seviyesiyle birleşerek (Konfluans) güçlü bir alım noktası oluşturuyor. Kurumsal yatırımcıların bu bölgeden alım yapması beklenir.")
+                    sig_id = random.randint(2200, 2300)
+                    
+                    # LONG SENARYOSU
+                    if trend_up and bullish_fvg:
+                        if abs(curr - bullish_fvg) / curr < 0.02 and abs(curr - yatay_destek) / curr < 0.04:
+                            entry_low = bullish_fvg * 0.998
+                            entry_high = bullish_fvg * 1.002
+                            stop_loss = yatay_destek * 0.98
+                            
+                            # Hedefler
+                            diff = entry_high - stop_loss
+                            targets = [
+                                entry_high + (diff * 1.0),
+                                entry_high + (diff * 1.5),
+                                entry_high + (diff * 2.0),
+                                entry_high + (diff * 3.0),
+                                entry_high + (diff * 4.0)
+                            ]
+                            
+                            msg = (f"📍SIGNAL ID: #{sig_id}📍\n"
+                                   f"COIN: #{symbol} (2-5x)\n"
+                                   f"Direction: LONG\n"
+                                   f"➖➖➖➖➖➖➖\n"
+                                   f"ENTRY: {akilli_fiyat(entry_low)} - {akilli_fiyat(entry_high)}\n\n"
+                                   f"TARGETS: {akilli_fiyat(targets[0])} – {akilli_fiyat(targets[1])} – {akilli_fiyat(targets[2])} - {akilli_fiyat(targets[3])} - {akilli_fiyat(targets[4])}\n\n"
+                                   f"STOP LOSS: {akilli_fiyat(stop_loss)}\n\n"
+                                   f"{tf.upper()} FVG confluent with ascending trendline confluent with stacked horizontal support at entry.\n"
+                                   f"➖➖➖➖➖➖➖\n"
+                                   f"- Binance Killers® (Bot Clone)")
+                            
                             if tg(C, msg):
                                 son_fvg_sinyalleri[symbol] = time.time()
-                                log("FVG", f"LONG Konfluans: {symbol} ({tf})")
+                                log("BINANCE_KILLERS", f"LONG Konfluans: {symbol}")
                                 break
-
-                    # SHORT SENARYOSU: Düşen trend + Fiyat Direnç/FVG altında
-                    elif trend_down and bearish_fvg_level:
-                        # Fiyat FVG bölgesine mi yaklaştı? (Yüzde 1.5 tolerans)
-                        if abs(curr - bearish_fvg_level) / curr < 0.015 and abs(curr - yatay_direnc) / curr < 0.03:
-                            msg = (f"⚖️ <b>FVG KONFLUANS (SHORT): {symbol}</b>\n"
-                                   f"<i>{tf.upper()} Grafik - Ayı FVG & Direnç Uyumu</i>\n\n"
-                                   f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
-                                   f"🎯 FVG Direnç Bölgesi: ~{akilli_fiyat(bearish_fvg_level)}\n"
-                                   f"📊 Yatay Direnç: ~{akilli_fiyat(yatay_direnc)}\n\n"
-                                   f"💡 <b>Açıklama:</b> Fiyat, düşen bir trend içinde. Aşağı yönlü hareket sırasında oluşan <b>Adil Değer Boşluğu (FVG)</b> bölgesine tepki verdi. Bu bölge, devasa bir <b>yatay direnç</b> seviyesiyle birleşerek (Konfluans) güçlü bir satış noktası oluşturuyor. Kurumsal yatırımcıların bu bölgeden satış yapması beklenir.")
+                                
+                    # SHORT SENARYOSU
+                    elif trend_down and bearish_fvg:
+                        if abs(curr - bearish_fvg) / curr < 0.02 and abs(curr - yatay_direnc) / curr < 0.04:
+                            entry_low = bearish_fvg * 0.998
+                            entry_high = bearish_fvg * 1.002
+                            stop_loss = yatay_direnc * 1.02
+                            
+                            diff = stop_loss - entry_low
+                            targets = [
+                                entry_low - (diff * 1.0),
+                                entry_low - (diff * 1.5),
+                                entry_low - (diff * 2.0),
+                                entry_low - (diff * 3.0),
+                                entry_low - (diff * 4.0)
+                            ]
+                            
+                            msg = (f"📍SIGNAL ID: #{sig_id}📍\n"
+                                   f"COIN: #{symbol} (2-5x)\n"
+                                   f"Direction: SHORT\n"
+                                   f"➖➖➖➖➖➖➖\n"
+                                   f"ENTRY: {akilli_fiyat(entry_low)} - {akilli_fiyat(entry_high)}\n\n"
+                                   f"TARGETS: {akilli_fiyat(targets[0])} – {akilli_fiyat(targets[1])} – {akilli_fiyat(targets[2])} - {akilli_fiyat(targets[3])} - {akilli_fiyat(targets[4])}\n\n"
+                                   f"STOP LOSS: {akilli_fiyat(stop_loss)}\n\n"
+                                   f"{tf.upper()} FVG confluent with descending trendline confluent with stacked horizontal resistance at entry.\n"
+                                   f"➖➖➖➖➖➖➖\n"
+                                   f"- Binance Killers® (Bot Clone)")
+                            
                             if tg(C, msg):
                                 son_fvg_sinyalleri[symbol] = time.time()
-                                log("FVG", f"SHORT Konfluans: {symbol} ({tf})")
+                                log("BINANCE_KILLERS", f"SHORT Konfluans: {symbol}")
                                 break
                                 
                 time.sleep(0.1)
             time.sleep(FVG_KONFLUANS_ARALIGI)
         except Exception as e:
-            log("FVG", f"Hata: {e}")
+            log("BINANCE_KILLERS", f"Hata: {e}")
             time.sleep(60)
 
 # =====================================================
@@ -813,6 +840,6 @@ if __name__ == "__main__":
     threading.Thread(target=sma200_loop, daemon=True).start()
     threading.Thread(target=bollinger_loop, daemon=True).start()
     threading.Thread(target=ichimoku_loop, daemon=True).start()
-    threading.Thread(target=fvg_konfluans_loop, daemon=True).start() # YENİ MOTOR
+    threading.Thread(target=binance_killers_loop, daemon=True).start() # YENİ
     
     run_web_server()
