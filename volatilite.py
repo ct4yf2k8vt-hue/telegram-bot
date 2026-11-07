@@ -35,6 +35,7 @@ DIGITAL_CHARTIST_ARALIGI = 3600 # 1 Saat
 SMA200_ARALIGI = 3600      # 1 Saat
 BOLLINGER_ARALIGI = 3600   # 1 Saat
 ICHIMOKU_ARALIGI = 3600    # 1 Saat
+FVG_KONFLUANS_ARALIGI = 3600 # 1 Saat (YENİ)
 
 # FİLTRELER (Hacim)
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -48,6 +49,7 @@ MIN_HACIM_DIGITAL = 10_000_000
 MIN_HACIM_SMA200 = 15_000_000  
 MIN_HACIM_BOLLINGER = 10_000_000 
 MIN_HACIM_ICHIMOKU = 10_000_000  
+MIN_HACIM_FVG = 10_000_000 # YENİ
 
 # SİNYAL HAFIZALARI (Aynı sinyalin tekrarlanmasını önler)
 son_sinyaller = {}
@@ -61,6 +63,7 @@ son_chartist_sinyalleri = {}
 son_sma200_sinyalleri = {}   
 son_bollinger_sinyalleri = {} 
 son_ichimoku_sinyalleri = {}  
+son_fvg_sinyalleri = {}       # YENİ
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -686,6 +689,99 @@ def ichimoku_loop():
             time.sleep(60)
 
 # =====================================================
+# MOTOR 13: FVG KONFLUANS MOTORU (ÇİFT YÖNLÜ)
+# =====================================================
+def fvg_konfluans_loop():
+    log("FVG", "FVG ve Konfluans Motoru Başladı.")
+    time.sleep(270)
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FVG]:
+                if symbol in son_fvg_sinyalleri and time.time() - son_fvg_sinyalleri[symbol] < 14400: continue
+                
+                for tf in ['4h', '8h', '1d']:
+                    klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=100")
+                    if not isinstance(klines, list) or len(klines) < 50: continue
+                    
+                    # Mum verilerini al
+                    highs = [float(k[2]) for k in klines]
+                    lows = [float(k[3]) for k in klines]
+                    closes = [float(k[4]) for k in klines]
+                    
+                    curr = closes[-1]
+                    
+                    # Basit bir trend yönü belirleme (EMA 20 ve 50)
+                    ema20 = calculate_ema(closes[:-1], 20)
+                    ema50 = calculate_ema(closes[:-1], 50)
+                    if not ema20 or not ema50: continue
+                    
+                    trend_up = ema20[-1] > ema50[-1]
+                    trend_down = ema20[-1] < ema50[-1]
+                    
+                    # Yatay Destek / Direnç (Son 20 mum)
+                    yatay_direnc = max(highs[-20:-1])
+                    yatay_destek = min(lows[-20:-1])
+                    
+                    # FVG Tespiti (Son 3 mum üzerinden)
+                    # Boğa FVG: 1. mumun tepe noktası ile 3. mumun dip noktası arasında boşluk
+                    # Ayı FVG: 1. mumun dip noktası ile 3. mumun tepe noktası arasında boşluk
+                    
+                    # Son 3 mumu al (kapanmış olanlar)
+                    # FVG genelde geri çekilme (pullback) sırasında test edilir.
+                    # O yüzden son 10 mum içinde oluşmuş bir FVG'yi arıyoruz.
+                    
+                    bullish_fvg_level = None
+                    bearish_fvg_level = None
+                    
+                    for i in range(len(closes)-10, len(closes)-2):
+                        # Boğa FVG (Yukarı yönlü hareket boşluğu - Destek görevi görür)
+                        if lows[i+2] > highs[i]:
+                            bullish_fvg_level = (highs[i] + lows[i+2]) / 2 # FVG'nin ortası
+                        
+                        # Ayı FVG (Aşağı yönlü hareket boşluğu - Direnç görevi görür)
+                        if highs[i+2] < lows[i]:
+                            bearish_fvg_level = (lows[i] + highs[i+2]) / 2 # FVG'nin ortası
+
+                    # LONG SENARYOSU: Yükselen trend + Fiyat Destek/FVG üzerinde
+                    if trend_up and bullish_fvg_level:
+                        # Fiyat FVG bölgesine mi yaklaştı? (Yüzde 1.5 tolerans)
+                        if abs(curr - bullish_fvg_level) / curr < 0.015 and abs(curr - yatay_destek) / curr < 0.03:
+                            msg = (f"⚖️ <b>FVG KONFLUANS (LONG): {symbol}</b>\n"
+                                   f"<i>{tf.upper()} Grafik - Boğa FVG & Destek Uyumu</i>\n\n"
+                                   f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
+                                   f"🎯 FVG Destek Bölgesi: ~{akilli_fiyat(bullish_fvg_level)}\n"
+                                   f"📊 Yatay Destek: ~{akilli_fiyat(yatay_destek)}\n\n"
+                                   f"💡 <b>Açıklama:</b> Fiyat, yükselen bir trend içinde. Yukarı yönlü hareket sırasında oluşan <b>Adil Değer Boşluğu (FVG)</b> bölgesine geri çekildi. Bu bölge, devasa bir <b>yatay destek</b> seviyesiyle birleşerek (Konfluans) güçlü bir alım noktası oluşturuyor. Kurumsal yatırımcıların bu bölgeden alım yapması beklenir.")
+                            if tg(C, msg):
+                                son_fvg_sinyalleri[symbol] = time.time()
+                                log("FVG", f"LONG Konfluans: {symbol} ({tf})")
+                                break
+
+                    # SHORT SENARYOSU: Düşen trend + Fiyat Direnç/FVG altında
+                    elif trend_down and bearish_fvg_level:
+                        # Fiyat FVG bölgesine mi yaklaştı? (Yüzde 1.5 tolerans)
+                        if abs(curr - bearish_fvg_level) / curr < 0.015 and abs(curr - yatay_direnc) / curr < 0.03:
+                            msg = (f"⚖️ <b>FVG KONFLUANS (SHORT): {symbol}</b>\n"
+                                   f"<i>{tf.upper()} Grafik - Ayı FVG & Direnç Uyumu</i>\n\n"
+                                   f"💰 Anlık Fiyat: {akilli_fiyat(curr)}\n"
+                                   f"🎯 FVG Direnç Bölgesi: ~{akilli_fiyat(bearish_fvg_level)}\n"
+                                   f"📊 Yatay Direnç: ~{akilli_fiyat(yatay_direnc)}\n\n"
+                                   f"💡 <b>Açıklama:</b> Fiyat, düşen bir trend içinde. Aşağı yönlü hareket sırasında oluşan <b>Adil Değer Boşluğu (FVG)</b> bölgesine tepki verdi. Bu bölge, devasa bir <b>yatay direnç</b> seviyesiyle birleşerek (Konfluans) güçlü bir satış noktası oluşturuyor. Kurumsal yatırımcıların bu bölgeden satış yapması beklenir.")
+                            if tg(C, msg):
+                                son_fvg_sinyalleri[symbol] = time.time()
+                                log("FVG", f"SHORT Konfluans: {symbol} ({tf})")
+                                break
+                                
+                time.sleep(0.1)
+            time.sleep(FVG_KONFLUANS_ARALIGI)
+        except Exception as e:
+            log("FVG", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
 # RENDER WEB SUNUCUSU
 # =====================================================
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -717,5 +813,6 @@ if __name__ == "__main__":
     threading.Thread(target=sma200_loop, daemon=True).start()
     threading.Thread(target=bollinger_loop, daemon=True).start()
     threading.Thread(target=ichimoku_loop, daemon=True).start()
+    threading.Thread(target=fvg_konfluans_loop, daemon=True).start() # YENİ MOTOR
     
     run_web_server()
