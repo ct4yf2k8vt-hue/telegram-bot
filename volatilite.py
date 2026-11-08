@@ -38,6 +38,7 @@ BOLLINGER_ARALIGI = 3600
 ICHIMOKU_ARALIGI = 3600    
 FVG_KONFLUANS_ARALIGI = 3600 
 SQUEEZE_RADAR_ARALIGI = 14400
+HACIM_PATLAMASI_ARALIGI = 3600 # YENİ
 
 # FİLTRELER (Hacim)
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -53,6 +54,7 @@ MIN_HACIM_BOLLINGER = 10_000_000
 MIN_HACIM_ICHIMOKU = 10_000_000  
 MIN_HACIM_FVG = 10_000_000 
 MIN_HACIM_SQUEEZE = 20_000_000 
+MIN_HACIM_HACIM_PATLAMASI = 10_000_000 # YENİ
 
 # SİNYAL HAFIZALARI
 son_sinyaller = {}
@@ -68,6 +70,7 @@ son_bollinger_sinyalleri = {}
 son_ichimoku_sinyalleri = {}  
 son_fvg_sinyalleri = {}       
 son_squeeze_sinyalleri = {}
+son_hacim_sinyalleri = {} # YENİ
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -202,6 +205,80 @@ def squeeze_radar_check(symbol, timeframe='4h'):
     except: return ""
 
 # =====================================================
+# MOTOR 15: TEYİTLİ HACİM PATLAMASI (VOLUME SPIKE)
+# =====================================================
+def teyitli_hacim_loop():
+    log("HACIM", "Teyitli Hacim Patlaması Motoru Başladı.")
+    time.sleep(330)
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_HACIM_PATLAMASI]:
+                for tf in ['4h', '8h', '1d']:
+                    cooldown_key = f"VOL_{tf}_{symbol}"
+                    if cooldown_key in son_hacim_sinyalleri and time.time() - son_hacim_sinyalleri[cooldown_key] < 14400: continue
+                    
+                    klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=250")
+                    if not isinstance(klines, list) or len(klines) < 50: continue
+                    
+                    closes = [float(k[4]) for k in klines[:-1]]
+                    vols = [float(k[5]) for k in klines[:-1]]
+                    highs = [float(k[2]) for k in klines[:-1]]
+                    lows = [float(k[3]) for k in klines[:-1]]
+                    
+                    curr_close = closes[-1]
+                    prev_close = closes[-2]
+                    curr_vol = vols[-1]
+                    avg_vol = sum(vols[-21:-1]) / 20
+                    
+                    if avg_vol == 0: continue
+                    
+                    # 1. ŞART: Hacim Patlaması (Ortalamanın en az 2 katı)
+                    if curr_vol >= (avg_vol * 2.0):
+                        spike_ratio = (curr_vol / avg_vol) * 100
+                        
+                        # 2. ŞART: Trend Teyidi (EMA200)
+                        ema200 = calculate_ema(closes, 200)
+                        if not ema200: continue
+                        c_ema = ema200[-1]
+                        
+                        # 3. ŞART: Trap Radar
+                        teyit = trap_radar_check(symbol)
+                        tuzak_mi = "SAHTE" in teyit or "TUZAK" in teyit
+                        
+                        # LONG SENARYOSU
+                        if curr_close > c_ema and curr_close > prev_close and not tuzak_mi:
+                            son_direnc = max(highs[-21:-1])
+                            if curr_close >= son_direnc:
+                                msg = (f"📊 <b>HACİM PATLAMASI (LONG): {symbol}</b>\n"
+                                       f"<i>{tf.upper()} Grafik - Teyitli Kırılım</i>\n\n"
+                                       f"📈 Hacim Artışı: <b>+%{spike_ratio:.0f}</b> (Ortalamanın {curr_vol/avg_vol:.1f} katı)\n"
+                                       f"💰 Anlık Fiyat: {akilli_fiyat(curr_close)}\n"
+                                       f"{teyit}\n\n"
+                                       f"💡 <b>Açıklama:</b> Hacim patlaması, EMA200 trendi ve yatay direnç kırılımı aynı anda gerçekleşti. Bu, büyük yatırımcıların (balinaların) bölgeye girdiğini gösteren çok güçlü bir alış sinyalidir. Trap radarı da bu hareketin sahte olmadığını teyit ediyor.")
+                                if tg(C, msg): son_hacim_sinyalleri[cooldown_key] = time.time()
+                                
+                        # SHORT SENARYOSU
+                        elif curr_close < c_ema and curr_close < prev_close and not tuzak_mi:
+                            son_destek = min(lows[-21:-1])
+                            if curr_close <= son_destek:
+                                msg = (f"📉 <b>HACİM PATLAMASI (SHORT): {symbol}</b>\n"
+                                       f"<i>{tf.upper()} Grafik - Teyitli Kırılım</i>\n\n"
+                                       f"📉 Hacim Artışı: <b>+%{spike_ratio:.0f}</b> (Ortalamanın {curr_vol/avg_vol:.1f} katı)\n"
+                                       f"💰 Anlık Fiyat: {akilli_fiyat(curr_close)}\n"
+                                       f"{teyit}\n\n"
+                                       f"💡 <b>Açıklama:</b> Hacim patlaması, EMA200 trendi ve yatay destek kırılımı aynı anda gerçekleşti. Bu, büyük satıcıların bölgeden çıktığını gösteren çok güçlü bir satış sinyalidir. Trap radarı da bu hareketin sahte olmadığını teyit ediyor.")
+                                if tg(C, msg): son_hacim_sinyalleri[cooldown_key] = time.time()
+                                
+                time.sleep(0.1)
+            time.sleep(HACIM_PATLAMASI_ARALIGI)
+        except Exception as e:
+            log("HACIM", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
 # MOTOR 14: SQUEEZE RADAR (SIKIŞMA RADARI)
 # =====================================================
 def squeeze_radar_loop():
@@ -239,7 +316,7 @@ def squeeze_radar_loop():
                                f"👥 <b>Küçük Yatırımcı:</b> %{g_long_pct:.1f} Long\n"
                                f"🐋 <b>Balina (Top Trader):</b> %{t_long_pct:.1f} Long\n\n"
                                f"💡 <b>Açıklama:</b> Küçük yatırımcı aşırı derecede Short pozisyonda. Ancak balinalar Long'a geçmiş durumda. Bu durum, yakın zamanda bir 'Short Sıkışması' (roket yükselişi) yaşanabileceğini gösterir. Satış sinyallerine karşı dikkatli olun!")
-                        if tg(C, msg): son_squeeze_sinyalleri[cooldown_key] = time.time()
+                        if tg(C, msg): son_squeeze_sinyalleri[cooldown_key] = time.sleep()
                 time.sleep(0.1)
             time.sleep(SQUEEZE_RADAR_ARALIGI)
         except Exception as e:
@@ -717,12 +794,11 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
-    # --- İLK MESAJ (STARTUP) ---
     log("SİSTEM", "Bot başlatıldı. Telegram'a onay mesajı gönderiliyor...")
     baslangic_mesaji = (
         "🤖 <b>SİSTEM AKTİF!</b>\n\n"
         "Kripto Sinyal Botu başarıyla başlatıldı. 🚀\n"
-        "13 farklı motor (Pump, FVG, Sıkışma Radarı vb.) arka planda piyasayı taramaya başladı.\n\n"
+        "15 farklı motor (Pump, FVG, Sıkışma Radarı, Hacim Patlaması vb.) arka planda piyasayı taramaya başladı.\n\n"
         "Piyasa şartları uygun olduğunda ve kaliteli bir fırsat yakalandığında sinyaller buraya düşecektir."
     )
     if tg(C, baslangic_mesaji):
@@ -730,7 +806,8 @@ if __name__ == "__main__":
     else:
         log("SİSTEM", "❌ HATA: Telegram'a mesaj gönderilemedi! Lütfen BOT_TOKEN ve CHAT_ID ayarlarını kontrol edin.")
     
-    # Motorları başlat (Performans takip motoru çıkarıldı)
+    # Motorları başlat
+    threading.Thread(target=teyitli_hacim_loop, daemon=True).start() # YENİ MOTOR
     threading.Thread(target=squeeze_radar_loop, daemon=True).start() 
     threading.Thread(target=midas_flow_loop, daemon=True).start()
     threading.Thread(target=chartist_loop, daemon=True).start()
