@@ -37,7 +37,8 @@ SMA200_ARALIGI = 3600
 BOLLINGER_ARALIGI = 3600   
 ICHIMOKU_ARALIGI = 3600    
 FVG_KONFLUANS_ARALIGI = 3600 
-PERFORMANS_TAKIP_ARALIGI = 300 # 5 Dakika
+PERFORMANS_TAKIP_ARALIGI = 300 
+SQUEEZE_RADAR_ARALIGI = 14400 # 4 Saat (YENİ)
 
 # FİLTRELER (Hacim)
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -52,6 +53,7 @@ MIN_HACIM_SMA200 = 15_000_000
 MIN_HACIM_BOLLINGER = 10_000_000 
 MIN_HACIM_ICHIMOKU = 10_000_000  
 MIN_HACIM_FVG = 10_000_000 
+MIN_HACIM_SQUEEZE = 20_000_000 # Sıkışma Radarı için Yüksek Hacim Şartı
 
 # SİNYAL HAFIZALARI
 son_sinyaller = {}
@@ -66,6 +68,7 @@ son_sma200_sinyalleri = {}
 son_bollinger_sinyalleri = {} 
 son_ichimoku_sinyalleri = {}  
 son_fvg_sinyalleri = {}       
+son_squeeze_sinyalleri = {} # YENİ
 
 # AKTİF SİNYAL TAKİP HAFIZASI
 aktif_sinyaller = {} 
@@ -185,6 +188,28 @@ def trap_radar_check(symbol):
         else: return "⚖️ <b>Kısmi Teyit</b>"
     except: return "⚖️ <b>Kısmi Teyit</b>"
 
+# YENİ: SIKIŞMA RADARI (SQUEEZE RADAR) KONTROLÜ
+def squeeze_radar_check(symbol, timeframe='4h'):
+    try:
+        global_data = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={timeframe}&limit=1")
+        top_data = gj(f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol}&period={timeframe}&limit=1")
+        
+        if not global_data or not top_data: return ""
+        
+        g_long_pct = float(global_data[0]['longAccount']) * 100
+        t_long_pct = float(top_data[0]['longAccount']) * 100
+        
+        # Long Sıkışması: Kalabalık aşırı Long, Balina Short'a geçmiş
+        if g_long_pct > 75 and t_long_pct < 50:
+            return f"⚠️ <b>SİNYAL RİSKLİ:</b> Long Sıkışması Riski Var! (Kalabalık %{g_long_pct:.0f} Long, Balina %{t_long_pct:.0f} Long)"
+        
+        # Short Sıkışması: Kalabalık aşırı Short, Balina Long'a geçmiş
+        elif g_long_pct < 30 and t_long_pct > 60:
+            return f"🚀 <b>SİNYAL DESTEKLİ:</b> Short Sıkışması Riski Var! (Kalabalık %{g_long_pct:.0f} Long, Balina %{t_long_pct:.0f} Long)"
+        
+        return ""
+    except: return ""
+
 def sinyal_kaydet(symbol, yon, entry, targets, sl):
     aktif_sinyaller[symbol] = {"symbol": symbol, "yon": yon, "entry": float(entry), "targets": [float(t) for t in targets], "sl": float(sl), "peak_move": 0.0, "hit_targets": 0, "time": time.time()}
     log("TAKİP", f"Sinyal Hafızaya Alındı: {symbol} ({yon})")
@@ -235,7 +260,55 @@ def performans_takip_loop():
         except Exception as e: time.sleep(60)
 
 # =====================================================
-# MOTOR 1: MİDAS FLOW
+# MOTOR 14: SQUEEZE RADAR (SIKIŞMA RADARI)
+# =====================================================
+def squeeze_radar_loop():
+    log("SQUEEZE", "Sıkışma Radarı Motoru Başladı.")
+    time.sleep(300)
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SQUEEZE]:
+                for tf in ['4h', '1d']:
+                    cooldown_key = f"SQZ_{tf}_{symbol}"
+                    if cooldown_key in son_squeeze_sinyalleri and time.time() - son_squeeze_sinyalleri[cooldown_key] < 43200: continue
+                    
+                    # Veriyi kontrol et
+                    global_data = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
+                    top_data = gj(f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
+                    
+                    if not global_data or not top_data: continue
+                    
+                    g_long_pct = float(global_data[0]['longAccount']) * 100
+                    t_long_pct = float(top_data[0]['longAccount']) * 100
+                    
+                    # LONG SIKIŞMASI
+                    if g_long_pct > 75 and t_long_pct < 50:
+                        msg = (f"🚨 <b>LONG SIKIŞMASI RİSKİ: {symbol}</b>\n"
+                               f"<i>{tf.upper()} Grafik - Kontradyen Uyarı</i>\n\n"
+                               f"👥 <b>Küçük Yatırımcı:</b> %{g_long_pct:.1f} Long\n"
+                               f"🐋 <b>Balina (Top Trader):</b> %{t_long_pct:.1f} Long\n\n"
+                               f"💡 <b>Açıklama:</b> Küçük yatırımcı aşırı derecede Long pozisyonda (Long yığılması var). Ancak balinalar tersine Short'a geçmiş durumda. Bu tablo, yakın zamanda bir 'Long Patlatma' (şelale düşüşü) operasyonu gelebileceğini gösterir. Alım sinyallerine karşı dikkatli olun!")
+                        if tg(C, msg): son_squeeze_sinyalleri[cooldown_key] = time.time()
+                        
+                    # SHORT SIKIŞMASI
+                    elif g_long_pct < 30 and t_long_pct > 60:
+                        msg = (f"🚨 <b>SHORT SIKIŞMASI RİSKİ: {symbol}</b>\n"
+                               f"<i>{tf.upper()} Grafik - Kontradyen Uyarı</i>\n\n"
+                               f"👥 <b>Küçük Yatırımcı:</b> %{g_long_pct:.1f} Long\n"
+                               f"🐋 <b>Balina (Top Trader):</b> %{t_long_pct:.1f} Long\n\n"
+                               f"💡 <b>Açıklama:</b> Küçük yatırımcı aşırı derecede Short pozisyonda. Ancak balinalar Long'a geçmiş durumda. Bu durum, yakın zamanda bir 'Short Sıkışması' (roket yükselişi) yaşanabileceğini gösterir. Satış sinyallerine karşı dikkatli olun!")
+                        if tg(C, msg): son_squeeze_sinyalleri[cooldown_key] = time.time()
+                time.sleep(0.1)
+            time.sleep(SQUEEZE_RADAR_ARALIGI)
+        except Exception as e:
+            log("SQUEEZE", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# MOTOR 1-13 (Mevcut Motorlar)
 # =====================================================
 def midas_flow_loop():
     log("RAPOR", "Midas Flow Motoru Başladı.")
@@ -266,9 +339,6 @@ def midas_flow_loop():
             time.sleep(RAPOR_ARALIGI)
         except: time.sleep(60)
 
-# =====================================================
-# MOTOR 2: CHARTIST (EMA200 ÇİFT YÖNLÜ)
-# =====================================================
 def chartist_loop():
     log("CHARTIST", "Zırhlı EMA200 Motoru Başladı.")
     time.sleep(15)
@@ -289,19 +359,19 @@ def chartist_loop():
                         c_ema, p_ema = ema200[-1], ema200[-2]
                         vol = [float(k[7]) for k in klines[:-1]]
                         if vol[-1] > sum(vol[-21:-1])/20:
+                            sqz = squeeze_radar_check(symbol, tf)
                             if prev <= p_ema and curr > c_ema and curr > c_ema * 1.01:
                                 msg = (f"📈 <b>UZUN VADELİ SPOT (LONG): {symbol}</b>\n<i>{tf.upper()} EMA200 Yukarı Kırılımı</i>\n\n💰 Fiyat: {akilli_fiyat(curr)}\n\n💡 <b>Açıklama:</b> Fiyat, 200 periyotluk devasa ortalamayı (EMA200) hacimle yukarı kırdı. Bu, uzun vadeli yatırımcıların (kurumsalların) bölgeye girdiğini ve trendin kalıcı olarak yön değiştirebileceğini gösterir.")
+                                if sqz: msg += f"\n\n{sqz}"
                                 if tg(C, msg): son_sinyaller[cooldown_key] = time.time(); sinyal_kaydet(symbol, "LONG", curr, [curr*1.03, curr*1.05, curr*1.08], curr*0.97)
                             elif prev >= p_ema and curr < c_ema and curr < c_ema * 0.99:
                                 msg = (f"📉 <b>UZUN VADELİ SPOT (SHORT): {symbol}</b>\n<i>{tf.upper()} EMA200 Aşağı Kırılımı</i>\n\n💰 Fiyat: {akilli_fiyat(curr)}\n\n💡 <b>Açıklama:</b> Fiyat, 200 periyotluk devasa ortalamayı (EMA200) hacimle aşağı kırdı. Büyük yatırımcıların çıktığını ve uzun vadeli düşüş trendinin (Ayı) başladığını gösterebilir.")
+                                if sqz: msg += f"\n\n{sqz}"
                                 if tg(C, msg): son_sinyaller[cooldown_key] = time.time(); sinyal_kaydet(symbol, "SHORT", curr, [curr*0.97, curr*0.95, curr*0.92], curr*1.03)
                 time.sleep(0.05)
             time.sleep(CHARTIST_ARALIGI)
         except: time.sleep(60)
 
-# =====================================================
-# MOTOR 3: PUMP AVCISI
-# =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı.")
     time.sleep(30)
@@ -319,16 +389,15 @@ def pump_loop():
                 if pc == 0 or pv == 0: continue
                 if ((cc-pc)/pc)*100 >= 3.0 and ((cv-pv)/pv)*100 >= 100.0 and (cv-pv) >= 50_000:
                     teyit = trap_radar_check(symbol)
+                    sqz = squeeze_radar_check(symbol, '4h') # Pump anında sıkışma kontrolü
                     msg = (f"🚀 <b>Pump - {symbol}</b>\n💰 Fiyat: {akilli_fiyat(cc)}\n📊 Hacim Artışı: +%{((cv-pv)/pv)*100:.0f}\n\n{teyit}\n\n"
                            f"💡 <b>Açıklama:</b> 5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Trap Radar (OI ve CVD) sayesinde bu hareketin arkasında gerçek balinaların mı yoksa küçük yatırımcıyı çekmek isteyen sahte botların mı olduğunu analiz ettik.")
+                    if sqz: msg += f"\n\n{sqz}"
                     tg(C, msg); son_pump_sinyalleri[symbol] = time.time()
                 time.sleep(0.05)
             time.sleep(PUMP_ARALIGI)
         except: time.sleep(60)
 
-# =====================================================
-# MOTOR 4: FORMASYON (MSS ÇİFT YÖNLÜ)
-# =====================================================
 def formasyon_loop():
     log("FORMASYON", "Formasyon Motoru Başladı.")
     time.sleep(45)
@@ -354,9 +423,6 @@ def formasyon_loop():
             time.sleep(FORMASYON_ARALIGI)
         except: time.sleep(60)
 
-# =====================================================
-# MOTOR 5: EMA RIBBON (ÇİFT YÖNLÜ)
-# =====================================================
 def ema_ribbon_loop():
     log("EMA_RIBBON", "EMA Dizilim Motoru Başladı.")
     time.sleep(90)
@@ -383,9 +449,6 @@ def ema_ribbon_loop():
             time.sleep(EMA_RIBBON_ARALIGI)
         except: time.sleep(60)
 
-# =====================================================
-# MOTOR 6: MACD (ÇİFT YÖNLÜ)
-# =====================================================
 def macd_loop():
     log("MACD", "MACD Motoru Başladı.")
     time.sleep(105)
@@ -414,9 +477,6 @@ def macd_loop():
             time.sleep(MACD_ARALIGI)
         except: time.sleep(60)
 
-# =====================================================
-# MOTOR 7: MIDAS SETUP (ÇİFT YÖNLÜ)
-# =====================================================
 def midas_setup_loop():
     log("MIDAS_SETUP", "Midas Setup Motoru Başladı.")
     time.sleep(120)
@@ -446,9 +506,6 @@ def midas_setup_loop():
             time.sleep(MIDAS_SETUP_ARALIGI)
         except: time.sleep(60)
 
-# =====================================================
-# MOTOR 8: TARİHİ ZİRVE / DİP (ATH/ATL)
-# =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Motoru Başladı.")
     time.sleep(135)
@@ -485,9 +542,6 @@ def ath_atl_loop():
             time.sleep(ATH_ATL_ARALIGI)
         except Exception as e: time.sleep(60)
 
-# =====================================================
-# MOTOR 9: DIGITAL CHARTIST (ÇİFT YÖNLÜ)
-# =====================================================
 def digital_chartist_loop():
     log("DIGITAL_CHARTIST", "Kırılım ve Hedef Motoru Başladı.")
     time.sleep(150)
@@ -526,9 +580,6 @@ def digital_chartist_loop():
             time.sleep(DIGITAL_CHARTIST_ARALIGI)
         except Exception as e: time.sleep(60)
 
-# =====================================================
-# MOTOR 10: SMA200 (ÇİFT YÖNLÜ)
-# =====================================================
 def sma200_loop():
     log("SMA200", "SMA200 Çift Yönlü Motoru Başladı.")
     time.sleep(180)
@@ -548,20 +599,21 @@ def sma200_loop():
                     c_sma = sma200[-1]; p_sma = sma200[-2]
                     
                     if prev <= p_sma and curr > c_sma and curr > c_sma * 1.005:
+                        sqz = squeeze_radar_check(symbol, tf)
                         msg = (f"🚀 <b>SMA200 YUKARI KIRILIM (LONG): {symbol}</b>\n<i>{tf.upper()} Grafik</i>\n\n"
                                f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk basit ortalamanın (SMA200) üzerine çıktı. SMA200, kurumsal yatırımcıların ortalama maliyet çizgisidir. Bu çizginin üzerine çıkılması, piyasanın genel olarak 'Al' bölgesine geçtiğini gösterir.")
+                        if sqz: msg += f"\n\n{sqz}"
                         if tg(C, msg): son_sma200_sinyalleri[cooldown_key] = time.time(); sinyal_kaydet(symbol, "LONG", curr, [curr*1.03, curr*1.05, curr*1.08], curr*0.97)
                     elif prev >= p_sma and curr < c_sma and curr < c_sma * 0.995:
+                        sqz = squeeze_radar_check(symbol, tf)
                         msg = (f"💀 <b>SMA200 AŞAĞI KIRILIM (SHORT): {symbol}</b>\n<i>{tf.upper()} Grafik</i>\n\n"
                                f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk ortalamanın (SMA200) altına sarktı. Büyük yatırımcıların bölgeden çıktığını ve piyasanın genel olarak 'Sat' (Ayı) bölgesine geçtiğini gösterir. Düşüş trendi hız kazanabilir.")
+                        if sqz: msg += f"\n\n{sqz}"
                         if tg(C, msg): son_sma200_sinyalleri[cooldown_key] = time.time(); sinyal_kaydet(symbol, "SHORT", curr, [curr*0.97, curr*0.95, curr*0.92], curr*1.03)
                 time.sleep(0.1)
             time.sleep(SMA200_ARALIGI)
         except Exception as e: time.sleep(60)
 
-# =====================================================
-# MOTOR 11: BOLLINGER (ÇİFT YÖNLÜ)
-# =====================================================
 def bollinger_loop():
     log("BOLLINGER", "Bollinger Bantları Motoru Başladı.")
     time.sleep(210)
@@ -591,9 +643,6 @@ def bollinger_loop():
             time.sleep(BOLLINGER_ARALIGI)
         except Exception as e: time.sleep(60)
 
-# =====================================================
-# MOTOR 12: ICHIMOKU (ÇİFT YÖNLÜ)
-# =====================================================
 def ichimoku_loop():
     log("ICHIMOKU", "Ichimoku Bulut Motoru Başladı.")
     time.sleep(240)
@@ -624,9 +673,6 @@ def ichimoku_loop():
             time.sleep(ICHIMOKU_ARALIGI)
         except Exception as e: time.sleep(60)
 
-# =====================================================
-# MOTOR 13: BINANCE KILLERS CLONE (FVG & KONFLUANS)
-# =====================================================
 def binance_killers_loop():
     log("BINANCE_KILLERS", "FVG ve Konfluans Motoru Başladı.")
     time.sleep(270)
@@ -657,16 +703,20 @@ def binance_killers_loop():
                         stop_loss = yatay_destek * 0.98
                         diff = entry_high - stop_loss
                         targets = [entry_high + (diff * i) for i in [1.0, 1.5, 2.0, 3.0, 4.0]]
+                        sqz = squeeze_radar_check(symbol, tf)
                         msg = (f"📍SIGNAL ID: #{sig_id}📍\nCOIN: #{symbol} (2-5x)\nDirection: LONG\n➖➖➖➖➖➖➖\nENTRY: {akilli_fiyat(entry_low)} - {akilli_fiyat(entry_high)}\n\nTARGETS: {' – '.join([akilli_fiyat(t) for t in targets])}\n\nSTOP LOSS: {akilli_fiyat(stop_loss)}\n\n{tf.upper()} FVG confluent with ascending trendline confluent with stacked horizontal support at entry.\n\n"
                                f"💡 <b>Açıklama:</b> Yükselen trend içinde, fiyatın hızlı hareket ederken bıraktığı boşluk (FVG) ve yatay destek seviyesi tam olarak çakışıyor (Konfluans). Kurumsal yatırımcıların bu bölgeden alım yapması beklenir.")
+                        if sqz: msg += f"\n\n{sqz}"
                         if tg(C, msg): son_fvg_sinyalleri[symbol] = time.time(); sinyal_kaydet(symbol, "LONG", (entry_low+entry_high)/2, targets, stop_loss); break
                     elif trend_down and bearish_fvg and abs(curr - bearish_fvg) / curr < 0.02 and abs(curr - yatay_direnc) / curr < 0.04:
                         entry_low = bearish_fvg * 0.998; entry_high = bearish_fvg * 1.002
                         stop_loss = yatay_direnc * 1.02
                         diff = stop_loss - entry_low
                         targets = [entry_low - (diff * i) for i in [1.0, 1.5, 2.0, 3.0, 4.0]]
+                        sqz = squeeze_radar_check(symbol, tf)
                         msg = (f"📍SIGNAL ID: #{sig_id}📍\nCOIN: #{symbol} (2-5x)\nDirection: SHORT\n➖➖➖➖➖➖➖\nENTRY: {akilli_fiyat(entry_low)} - {akilli_fiyat(entry_high)}\n\nTARGETS: {' – '.join([akilli_fiyat(t) for t in targets])}\n\nSTOP LOSS: {akilli_fiyat(stop_loss)}\n\n{tf.upper()} FVG confluent with descending trendline confluent with stacked horizontal resistance at entry.\n\n"
                                f"💡 <b>Açıklama:</b> Düşen trend içinde, fiyatın bıraktığı ayı boşluğu (FVG) ve yatay direnç seviyesi çakışıyor (Konfluans). Kurumsal satışların bu bölgeden gelmesi beklenir.")
+                        if sqz: msg += f"\n\n{sqz}"
                         if tg(C, msg): son_fvg_sinyalleri[symbol] = time.time(); sinyal_kaydet(symbol, "SHORT", (entry_low+entry_high)/2, targets, stop_loss); break
                 time.sleep(0.1)
             time.sleep(FVG_KONFLUANS_ARALIGI)
@@ -693,6 +743,7 @@ def run_web_server():
 # =====================================================
 if __name__ == "__main__":
     threading.Thread(target=performans_takip_loop, daemon=True).start()
+    threading.Thread(target=squeeze_radar_loop, daemon=True).start() # YENİ MOTOR
     threading.Thread(target=midas_flow_loop, daemon=True).start()
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
