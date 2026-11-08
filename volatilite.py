@@ -38,7 +38,7 @@ BOLLINGER_ARALIGI = 3600
 ICHIMOKU_ARALIGI = 3600    
 FVG_KONFLUANS_ARALIGI = 3600 
 PERFORMANS_TAKIP_ARALIGI = 300 
-SQUEEZE_RADAR_ARALIGI = 14400 # 4 Saat (YENİ)
+SQUEEZE_RADAR_ARALIGI = 14400
 
 # FİLTRELER (Hacim)
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -53,7 +53,7 @@ MIN_HACIM_SMA200 = 15_000_000
 MIN_HACIM_BOLLINGER = 10_000_000 
 MIN_HACIM_ICHIMOKU = 10_000_000  
 MIN_HACIM_FVG = 10_000_000 
-MIN_HACIM_SQUEEZE = 20_000_000 # Sıkışma Radarı için Yüksek Hacim Şartı
+MIN_HACIM_SQUEEZE = 20_000_000 
 
 # SİNYAL HAFIZALARI
 son_sinyaller = {}
@@ -68,7 +68,7 @@ son_sma200_sinyalleri = {}
 son_bollinger_sinyalleri = {} 
 son_ichimoku_sinyalleri = {}  
 son_fvg_sinyalleri = {}       
-son_squeeze_sinyalleri = {} # YENİ
+son_squeeze_sinyalleri = {}
 
 # AKTİF SİNYAL TAKİP HAFIZASI
 aktif_sinyaller = {} 
@@ -188,7 +188,6 @@ def trap_radar_check(symbol):
         else: return "⚖️ <b>Kısmi Teyit</b>"
     except: return "⚖️ <b>Kısmi Teyit</b>"
 
-# YENİ: SIKIŞMA RADARI (SQUEEZE RADAR) KONTROLÜ
 def squeeze_radar_check(symbol, timeframe='4h'):
     try:
         global_data = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={timeframe}&limit=1")
@@ -199,14 +198,10 @@ def squeeze_radar_check(symbol, timeframe='4h'):
         g_long_pct = float(global_data[0]['longAccount']) * 100
         t_long_pct = float(top_data[0]['longAccount']) * 100
         
-        # Long Sıkışması: Kalabalık aşırı Long, Balina Short'a geçmiş
         if g_long_pct > 75 and t_long_pct < 50:
             return f"⚠️ <b>SİNYAL RİSKLİ:</b> Long Sıkışması Riski Var! (Kalabalık %{g_long_pct:.0f} Long, Balina %{t_long_pct:.0f} Long)"
-        
-        # Short Sıkışması: Kalabalık aşırı Short, Balina Long'a geçmiş
         elif g_long_pct < 30 and t_long_pct > 60:
             return f"🚀 <b>SİNYAL DESTEKLİ:</b> Short Sıkışması Riski Var! (Kalabalık %{g_long_pct:.0f} Long, Balina %{t_long_pct:.0f} Long)"
-        
         return ""
     except: return ""
 
@@ -275,7 +270,6 @@ def squeeze_radar_loop():
                     cooldown_key = f"SQZ_{tf}_{symbol}"
                     if cooldown_key in son_squeeze_sinyalleri and time.time() - son_squeeze_sinyalleri[cooldown_key] < 43200: continue
                     
-                    # Veriyi kontrol et
                     global_data = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
                     top_data = gj(f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
                     
@@ -284,7 +278,6 @@ def squeeze_radar_loop():
                     g_long_pct = float(global_data[0]['longAccount']) * 100
                     t_long_pct = float(top_data[0]['longAccount']) * 100
                     
-                    # LONG SIKIŞMASI
                     if g_long_pct > 75 and t_long_pct < 50:
                         msg = (f"🚨 <b>LONG SIKIŞMASI RİSKİ: {symbol}</b>\n"
                                f"<i>{tf.upper()} Grafik - Kontradyen Uyarı</i>\n\n"
@@ -293,7 +286,6 @@ def squeeze_radar_loop():
                                f"💡 <b>Açıklama:</b> Küçük yatırımcı aşırı derecede Long pozisyonda (Long yığılması var). Ancak balinalar tersine Short'a geçmiş durumda. Bu tablo, yakın zamanda bir 'Long Patlatma' (şelale düşüşü) operasyonu gelebileceğini gösterir. Alım sinyallerine karşı dikkatli olun!")
                         if tg(C, msg): son_squeeze_sinyalleri[cooldown_key] = time.time()
                         
-                    # SHORT SIKIŞMASI
                     elif g_long_pct < 30 and t_long_pct > 60:
                         msg = (f"🚨 <b>SHORT SIKIŞMASI RİSKİ: {symbol}</b>\n"
                                f"<i>{tf.upper()} Grafik - Kontradyen Uyarı</i>\n\n"
@@ -308,7 +300,7 @@ def squeeze_radar_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 1-13 (Mevcut Motorlar)
+# MOTOR 1: MİDAS FLOW
 # =====================================================
 def midas_flow_loop():
     log("RAPOR", "Midas Flow Motoru Başladı.")
@@ -339,6 +331,9 @@ def midas_flow_loop():
             time.sleep(RAPOR_ARALIGI)
         except: time.sleep(60)
 
+# =====================================================
+# MOTOR 2: CHARTIST (EMA200 ÇİFT YÖNLÜ)
+# =====================================================
 def chartist_loop():
     log("CHARTIST", "Zırhlı EMA200 Motoru Başladı.")
     time.sleep(15)
@@ -372,6 +367,9 @@ def chartist_loop():
             time.sleep(CHARTIST_ARALIGI)
         except: time.sleep(60)
 
+# =====================================================
+# MOTOR 3: PUMP AVCISI
+# =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı.")
     time.sleep(30)
@@ -389,7 +387,7 @@ def pump_loop():
                 if pc == 0 or pv == 0: continue
                 if ((cc-pc)/pc)*100 >= 3.0 and ((cv-pv)/pv)*100 >= 100.0 and (cv-pv) >= 50_000:
                     teyit = trap_radar_check(symbol)
-                    sqz = squeeze_radar_check(symbol, '4h') # Pump anında sıkışma kontrolü
+                    sqz = squeeze_radar_check(symbol, '4h')
                     msg = (f"🚀 <b>Pump - {symbol}</b>\n💰 Fiyat: {akilli_fiyat(cc)}\n📊 Hacim Artışı: +%{((cv-pv)/pv)*100:.0f}\n\n{teyit}\n\n"
                            f"💡 <b>Açıklama:</b> 5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Trap Radar (OI ve CVD) sayesinde bu hareketin arkasında gerçek balinaların mı yoksa küçük yatırımcıyı çekmek isteyen sahte botların mı olduğunu analiz ettik.")
                     if sqz: msg += f"\n\n{sqz}"
@@ -398,6 +396,9 @@ def pump_loop():
             time.sleep(PUMP_ARALIGI)
         except: time.sleep(60)
 
+# =====================================================
+# MOTOR 4: FORMASYON (MSS ÇİFT YÖNLÜ)
+# =====================================================
 def formasyon_loop():
     log("FORMASYON", "Formasyon Motoru Başladı.")
     time.sleep(45)
@@ -423,6 +424,9 @@ def formasyon_loop():
             time.sleep(FORMASYON_ARALIGI)
         except: time.sleep(60)
 
+# =====================================================
+# MOTOR 5: EMA RIBBON (ÇİFT YÖNLÜ)
+# =====================================================
 def ema_ribbon_loop():
     log("EMA_RIBBON", "EMA Dizilim Motoru Başladı.")
     time.sleep(90)
@@ -449,6 +453,9 @@ def ema_ribbon_loop():
             time.sleep(EMA_RIBBON_ARALIGI)
         except: time.sleep(60)
 
+# =====================================================
+# MOTOR 6: MACD (ÇİFT YÖNLÜ)
+# =====================================================
 def macd_loop():
     log("MACD", "MACD Motoru Başladı.")
     time.sleep(105)
@@ -477,6 +484,9 @@ def macd_loop():
             time.sleep(MACD_ARALIGI)
         except: time.sleep(60)
 
+# =====================================================
+# MOTOR 7: MIDAS SETUP (ÇİFT YÖNLÜ)
+# =====================================================
 def midas_setup_loop():
     log("MIDAS_SETUP", "Midas Setup Motoru Başladı.")
     time.sleep(120)
@@ -506,6 +516,9 @@ def midas_setup_loop():
             time.sleep(MIDAS_SETUP_ARALIGI)
         except: time.sleep(60)
 
+# =====================================================
+# MOTOR 8: TARİHİ ZİRVE / DİP (ATH/ATL)
+# =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Motoru Başladı.")
     time.sleep(135)
@@ -542,6 +555,9 @@ def ath_atl_loop():
             time.sleep(ATH_ATL_ARALIGI)
         except Exception as e: time.sleep(60)
 
+# =====================================================
+# MOTOR 9: DIGITAL CHARTIST (ÇİFT YÖNLÜ)
+# =====================================================
 def digital_chartist_loop():
     log("DIGITAL_CHARTIST", "Kırılım ve Hedef Motoru Başladı.")
     time.sleep(150)
@@ -580,6 +596,9 @@ def digital_chartist_loop():
             time.sleep(DIGITAL_CHARTIST_ARALIGI)
         except Exception as e: time.sleep(60)
 
+# =====================================================
+# MOTOR 10: SMA200 (ÇİFT YÖNLÜ)
+# =====================================================
 def sma200_loop():
     log("SMA200", "SMA200 Çift Yönlü Motoru Başladı.")
     time.sleep(180)
@@ -614,6 +633,9 @@ def sma200_loop():
             time.sleep(SMA200_ARALIGI)
         except Exception as e: time.sleep(60)
 
+# =====================================================
+# MOTOR 11: BOLLINGER (ÇİFT YÖNLÜ)
+# =====================================================
 def bollinger_loop():
     log("BOLLINGER", "Bollinger Bantları Motoru Başladı.")
     time.sleep(210)
@@ -643,6 +665,9 @@ def bollinger_loop():
             time.sleep(BOLLINGER_ARALIGI)
         except Exception as e: time.sleep(60)
 
+# =====================================================
+# MOTOR 12: ICHIMOKU (ÇİFT YÖNLÜ)
+# =====================================================
 def ichimoku_loop():
     log("ICHIMOKU", "Ichimoku Bulut Motoru Başladı.")
     time.sleep(240)
@@ -673,6 +698,9 @@ def ichimoku_loop():
             time.sleep(ICHIMOKU_ARALIGI)
         except Exception as e: time.sleep(60)
 
+# =====================================================
+# MOTOR 13: BINANCE KILLERS CLONE (FVG & KONFLUANS)
+# =====================================================
 def binance_killers_loop():
     log("BINANCE_KILLERS", "FVG ve Konfluans Motoru Başladı.")
     time.sleep(270)
@@ -742,8 +770,22 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
+    # --- İLK MESAJ (STARTUP) ---
+    log("SİSTEM", "Bot başlatıldı. Telegram'a onay mesajı gönderiliyor...")
+    baslangic_mesaji = (
+        "🤖 <b>SİSTEM AKTİF!</b>\n\n"
+        "Kripto Sinyal Botu başarıyla başlatıldı. 🚀\n"
+        "14 farklı motor (Pump, FVG, Sıkışma Radarı vb.) arka planda piyasayı taramaya başladı.\n\n"
+        "Piyasa şartları uygun olduğunda ve kaliteli bir fırsat yakalandığında sinyaller buraya düşecektir."
+    )
+    if tg(C, baslangic_mesaji):
+        log("SİSTEM", "✅ Başlangıç mesajı başarıyla Telegram'a gönderildi.")
+    else:
+        log("SİSTEM", "❌ HATA: Telegram'a mesaj gönderilemedi! Lütfen BOT_TOKEN ve CHAT_ID ayarlarını kontrol edin.")
+    
+    # Motorları başlat
     threading.Thread(target=performans_takip_loop, daemon=True).start()
-    threading.Thread(target=squeeze_radar_loop, daemon=True).start() # YENİ MOTOR
+    threading.Thread(target=squeeze_radar_loop, daemon=True).start() 
     threading.Thread(target=midas_flow_loop, daemon=True).start()
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
@@ -758,4 +800,5 @@ if __name__ == "__main__":
     threading.Thread(target=ichimoku_loop, daemon=True).start()
     threading.Thread(target=binance_killers_loop, daemon=True).start() 
     
+    # Web sunucusunu başlat
     run_web_server()
