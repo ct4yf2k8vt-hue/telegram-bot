@@ -1,50 +1,37 @@
 # =====================================================
-# MOTOR 8: YILLIK ZİRVE / DİP (365 GÜN) - GÜNCELLENDİ
+# MOTOR 10: SMA200 (SADECE 3 GÜNLÜK VE HAFTALIK)
 # =====================================================
-def ath_atl_loop():
-    log("YILLIK_ZIRVE_DIP", "Yıllık Zirve/Dip (365 Gün) Motoru Başladı.")
-    time.sleep(135)
+def sma200_loop():
+    log("SMA200", "SMA200 (3 Günlük ve Haftalık) Motoru Başladı.")
+    time.sleep(180)
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ATH_ATL]
-            
-            for symbol in adaylar:
-                if symbol in son_ath_atl_sinyalleri and time.time() - son_ath_atl_sinyalleri[symbol] < 86400: continue
-                
-                # 500 Gün yerine 365 Gün (1 Yıl) veri çekiyoruz
-                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=365")
-                if not isinstance(klines, list) or len(klines) < 200: continue
-                
-                highs = [float(k[2]) for k in klines[:-1]]
-                lows = [float(k[3]) for k in klines[:-1]]
-                closes = [float(k[4]) for k in klines[:-1]]
-                vols = [float(k[7]) for k in klines[:-1]]
-                
-                current_price = closes[-1]; prev_close = closes[-2]; current_vol = vols[-1]
-                
-                # Son 1 yılın en yüksek ve en düşük seviyeleri
-                yillik_zirve = max(highs)
-                yillik_dip = min(lows)
-                
-                if current_vol < (sum(vols[-21:-1])/20 * 1.2): continue
-                
-                # YILLIK DİP KIRILIMI (SHORT)
-                if prev_close >= yillik_dip and current_price < yillik_dip:
-                    stop = yillik_dip * 1.05; hedef = current_price * 0.80 
-                    msg = (f"💀 <b>YILLIK DİP KIRILIMI (SHORT): {symbol}</b>\n<i>1 Günlük Grafik (Son 365 Gün)</i>\n\n"
-                           f"💰 Giriş: {akilli_fiyat(current_price)}\n🎯 Hedef: {akilli_fiyat(hedef)}\n🛑 Stop: {akilli_fiyat(stop)}\n\n"
-                           f"💡 <b>Açıklama:</b> Fiyat, son 1 yılın (365 gün) en düşük seviyesini hacimle aşağı kırdı. Psikolojik bir çöküş (kapitülasyon) yaşanıyor olabilir, düşüş derinleşebilir.")
-                    if tg(C, msg): son_ath_atl_sinyalleri[symbol] = time.time()
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SMA200]:
+                # SADECE 3 GÜNLÜK (3d) VE HAFTALIK (1w) OLARAK AYARLANDI
+                for tf in ['3d', '1w']:
+                    cooldown_key = f"SMA200_{tf}_{symbol}"
+                    if cooldown_key in son_sma200_sinyalleri and time.time() - son_sma200_sinyalleri[cooldown_key] < 43200: continue 
+                    klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=250")
+                    if not isinstance(klines, list) or len(klines) < 205: continue
+                    closes = [float(k[4]) for k in klines[:-1]]; curr, prev = closes[-1], closes[-2]
+                    sma200 = calculate_sma(closes, 200)
+                    if not sma200 or len(sma200) < 3: continue
+                    c_sma = sma200[-1]; p_sma = sma200[-2]
                     
-                # YILLIK ZİRVE KIRILIMI (LONG)
-                elif prev_close <= yillik_zirve and current_price > yillik_zirve:
-                    stop = yillik_zirve * 0.95; hedef = current_price * 1.20 
-                    msg = (f"🚀 <b>YILLIK ZİRVE KIRILIMI (LONG): {symbol}</b>\n<i>1 Günlük Grafik (Son 365 Gün)</i>\n\n"
-                           f"💰 Giriş: {akilli_fiyat(current_price)}\n🎯 Hedef: {akilli_fiyat(hedef)}\n🛑 Stop: {akilli_fiyat(stop)}\n\n"
-                           f"💡 <b>Açıklama:</b> Fiyat, son 1 yılın (365 gün) en yüksek seviyesini hacimle yukarı kırdı. Önünde hiçbir yıllık direnç kalmadı (Fiyat Keşfi), büyük bir boğa trendi başlayabilir.")
-                    if tg(C, msg): son_ath_atl_sinyalleri[symbol] = time.time()
+                    if prev <= p_sma and curr > c_sma and curr > c_sma * 1.005:
+                        sqz = squeeze_radar_check(symbol, tf)
+                        msg = (f"🚀 <b>SMA200 YUKARI KIRILIM (LONG): {symbol}</b>\n<i>{tf.upper()} Grafik</i>\n\n"
+                               f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk basit ortalamanın (SMA200) üzerine çıktı. SMA200, kurumsal yatırımcıların ortalama maliyet çizgisidir. Bu çizginin üzerine çıkılması, piyasanın genel olarak 'Al' bölgesine geçtiğini gösterir.")
+                        if sqz: msg += f"\n\n{sqz}"
+                        if tg(C, msg): son_sma200_sinyalleri[cooldown_key] = time.time()
+                    elif prev >= p_sma and curr < c_sma and curr < c_sma * 0.995:
+                        sqz = squeeze_radar_check(symbol, tf)
+                        msg = (f"💀 <b>SMA200 AŞAĞI KIRILIM (SHORT): {symbol}</b>\n<i>{tf.upper()} Grafik</i>\n\n"
+                               f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk ortalamanın (SMA200) altına sarktı. Büyük yatırımcıların bölgeden çıktığını ve piyasanın genel olarak 'Sat' (Ayı) bölgesine geçtiğini gösterir. Düşüş trendi hız kazanabilir.")
+                        if sqz: msg += f"\n\n{sqz}"
+                        if tg(C, msg): son_sma200_sinyalleri[cooldown_key] = time.time()
                 time.sleep(0.1)
-            time.sleep(ATH_ATL_ARALIGI)
+            time.sleep(SMA200_ARALIGI)
         except Exception as e: time.sleep(60)
