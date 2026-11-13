@@ -39,7 +39,8 @@ ICHIMOKU_ARALIGI = 3600
 FVG_KONFLUANS_ARALIGI = 3600 
 SQUEEZE_RADAR_ARALIGI = 14400
 HACIM_PATLAMASI_ARALIGI = 3600 
-EMILIM_ARALIGI = 3600 # YENİ
+EMILIM_ARALIGI = 3600 
+SMART_MONEY_ARALIGI = 3600 # YENİ
 
 # FİLTRELER (Hacim)
 MIN_HACIM_CHARTIST = 10_000_000 
@@ -56,7 +57,8 @@ MIN_HACIM_ICHIMOKU = 10_000_000
 MIN_HACIM_FVG = 10_000_000 
 MIN_HACIM_SQUEEZE = 20_000_000 
 MIN_HACIM_HACIM_PATLAMASI = 10_000_000 
-MIN_HACIM_EMILIM = 5_000_000 # YENİ
+MIN_HACIM_EMILIM = 5_000_000 
+MIN_HACIM_SMART_MONEY = 100_000_000 # SADECE DEV COINLER İÇİN (BTC, ETH vb.)
 
 # SİNYAL HAFIZALARI
 son_sinyaller = {}
@@ -73,7 +75,8 @@ son_ichimoku_sinyalleri = {}
 son_fvg_sinyalleri = {}       
 son_squeeze_sinyalleri = {}
 son_hacim_sinyalleri = {} 
-son_emilim_sinyalleri = {} # YENİ
+son_emilim_sinyalleri = {} 
+son_smart_money_sinyalleri = {} # YENİ
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -206,6 +209,78 @@ def squeeze_radar_check(symbol, timeframe='4h'):
             return f"🚀 <b>SİNYAL DESTEKLİ:</b> Short Sıkışması Riski Var! (Kalabalık %{g_long_pct:.0f} Long, Balina %{t_long_pct:.0f} Long)"
         return ""
     except: return ""
+
+# =====================================================
+# MOTOR 17: SMART MONEY (LİKİDİTE AVI & OTE)
+# =====================================================
+def smart_money_loop():
+    log("SMART_MONEY", "Akıllı Para (Likidite Avı & OTE) Motoru Başladı.")
+    time.sleep(400)
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SMART_MONEY]:
+                for tf in ['4h', '1d']:
+                    cooldown_key = f"SM_{tf}_{symbol}"
+                    if cooldown_key in son_smart_money_sinyalleri and time.time() - son_smart_money_sinyalleri[cooldown_key] < 14400: continue
+                    
+                    klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=50")
+                    if not isinstance(klines, list) or len(klines) < 30: continue
+                    
+                    highs = [float(k[2]) for k in klines]
+                    lows = [float(k[3]) for k in klines]
+                    closes = [float(k[4]) for k in klines]
+                    
+                    curr_high = highs[-2]
+                    curr_low = lows[-2]
+                    curr_close = closes[-2]
+                    
+                    son_20_dip = min(lows[-22:-2])
+                    son_20_tepe = max(highs[-22:-2])
+                    
+                    # LONG SENARYOSU (Likidite Avı + OTE)
+                    if curr_low < son_20_dip and curr_close > son_20_dip:
+                        son_tepe = max(highs[-15:-2]) 
+                        ote_ust = son_tepe - ((son_tepe - curr_low) * 0.618)
+                        ote_alt = son_tepe - ((son_tepe - curr_low) * 0.786)
+                        
+                        if ote_alt <= curr_close <= ote_ust:
+                            msg = (f"🎯 <b>SMART MONEY (LONG): {symbol}</b>\n"
+                                   f"<i>{tf.upper()} Grafik - Likidite Avı & Fibonacci OTE</i>\n\n"
+                                   f"💰 <b>Giriş (OTE Bölgesi):</b> {akilli_fiyat(ote_alt)} - {akilli_fiyat(ote_ust)}\n"
+                                   f"🎯 <b>Hedef:</b> {akilli_fiyat(son_tepe)} (Önceki Zirve)\n"
+                                   f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(curr_low * 0.995)} (Avlanan Dibi)\n\n"
+                                   f"📊 <b>Yapılan Analiz:</b>\n"
+                                   f"1. 💧 <b>Likidite Avı:</b> Fiyat, 20 günlük dibi ({akilli_fiyat(son_20_dip)}) aşağı yönlü kırıp stopları patlattı ve anında geri döndü.\n"
+                                   f"2. 📏 <b>Fibonacci OTE:</b> Yükseliş sonrası fiyat, en kârlı alım bölgesi olan %61.8 - %78.6 geri çekilme bandına sarktı.\n\n"
+                                   f"💡 <b>Açıklama:</b> Balinalar sahte bir düşüş yaratarak küçük yatırımcıların stoplarını avladı. Şu an fiyat, akıllı paranın (Smart Money) en uygun maliyetle alım yapacağı OTE bölgesinde. Güçlü bir dönüş sinyali.")
+                            if tg(C, msg): son_smart_money_sinyalleri[cooldown_key] = time.time()
+
+                    # SHORT SENARYOSU (Likidite Avı + OTE)
+                    elif curr_high > son_20_tepe and curr_close < son_20_tepe:
+                        son_dip = min(lows[-15:-2])
+                        ote_alt = son_dip + ((curr_high - son_dip) * 0.618)
+                        ote_ust = son_dip + ((curr_high - son_dip) * 0.786)
+                        
+                        if ote_alt <= curr_close <= ote_ust:
+                            msg = (f"🎯 <b>SMART MONEY (SHORT): {symbol}</b>\n"
+                                   f"<i>{tf.upper()} Grafik - Likidite Avı & Fibonacci OTE</i>\n\n"
+                                   f"💰 <b>Giriş (OTE Bölgesi):</b> {akilli_fiyat(ote_alt)} - {akilli_fiyat(ote_ust)}\n"
+                                   f"🎯 <b>Hedef:</b> {akilli_fiyat(son_dip)} (Önceki Dip)\n"
+                                   f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(curr_high * 1.005)} (Avlanan Tepesi)\n\n"
+                                   f"📊 <b>Yapılan Analiz:</b>\n"
+                                   f"1. 💧 <b>Likidite Avı:</b> Fiyat, 20 günlük tepeyi ({akilli_fiyat(son_20_tepe)}) yukarı yönlü kırıp short stoplarını patlattı ve anında geri döndü.\n"
+                                   f"2. 📏 <b>Fibonacci OTE:</b> Düşüş sonrası fiyat, en kârlı satış bölgesi olan %61.8 - %78.6 geri çekilme bandına tepki verdi.\n\n"
+                                   f"💡 <b>Açıklama:</b> Balinalar sahte bir yükseliş yaratarak shortçuların stoplarını avladı. Şu an fiyat, akıllı paranın en uygun maliyetle satış yapacağı OTE bölgesinde. Sert bir düşüş gelebilir.")
+                            if tg(C, msg): son_smart_money_sinyalleri[cooldown_key] = time.time()
+
+                time.sleep(0.1)
+            time.sleep(SMART_MONEY_ARALIGI)
+        except Exception as e:
+            log("SMART_MONEY", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 16: EMİLİM (ABSORPTION) DEDEKTÖRÜ
@@ -854,7 +929,7 @@ if __name__ == "__main__":
     baslangic_mesaji = (
         "🤖 <b>SİSTEM AKTİF!</b>\n\n"
         "Kripto Sinyal Botu başarıyla başlatıldı. 🚀\n"
-        "16 farklı motor (Pump, FVG, Emilim, Sıkışma Radarı, Hacim Patlaması vb.) arka planda piyasayı taramaya başladı.\n\n"
+        "17 farklı motor (Pump, FVG, Emilim, Sıkışma Radarı, Hacim Patlaması, Smart Money vb.) arka planda piyasayı taramaya başladı.\n\n"
         "Piyasa şartları uygun olduğunda ve kaliteli bir fırsat yakalandığında sinyaller buraya düşecektir."
     )
     if tg(C, baslangic_mesaji):
@@ -863,7 +938,8 @@ if __name__ == "__main__":
         log("SİSTEM", "❌ HATA: Telegram'a mesaj gönderilemedi! Lütfen BOT_TOKEN ve CHAT_ID ayarlarını kontrol edin.")
     
     # Motorları başlat
-    threading.Thread(target=absorption_loop, daemon=True).start() # YENİ EKLENEN MOTOR
+    threading.Thread(target=smart_money_loop, daemon=True).start() # YENİ EKLENEN SMART MONEY
+    threading.Thread(target=absorption_loop, daemon=True).start() 
     threading.Thread(target=teyitli_hacim_loop, daemon=True).start() 
     threading.Thread(target=squeeze_radar_loop, daemon=True).start() 
     threading.Thread(target=midas_flow_loop, daemon=True).start()
