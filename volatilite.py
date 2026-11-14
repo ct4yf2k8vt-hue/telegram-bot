@@ -110,10 +110,10 @@ def trap_radar_check(symbol):
     except: return "⚖️ <b>Kısmi Teyit</b>"
 
 # =====================================================
-# MOTOR 1: FORMASYON (4 SAATLİK VE GÜNLÜK)
+# MOTOR 1: FORMASYON (4 SAATLİK VE GÜNLÜK) - AYRIŞTIRILMIŞ
 # =====================================================
 def formasyon_loop():
-    log("FORMASYON", "Formasyon (İkili Tepe/Omuz-Baş-Omuz) Motoru Başladı.")
+    log("FORMASYON", "Formasyon (İkili Tepe & Omuz-Baş-Omuz) Motoru Başladı.")
     time.sleep(10)
     while True:
         try:
@@ -124,21 +124,60 @@ def formasyon_loop():
                 for tf in ['4h', '1d']:
                     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=100")
                     if not isinstance(klines, list) or len(klines) < 100: continue
-                    closes = [float(k[4]) for k in klines]
-                    curr = closes[-2]
                     
+                    highs = [float(k[2]) for k in klines[:-1]]
+                    lows = [float(k[3]) for k in klines[:-1]]
+                    closes = [float(k[4]) for k in klines[:-1]]
+                    
+                    curr = closes[-1] # Son kapanan mum
+                    
+                    # Formasyon ayrımı için son 30 mumun zirvelerini alalım
+                    son_30_zirve = highs[-30:]
+                    son_30_dip = lows[-30:]
+                    
+                    en_yuksek = max(son_30_zirve)
+                    en_dusuk = min(son_30_dip)
+                    
+                    # --- LONG SENARYOSU (Ters İkili Dip veya Ters OBO) ---
                     if curr > max(closes[-20:-5]): 
+                        # İkili Dip mi OBO mu anlamak için 2. en düşük dibi bulalım
+                        sirali_dipler = sorted(list(set([round(x, 5) for x in son_30_dip])))
+                        if len(sirali_dipler) >= 2:
+                            dip1 = sirali_dipler[0]
+                            dip2 = sirali_dipler[1]
+                            # Eğer iki dip birbirine çok yakınsa (%1.5 içinde)
+                            if abs(dip1 - dip2) / dip1 < 0.015:
+                                formasyon_adi = "Ters İkili Dip (Double Bottom)"
+                            else:
+                                formasyon_adi = "Ters Omuz-Baş-Omuz"
+                        else:
+                            formasyon_adi = "Ters Omuz-Baş-Omuz / İkili Dip"
+                            
                         msg = (f"🚀 <b>FORMASYON KIRILIMI (LONG): {symbol}</b>\n"
-                               f"<i>{tf.upper()} Grafik - Ters Omuz-Baş-Omuz / İkili Dip</i>\n\n"
+                               f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
                                f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
-                               f"💡 <b>Açıklama:</b> Fiyat, görseldeki formasyonların boyun çizgisini (Neckline) yukarı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) gerçekleşti. Alıcılar kontrolü ele geçirdi ve yeni bir yükseliş trendi (Higher High) başladı.")
+                               f"💡 <b>Açıklama:</b> Fiyat, {formasyon_adi} formasyonunun boyun çizgisini (Neckline) yukarı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) gerçekleşti. Alıcılar kontrolü ele geçirdi ve yeni bir yükseliş trendi (Higher High) başladı.")
                         if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); break
                         
+                    # --- SHORT SENARYOSU (İkili Tepe veya OBO) ---
                     elif curr < min(closes[-20:-5]):
+                        # İkili Tepe mi OBO mu anlamak için 2. en yüksek tepeyi bulalım
+                        sirali_tepeler = sorted(list(set([round(x, 5) for x in son_30_zirve])), reverse=True)
+                        if len(sirali_tepeler) >= 2:
+                            tepe1 = sirali_tepeler[0]
+                            tepe2 = sirali_tepeler[1]
+                            # Eğer iki tepe birbirine çok yakınsa (%1.5 içinde)
+                            if abs(tepe1 - tepe2) / tepe1 < 0.015:
+                                formasyon_adi = "İkili Tepe (Double Top)"
+                            else:
+                                formasyon_adi = "Omuz-Baş-Omuz"
+                        else:
+                            formasyon_adi = "Omuz-Baş-Omuz / İkili Tepe"
+                            
                         msg = (f"💀 <b>FORMASYON KIRILIMI (SHORT): {symbol}</b>\n"
-                               f"<i>{tf.upper()} Grafik - Omuz-Baş-Omuz / İkili Tepe</i>\n\n"
+                               f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
                                f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
-                               f"💡 <b>Açıklama:</b> Fiyat, görseldeki formasyonların boyun çizgisini (Neckline) aşağı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) aşağı yönlü gerçekleşti. Satıcılar kontrolü ele geçirdi ve yeni bir düşüş trendi (Lower Low) başladı.")
+                               f"💡 <b>Açıklama:</b> Fiyat, {formasyon_adi} formasyonunun boyun çizgisini (Neckline) aşağı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) aşağı yönlü gerçekleşti. Satıcılar kontrolü ele geçirdi ve yeni bir düşüş trendi (Lower Low) başladı.")
                         if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); break
                 time.sleep(0.1)
             time.sleep(3600)
@@ -380,7 +419,7 @@ if __name__ == "__main__":
     baslangic_mesaji = (
         "🤖 <b>SİSTEM AKTİF!</b>\n\n"
         "İstediğin 7 motor başarıyla başlatıldı. 🚀\n"
-        "• Formasyon (4s, 1g)\n"
+        "• Formasyon (4s, 1g) [Ayrıştırılmış]\n"
         "• Midas Setup (4s)\n"
         "• Pump Avcısı (5dk)\n"
         "• MACD (1g)\n"
