@@ -1,7 +1,7 @@
 # =====================================================
-# MOTOR 11: FORMASYON AVCISI (RENDER UYUMLU TAM SÜRÜM)
+# MOTOR 11: FORMASYON AVCISI (TAM KORUMALI SÜRÜM)
 # =====================================================
-import threading
+import traceback # Hatayı net görmek için
 
 def find_pivots(highs, lows, left=3, right=3):
     pivot_highs, pivot_lows = [], []
@@ -10,9 +10,13 @@ def find_pivots(highs, lows, left=3, right=3):
         if lows[i] == min(lows[i-left:i+right+1]): pivot_lows.append((i, lows[i]))
     return pivot_highs, pivot_lows
 
+# Sinyal hafızasını burada garantiye alıyoruz
+son_formasyon_sinyalleri = {} 
+
 def pattern_scanner_loop():
     print("✅ [LOG] Formasyon Avcısı Motoru Başlatıldı!")
-    time.sleep(240) 
+    time.sleep(10) # Sadece 10 saniye beklesin, test için
+    
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
@@ -20,7 +24,7 @@ def pattern_scanner_loop():
                 time.sleep(60)
                 continue
                 
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 1000000]: # Hacim barajını 1 Milyon yaptım, botun orijinalindeki değişkeni bilmediğim için sabitledim
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 1000000]: 
                 for tf in ['4h', '1d']:
                     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=100")
                     if not isinstance(klines, list) or len(klines) < 50: continue
@@ -82,8 +86,6 @@ def pattern_scanner_loop():
 
                     if signal_type:
                         cooldown_key = f"FORMASYON_{tf}_{formasyon_adi}_{symbol}"
-                        if 'son_formasyon_sinyalleri' not in globals(): globals()['son_formasyon_sinyalleri'] = {}
-                        
                         if cooldown_key in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[cooldown_key] < 14400:
                             continue
                             
@@ -102,8 +104,16 @@ def pattern_scanner_loop():
                 time.sleep(0.2)
             time.sleep(1800) 
         except Exception as e:
-            print(f"⚠️ [HATA] Formasyon Motoru Hatası: {e}")
+            # EĞER HATA VARSA BURADA KIRMIZI KIRMIZI YAZACAK
+            print(f"⚠️ [MOTOR 11 HATASI]: {e}") 
+            traceback.print_exc() 
             time.sleep(60)
 
-# BOTU BAŞLATAN TETİKLEYİCİ (Bunu kesinlikle silme!)
-threading.Thread(target=pattern_scanner_loop, daemon=True).start()
+# MOTORU BAŞLATAN TETİKLEYİCİ
+try:
+    threading.Thread(target=pattern_scanner_loop, daemon=True).start()
+    print("✅ [LOG] Formasyon Motoru Thread'i Başarıyla Başlatıldı.")
+except Exception as e:
+    print(f"🚨 [THREAD BAŞLATMA HATASI]: {e}")
+    while True:
+    time.sleep(10)
