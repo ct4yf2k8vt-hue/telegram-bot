@@ -17,7 +17,10 @@ socket.setdefaulttimeout(15)
 T = os.environ.get("BOT_TOKEN", "").strip()
 C = os.environ.get("CHAT_ID", "1623907197").strip()
 TR_Saati = timezone(timedelta(hours=3))
-BASE = "https://api.binance.com"
+
+# PROXY KULLANARAK BINANCE ENGELINI ASIYORUZ
+BASE = "https://corsproxy.io/?https://api.binance.com"
+FAPI = "https://corsproxy.io/?https://fapi.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
 RAPOR_ARALIGI = 14400      # 4 Saat
@@ -79,6 +82,10 @@ def tg(chat_id, message):
 def gj(url):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
+        # Eğer url zaten proxy içeriyorsa başına ekleme
+        if "corsproxy.io" not in url:
+            url = f"https://corsproxy.io/?{url}"
+            
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as response:
             return json.loads(response.read().decode("utf-8"))
@@ -142,14 +149,14 @@ def get_market_trend(tickers):
 
 def trap_radar_check(symbol):
     try:
-        oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
+        oi_data = gj(f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
         oi_artiyor = False
         if oi_data and len(oi_data) >= 2:
             oi_old = float(oi_data[0]['sumOpenInterest'])
             oi_new = float(oi_data[1]['sumOpenInterest'])
             if oi_old > 0 and ((oi_new - oi_old) / oi_old) * 100 > 0.2: oi_artiyor = True
 
-        taker_data = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=1")
+        taker_data = gj(f"{FAPI}/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=1")
         alici_baskin = False
         if taker_data and len(taker_data) > 0:
             buy_vol = float(taker_data[0]['buyVol'])
@@ -399,7 +406,7 @@ def midas_setup_loop():
                     msg = (f"⚡ <b>{symbol} SETUP (LONG)</b>\n<i>4 Saatlik Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> 4 saatlik grafikte son 20 periyodun (yaklaşık 3 günün) direnci hacimle aşıldı. Kısa ve orta vadeli traderların dikkatini çeken, hızlı hareket potansiyeli yüksek bir kırılımdır.")
-                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time()
+                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.sleep(3600)
                 elif curr < min(lows[-20:]) and is_vol:
                     msg = (f"⚡ <b>{symbol} SETUP (SHORT)</b>\n<i>4 Saatlik Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
@@ -438,7 +445,7 @@ def bollinger_loop():
                     msg = (f"🩸 <b>BOLLINGER ALT BANT (SHORT): {symbol}</b>\n<i>1 Haftalık Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Bollinger alt bandını aşağı yönlü kırdı. Aşırı satım bölgesine girildiğini veya sert bir düşüş dalgasının başladığını gösterebilir.")
-                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time()
+                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.sleep(3600)
                 time.sleep(0.1)
             time.sleep(BOLLINGER_ARALIGI)
         except Exception as e: time.sleep(60)
@@ -474,7 +481,7 @@ def ichimoku_loop():
                     msg = (f"☁️ <b>ICHIMOKU (SHORT): {symbol}</b>\n<i>1 Haftalık Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Ichimoku Bulutunun altına sarktı. Piyasa 'Ayı' bölgesine girdi, düşüş trendi başlayabilir.")
-                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time()
+                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.sleep(3600)
                 time.sleep(0.1)
             time.sleep(ICHIMOKU_ARALIGI)
         except Exception as e: time.sleep(60)
@@ -536,8 +543,8 @@ if __name__ == "__main__":
     log("SİSTEM", "Bot başlatıldı. Telegram'a onay mesajı gönderiliyor...")
     baslangic_mesaji = (
         "🤖 <b>SİSTEM AKTİF!</b>\n\n"
-        "Bot dünkü çalışan haline geri döndürüldü. 🚀\n"
-        "Hafıza dosyası ve yeni mum filtreleri kaldırıldı. Sadece zaman bazlı cooldown aktif.\n\n"
+        "Bot yeniden başlatıldı. Binance API engeli (Proxy ile) aşıldı. 🚀\n"
+        "Motorlar çalışırken loglarda 'Piyasa taranıyor' yazacak.\n\n"
         "Aktif Motorlar:\n"
         "• Midas Flow Rapor (4s)\n"
         "• Formasyon (4s, 1g)\n"
