@@ -1,11 +1,6 @@
 # =====================================================
-# MOTOR 11: FORMASYON AVCISI (TEK BLOK KOPYALA-YAPIŞTIR)
+# MOTOR 11: FORMASYON AVCISI (HATASIZ TAM SÜRÜM)
 # =====================================================
-
-# 1. Cooldown sözlüğünü diğer sözlüklerin olduğu yere ekle (Eğer yoksa kodun en üstüne koy)
-son_formasyon_sinyalleri = {}
-
-# 2. Formasyon Motoru Fonksiyonu
 def find_pivots(highs, lows, left=3, right=3):
     pivot_highs, pivot_lows = [], []
     for i in range(left, len(highs) - right):
@@ -37,30 +32,36 @@ def pattern_scanner_loop():
                     curr_vol = volumes[-2]
                     avg_vol = sum(volumes[-22:-2]) / 20 
                     
+                    # Hacim filtresi (Ortalamanın 1.2 katı değilse geç)
                     if curr_vol < avg_vol * 1.2: continue
 
                     pivot_highs, pivot_lows = find_pivots(highs, lows)
-                    signal_type, formasyon_adi, neckline = None, "", 0.0
+                    signal_type = None
+                    formasyon_adi = ""
+                    neckline = 0.0
+                    yapi_yuksekligi = 0.0
 
-                    # İkili Tepe
+                    # --- İkili Tepe (Double Top) ---
                     if len(pivot_highs) >= 2:
                         p1_idx, p1_price = pivot_highs[-2]
                         p2_idx, p2_price = pivot_highs[-1]
                         if 5 <= (p2_idx - p1_idx) <= 30 and abs(p1_price - p2_price) / p1_price <= 0.02:
                             neckline = min(lows[p1_idx:p2_idx+1])
                             if curr_close < neckline * 0.99:
-                                signal_type, formasyon_adi = "SHORT", "İkili Tepe (Double Top)"
+                                signal_type, formasyon_adi = "SHORT", "İkili Tepe"
+                                yapi_yuksekligi = max(p1_price, p2_price) - neckline
 
-                    # İkili Dip
+                    # --- İkili Dip (Double Bottom) ---
                     if not signal_type and len(pivot_lows) >= 2:
                         p1_idx, p1_price = pivot_lows[-2]
                         p2_idx, p2_price = pivot_lows[-1]
                         if 5 <= (p2_idx - p1_idx) <= 30 and abs(p1_price - p2_price) / p1_price <= 0.02:
                             neckline = max(highs[p1_idx:p2_idx+1])
                             if curr_close > neckline * 1.01:
-                                signal_type, formasyon_adi = "LONG", "İkili Dip (Double Bottom)"
+                                signal_type, formasyon_adi = "LONG", "İkili Dip"
+                                yapi_yuksekligi = neckline - min(p1_price, p2_price)
 
-                    # OBO
+                    # --- Omuz-Baş-Omuz (OBO) ---
                     if not signal_type and len(pivot_highs) >= 3:
                         p1_idx, p1_price = pivot_highs[-3]
                         p2_idx, p2_price = pivot_highs[-2] 
@@ -68,9 +69,10 @@ def pattern_scanner_loop():
                         if p2_price > p1_price and p2_price > p3_price and abs(p1_price - p3_price) / p1_price <= 0.03:
                             neckline = min(lows[p1_idx:p3_idx+1])
                             if curr_close < neckline * 0.99:
-                                signal_type, formasyon_adi = "SHORT", "Omuz-Baş-Omuz (OBO)"
+                                signal_type, formasyon_adi = "SHORT", "OBO"
+                                yapi_yuksekligi = p2_price - neckline
 
-                    # Ters OBO
+                    # --- Ters Omuz-Baş-Omuz ---
                     if not signal_type and len(pivot_lows) >= 3:
                         p1_idx, p1_price = pivot_lows[-3]
                         p2_idx, p2_price = pivot_lows[-2] 
@@ -78,9 +80,10 @@ def pattern_scanner_loop():
                         if p2_price < p1_price and p2_price < p3_price and abs(p1_price - p3_price) / p1_price <= 0.03:
                             neckline = max(highs[p1_idx:p3_idx+1])
                             if curr_close > neckline * 1.01:
-                                signal_type, formasyon_adi = "LONG", "Ters Omuz-Baş-Omuz"
+                                signal_type, formasyon_adi = "LONG", "Ters OBO"
+                                yapi_yuksekligi = neckline - p2_price
 
-                    # Sinyal Gönderimi
+                    # --- Sinyal Gönderim Kısmı ---
                     if signal_type:
                         cooldown_key = f"FORMASYON_{tf}_{formasyon_adi}_{symbol}"
                         if cooldown_key in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[cooldown_key] < 14400:
@@ -88,7 +91,8 @@ def pattern_scanner_loop():
                             
                         emoji = "🚀" if signal_type == "LONG" else "💀"
                         yon = "YUKARI KIRILIM (LONG)" if signal_type == "LONG" else "AŞAĞI KIRILIM (SHORT)"
-                        yapi_yuksekligi = abs(max(highs[p1_idx:p3_idx]) - neckline) if "OBO" in formasyon_adi else abs(neckline - p1_price)
+                        
+                        # Hedef fiyat hesaplama (Yapı yüksekliğini boyun çizgisine ekle/çıkar)
                         hedef = neckline + yapi_yuksekligi if signal_type == "LONG" else neckline - yapi_yuksekligi
 
                         msg = (f"{emoji} <b>{formasyon_adi.upper()} {yon}: {symbol}</b>\n<i>{tf.upper()} Grafik</i>\n\n"
@@ -101,10 +105,7 @@ def pattern_scanner_loop():
                             son_formasyon_sinyalleri[cooldown_key] = time.time()
                             
                 time.sleep(0.2)
-            time.sleep(1800) 
+            time.sleep(1800) # 30 dakika bekle
         except Exception as e:
             log("FORMASYON", f"Formasyon motoru hatası: {e}")
             time.sleep(60)
-
-# 3. UNUTMA: Bunu ana thread başlatma yerine ekle!
-# threading.Thread(target=pattern_scanner_loop, daemon=True).start()
