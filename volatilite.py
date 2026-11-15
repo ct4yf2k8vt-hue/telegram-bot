@@ -48,9 +48,11 @@ def hafiza_yukle():
                 son_bollinger_sinyalleri.update(data.get("son_bollinger_sinyalleri", {}))
                 son_ichimoku_sinyalleri.update(data.get("son_ichimoku_sinyalleri", {}))
                 son_sma200_sinyalleri.update(data.get("son_sma200_sinyalleri", {}))
-            print("Hafıza başarıyla yüklendi.")
+            log("HAFIZA", "Hafıza başarıyla yüklendi. (Eğer dünkü sinyaller varsa, cooldown süreleri devam ediyor demektir.)")
         except Exception as e:
-            print(f"Hafıza yüklenirken hata: {e}")
+            log("HAFIZA", f"Hafıza yüklenirken hata: {e}")
+    else:
+        log("HAFIZA", "Yeni hafıza dosyası oluşturulacak.")
 
 def hafiza_kaydet():
     try:
@@ -66,7 +68,7 @@ def hafiza_kaydet():
         with open(HAFIZA_DOSYASI, "w") as f:
             json.dump(data, f)
     except Exception as e:
-        print(f"Hafıza kaydedilirken hata: {e}")
+        log("HAFIZA", f"Hafıza kaydedilirken hata: {e}")
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -94,17 +96,8 @@ def gj(url):
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as response: return json.loads(response.read().decode("utf-8"))
-    except: return None
-
-# ZAMAN FİLTRESİ: Mumun kapanış zamanı 15 dakikadan eskiyse eski sinyaldir, atla.
-def taze_mum_mu(klines, tf_saniye):
-    if not klines or len(klines) < 2: return False
-    kapanis_zamani_ms = float(klines[-2][6]) # Son kapanan mumun zamanı
-    su_an_ms = time.time() * 1000
-    # Eğer kapanışın üzerinden 15 dakikadan (900000 ms) fazla geçtiyse veya mum henüz çok yeniyse (bot ilk açıldığında geçmişi taramasın diye)
-    if (su_an_ms - kapanis_zamani_ms) > (15 * 60 * 1000):
-        return False
-    return True
+    except Exception as e:
+        return None
 
 def calculate_ema(prices, period):
     if len(prices) < period: return []
@@ -179,12 +172,17 @@ def midas_flow_loop():
     time.sleep(5)
     while True:
         try:
+            log("RAPOR", "Piyasa verileri çekiliyor...")
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
-            if not isinstance(tickers, list): time.sleep(300); continue
+            if not isinstance(tickers, list): 
+                log("RAPOR", "Binance API'den veri alınamadı, 5 dk sonra tekrar denenecek.")
+                time.sleep(300); continue
+            
             trend_text, avg_chg, ups, downs = get_market_trend(tickers)
             usdt_pairs = [t for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 5_000_000]
             usdt_pairs.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
             top_5 = usdt_pairs[:5]
+            
             if top_5:
                 msg = "🔥 <b>24 Saatteki En İyi Hareketler</b>\n"
                 msg += f"\n🌍 <b>Piyasa Yönü (24s):</b> {trend_text}\n"
@@ -199,9 +197,14 @@ def midas_flow_loop():
                     hashtags += f"#{symbol} "
                 msg += f"\n💡 <b>Açıklama:</b> Son 24 saatin en çok kazandıranları ve genel piyasa yönünü özetler. Piyasadaki genel hakimiyeti (Boğa/Ayı) anlamak için kullanılır."
                 msg += f"\n\n<a href='https://t.me/MidasFlowAI'>{hashtags}#MidasFlow</a>"
-                tg(C, msg)
+                if tg(C, msg):
+                    log("RAPOR", "Midas Flow raporu başarıyla gönderildi.")
+                else:
+                    log("RAPOR", "Midas Flow raporu Telegram'a gönderilemedi!")
             time.sleep(14400)
-        except: time.sleep(60)
+        except Exception as e:
+            log("RAPOR", f"Midas Flow Hatası: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 1: FORMASYON (4 SAATLİK VE GÜNLÜK)
@@ -213,19 +216,16 @@ def formasyon_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("FORMASYON", f"Piyasa taranıyor ({len(tickers)} coin)...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 10_000_000]:
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 86400: continue
                 for tf in ['4h', '1d']:
                     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=100")
                     if not isinstance(klines, list) or len(klines) < 100: continue
-                    
-                    # ZAMAN FİLTRESİ: Sadece yeni kapanan mumlara bak
-                    if not taze_mum_mu(klines, 4*3600): continue
 
                     highs = [float(k[2]) for k in klines[:-1]]
                     lows = [float(k[3]) for k in klines[:-1]]
                     closes = [float(k[4]) for k in klines[:-1]]
-                    
                     curr = closes[-1]
                     son_30_zirve = highs[-30:]
                     son_30_dip = lows[-30:]
@@ -241,7 +241,7 @@ def formasyon_loop():
                                f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
                                f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                                f"💡 <b>Açıklama:</b> Fiyat, {formasyon_adi} formasyonunun boyun çizgisini (Neckline) yukarı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) gerçekleşti. Alıcılar kontrolü ele geçirdi ve yeni bir yükseliş trendi (Higher High) başladı.")
-                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); hafiza_kaydet(); break
+                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("FORMASYON", f"Sinyal: {symbol} (LONG)"); break
                         
                     elif curr < min(closes[-20:-5]):
                         sirali_tepeler = sorted(list(set([round(x, 5) for x in son_30_zirve])), reverse=True)
@@ -254,10 +254,12 @@ def formasyon_loop():
                                f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
                                f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                                f"💡 <b>Açıklama:</b> Fiyat, {formasyon_adi} formasyonunun boyun çizgisini (Neckline) aşağı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) aşağı yönlü gerçekleşti. Satıcılar kontrolü ele geçirdi ve yeni bir düşüş trendi (Lower Low) başladı.")
-                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); hafiza_kaydet(); break
+                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("FORMASYON", f"Sinyal: {symbol} (SHORT)"); break
                 time.sleep(0.1)
             time.sleep(3600)
-        except Exception as e: time.sleep(60)
+        except Exception as e:
+            log("FORMASYON", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 2: MIDAS SETUP (4 SAATLİK)
@@ -269,12 +271,11 @@ def midas_setup_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("MIDAS_SETUP", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 15_000_000]:
                 if symbol in son_midas_setup_sinyalleri and time.time() - son_midas_setup_sinyalleri[symbol] < 14400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=4h&limit=50")
                 if not isinstance(klines, list) or len(klines) < 50: continue
-                
-                if not taze_mum_mu(klines, 4*3600): continue
 
                 highs = [float(k[2]) for k in klines[:-1]]
                 lows = [float(k[3]) for k in klines[:-1]]
@@ -288,16 +289,18 @@ def midas_setup_loop():
                            f"<i>4 Saatlik Hacimli Kırılım</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> 4 saatlik grafikte son 20 periyodun (yaklaşık 3 günün) direnci hacimle aşıldı. Kısa ve orta vadeli traderların dikkatini çeken, hızlı hareket potansiyeli yüksek bir kırılımdır.")
-                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MIDAS_SETUP", f"Sinyal: {symbol} (LONG)")
                 elif curr < min(lows[-20:]) and is_vol:
                     msg = (f"⚡ <b>{symbol} SETUP (SHORT)</b>\n"
                            f"<i>4 Saatlik Hacimli Destek Kırılımı</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> 4 saatlik grafikte son 20 periyodun en düşük desteği hacimle aşağı kırıldı. Satış baskısının arttığını ve hızlı bir düşüşün başlayabileceğini gösterir.")
-                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MIDAS_SETUP", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(7200)
-        except Exception as e: time.sleep(60)
+        except Exception as e:
+            log("MIDAS_SETUP", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 3: PUMP AVCISI (5 DAKİKALIK)
@@ -309,12 +312,11 @@ def pump_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("PUMP", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 5_000_000]:
                 if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 3600: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=5m&limit=3")
                 if not isinstance(klines, list) or len(klines) < 3: continue
-                
-                if not taze_mum_mu(klines, 5*60): continue
 
                 curr_k, prev_k = klines[-2], klines[-3]
                 cc, pc = float(curr_k[4]), float(prev_k[4])
@@ -329,10 +331,12 @@ def pump_loop():
                            f"📊 Hacim Artışı: +%{((cv-pv)/pv)*100:.0f}\n\n"
                            f"{teyit}\n\n"
                            f"💡 <b>Açıklama:</b> 5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Trap Radar (OI ve CVD) sayesinde bu hareketin arkasında gerçek balinaların mı yoksa küçük yatırımcıyı çekmek isteyen sahte botların mı olduğunu analiz ettik. Açık Pozisyon (OI) ve Alıcı baskısı (CVD) verileri bu hareketin niteliğini belirler.")
-                    if tg(C, msg): son_pump_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_pump_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("PUMP", f"Sinyal: {symbol}")
                 time.sleep(0.05)
             time.sleep(60)
-        except Exception as e: time.sleep(60)
+        except Exception as e:
+            log("PUMP", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 4: MACD (GÜNLÜK)
@@ -344,12 +348,11 @@ def macd_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("MACD", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 10_000_000]:
                 if symbol in son_macd_sinyalleri and time.time() - son_macd_sinyalleri[symbol] < 86400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=100")
                 if not isinstance(klines, list) or len(klines) < 80: continue
-                
-                if not taze_mum_mu(klines, 24*3600): continue
 
                 closes = [float(k[4]) for k in klines[:-1]]
                 macd_res = calculate_macd(closes)
@@ -362,16 +365,18 @@ def macd_loop():
                            f"<i>1 Günlük Grafik - MACD Yukarı Kesti</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> MACD indikatörü, Sinyal çizgisini aşağıdan yukarı yönlü kesti (Golden Cross). Momentumun (ivmenin) satıcılardan alıcılara geçtiğini ve trendin yönünün yukarı döndüğünü gösteren klasik ve güvenilir bir alış sinyalidir.")
-                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MACD", f"Sinyal: {symbol} (LONG)")
                 elif pm >= ps and cm < cs:
                     msg = (f"💀 <b>MACD SAT SİNYALİ (SHORT): {symbol}</b>\n"
                            f"<i>1 Günlük Grafik - MACD Aşağı Kesti</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> MACD indikatörü, Sinyal çizgisini yukarıdan aşağı yönlü kesti (Death Cross). Momentumun alıcılardan satıcılara geçtiğini ve düşüş trendinin başladığını gösterir.")
-                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MACD", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
-        except Exception as e: time.sleep(60)
+        except Exception as e:
+            log("MACD", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 5: BOLLINGER (HAFTALIK)
@@ -383,12 +388,11 @@ def bollinger_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("BOLLINGER", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 10_000_000]:
                 if symbol in son_bollinger_sinyalleri and time.time() - son_bollinger_sinyalleri[symbol] < 86400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1w&limit=50")
                 if not isinstance(klines, list) or len(klines) < 30: continue
-                
-                if not taze_mum_mu(klines, 7*24*3600): continue
 
                 closes = [float(k[4]) for k in klines[:-1]]
                 curr = closes[-1]
@@ -400,16 +404,18 @@ def bollinger_loop():
                            f"<i>1 Haftalık Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, sıkışmanın (Squeeze) ardından Bollinger üst bandını yukarı yönlü kırdı. Volatilitenin arttığını ve güçlü bir alım dalgasının piyasaya giriş yaptığını gösterir. Haftalık kırılımlar büyük trendleri işaret eder.")
-                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("BOLLINGER", f"Sinyal: {symbol} (LONG)")
                 elif curr < lower and closes[-2] >= lower:
                     msg = (f"🩸 <b>BOLLINGER ALT BANT KIRILIMI (SHORT): {symbol}</b>\n"
                            f"<i>1 Haftalık Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Bollinger alt bandını aşağı yönlü kırdı. Aşırı satım bölgesine girildiğini veya sert bir düşüş dalgasının (Squeeze) başladığını gösterebilir. Dikkatli olunmalı.")
-                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("BOLLINGER", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
-        except Exception as e: time.sleep(60)
+        except Exception as e:
+            log("BOLLINGER", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 6: ICHIMOKU (HAFTALIK)
@@ -421,12 +427,11 @@ def ichimoku_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("ICHIMOKU", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 10_000_000]:
                 if symbol in son_ichimoku_sinyalleri and time.time() - son_ichimoku_sinyalleri[symbol] < 86400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1w&limit=100")
                 if not isinstance(klines, list) or len(klines) < 52: continue
-                
-                if not taze_mum_mu(klines, 7*24*3600): continue
 
                 highs = [float(k[2]) for k in klines[:-1]]
                 lows = [float(k[3]) for k in klines[:-1]]
@@ -440,16 +445,18 @@ def ichimoku_loop():
                            f"<i>1 Haftalık Grafik - Kumo Breakout</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Japon trend sistemi Ichimoku'nun 'Kumo' (Bulut) direncini yukarı kırdı. Haftalık bulutun üzerine çıkılması, piyasanın makro anlamda 'Boğa' bölgesine girdiğini ve artık bulutun destek görevi göreceğini gösterir.")
-                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("ICHIMOKU", f"Sinyal: {symbol} (LONG)")
                 elif curr < cloud_bottom and prev >= cloud_bottom:
                     msg = (f"☁️ <b>ICHIMOKU BULUTU KIRILIMI (SHORT): {symbol}</b>\n"
                            f"<i>1 Haftalık Grafik - Kumo Breakdown</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Ichimoku Bulutunun altına sarktı. Bu durum piyasanın 'Ayı' bölgesine girdiğini ve bulutun artık devasa bir direnç (tavan) görevi göreceğini gösterir. Makro düşüş trendi başlıyor olabilir.")
-                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("ICHIMOKU", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
-        except Exception as e: time.sleep(60)
+        except Exception as e:
+            log("ICHIMOKU", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # MOTOR 7: SMA200 (3 GÜNLÜK)
@@ -461,12 +468,11 @@ def sma200_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("SMA200", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 15_000_000]:
                 if symbol in son_sma200_sinyalleri and time.time() - son_sma200_sinyalleri[symbol] < 86400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=3d&limit=250")
                 if not isinstance(klines, list) or len(klines) < 205: continue
-                
-                if not taze_mum_mu(klines, 3*24*3600): continue
 
                 closes = [float(k[4]) for k in klines[:-1]]; curr, prev = closes[-1], closes[-2]
                 sma200 = calculate_sma(closes, 200)
@@ -478,16 +484,18 @@ def sma200_loop():
                            f"<i>3 Günlük Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk basit ortalamanın (SMA200) üzerine çıktı. SMA200, kurumsal yatırımcıların ortalama maliyet çizgisidir. Bu çizginin üzerine çıkılması, piyasanın genel olarak 'Al' bölgesine geçtiğini gösterir.")
-                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("SMA200", f"Sinyal: {symbol} (LONG)")
                 elif prev >= p_sma and curr < c_sma and curr < c_sma * 0.995:
                     msg = (f"💀 <b>SMA200 AŞAĞI KIRILIM (SHORT): {symbol}</b>\n"
                            f"<i>3 Günlük Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk ortalamanın (SMA200) altına sarktı. Bu, büyük yatırımcıların bölgeden çıktığını ve piyasanın genel olarak 'Sat' (Ayı) bölgesine geçtiğini gösterir. Düşüş trendi hız kazanabilir.")
-                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); hafiza_kaydet()
+                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("SMA200", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
-        except Exception as e: time.sleep(60)
+        except Exception as e:
+            log("SMA200", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
 # RENDER WEB SUNUCUSU
@@ -513,8 +521,8 @@ if __name__ == "__main__":
     log("SİSTEM", "Bot başlatıldı. Telegram'a onay mesajı gönderiliyor...")
     baslangic_mesaji = (
         "🤖 <b>SİSTEM AKTİF!</b>\n\n"
-        "Bot yeniden başlatıldı. Hafıza (JSON) başarıyla yüklendi.\n"
-        "Artık eski sinyaller tekrar edilmeyecek, sadece <b>taze kırılımlar</b> yakalanacaktır. 🚀\n\n"
+        "Bot yeniden başlatıldı. Hafıza başarıyla yüklendi.\n"
+        "Sinyallerin sürekli gelmemesinin nedeni düzeltildi. Artık motorlar çalışırken loglarda 'Piyasa taranıyor' yazacak ve sadece cooldown süresi dolan yeni sinyalleri gönderecek. 🚀\n\n"
         "Aktif Motorlar:\n"
         "• Midas Flow Rapor (4s)\n"
         "• Formasyon (4s, 1g)\n"
