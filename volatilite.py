@@ -7,6 +7,7 @@ import os
 import threading
 import http.server
 import socketserver
+import statistics
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
@@ -532,6 +533,27 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
+    log("SİSTEM", "Bot başlatıldı. Telegram'a onay mesajı gönderiliyor...")
+    baslangic_mesaji = (
+        "🤖 <b>SİSTEM AKTİF!</b>\n\n"
+        "Bot dünkü çalışan haline geri döndürüldü. 🚀\n"
+        "Hafıza dosyası ve yeni mum filtreleri kaldırıldı. Sadece zaman bazlı cooldown aktif.\n\n"
+        "Aktif Motorlar:\n"
+        "• Midas Flow Rapor (4s)\n"
+        "• Formasyon (4s, 1g)\n"
+        "• Midas Setup (4s)\n"
+        "• Pump Avcısı (5dk)\n"
+        "• MACD (1g)\n"
+        "• Bollinger (1h)\n"
+        "• Ichimoku (1h)\n"
+        "• SMA200 (3g)"
+    )
+    if tg(C, baslangic_mesaji):
+        log("SİSTEM", "✅ Başlangıç mesajı başarıyla Telegram'a gönderildi.")
+    else:
+        log("SİSTEM", "❌ HATA: Telegram'a mesaj gönderilemedi! Lütfen BOT_TOKEN ve CHAT_ID ayarlarını kontrol edin.")
+    
+    # Motorları başlat
     threading.Thread(target=midas_flow_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
     threading.Thread(target=formasyon_loop, daemon=True).start()
@@ -541,4 +563,5 @@ if __name__ == "__main__":
     threading.Thread(target=ichimoku_loop, daemon=True).start()
     threading.Thread(target=sma200_loop, daemon=True).start()
     
+    # Web sunucusunu başlat
     run_web_server()
