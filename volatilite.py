@@ -18,7 +18,10 @@ socket.setdefaulttimeout(15)
 T = os.environ.get("BOT_TOKEN", "").strip()
 C = os.environ.get("CHAT_ID", "1623907197").strip()
 TR_Saati = timezone(timedelta(hours=3))
-BASE = "https://api.binance.com"
+
+# BINANCE ENGELINI ASMAK ICIN PROXY KULLANIYORUZ
+BASE = "https://corsproxy.io/?https://api.binance.com"
+FAPI = "https://corsproxy.io/?https://fapi.binance.com"
 
 RAPOR_ARALIGI = 14400      
 CHARTIST_ARALIGI = 3600    
@@ -97,9 +100,16 @@ def tg(chat_id, message):
 def gj(url):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
+        # Eğer url zaten proxy içermiyorsa başına ekle (güvenlik için)
+        if "corsproxy.io" not in url and "api.telegram.org" not in url:
+            url = f"https://corsproxy.io/?{url}"
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as response: return json.loads(response.read().decode("utf-8"))
-    except: return None
+        with urllib.request.urlopen(req, timeout=15) as response: 
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        # Hata olursa loglara basalım ki neden çalışmadığını görelim
+        # log("API_HATA", f"Veri çekilemedi: {e}")
+        return None
 
 def calculate_ema(prices, period):
     if len(prices) < period: return []
@@ -159,11 +169,11 @@ def get_market_trend(tickers):
 
 def trap_radar_check(symbol):
     try:
-        oi_data = gj(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
+        oi_data = gj(f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
         oi_artiyor = False
         if oi_data and len(oi_data) >= 2:
             if ((float(oi_data[1]['sumOpenInterest']) - float(oi_data[0]['sumOpenInterest'])) / float(oi_data[0]['sumOpenInterest'])) * 100 > 0.2: oi_artiyor = True
-        taker_data = gj(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=1")
+        taker_data = gj(f"{FAPI}/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=1")
         alici_baskin = False
         if taker_data and len(taker_data) > 0:
             total = float(taker_data[0]['buyVol']) + float(taker_data[0]['sellVol'])
@@ -175,8 +185,8 @@ def trap_radar_check(symbol):
 
 def squeeze_radar_check(symbol, timeframe='4h'):
     try:
-        global_data = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={timeframe}&limit=1")
-        top_data = gj(f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol}&period={timeframe}&limit=1")
+        global_data = gj(f"{FAPI}/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={timeframe}&limit=1")
+        top_data = gj(f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period={timeframe}&limit=1")
         if not global_data or not top_data: return ""
         g_long_pct = float(global_data[0]['longAccount']) * 100
         t_long_pct = float(top_data[0]['longAccount']) * 100
@@ -194,7 +204,10 @@ def smart_money_loop():
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
-            if not isinstance(tickers, list): time.sleep(60); continue
+            if not isinstance(tickers, list): 
+                log("SMART_MONEY", "API Hatası (Veri yok), bekleniyor...")
+                time.sleep(60); continue
+            log("SMART_MONEY", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SMART_MONEY]:
                 for tf in ['4h', '1d']:
                     cooldown_key = f"SM_{tf}_{symbol}"
@@ -218,7 +231,9 @@ def smart_money_loop():
                             if tg(C, msg): son_smart_money_sinyalleri[cooldown_key] = time.time()
                 time.sleep(0.1)
             time.sleep(SMART_MONEY_ARALIGI)
-        except Exception as e: time.sleep(60)
+        except Exception as e: 
+            log("SMART_MONEY", f"Hata: {e}")
+            time.sleep(60)
 
 def absorption_loop():
     log("EMILIM", "Başladı.")
@@ -227,6 +242,7 @@ def absorption_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("EMILIM", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_EMILIM]:
                 for tf in ['5m', '15m']:
                     cooldown_key = f"ABS_{tf}_{symbol}"
@@ -257,6 +273,7 @@ def teyitli_hacim_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("HACIM", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_HACIM_PATLAMASI]:
                 for tf in ['4h', '8h', '1d']:
                     cooldown_key = f"VOL_{tf}_{symbol}"
@@ -294,12 +311,13 @@ def squeeze_radar_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("SQUEEZE", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SQUEEZE]:
                 for tf in ['4h', '1d']:
                     cooldown_key = f"SQZ_{tf}_{symbol}"
                     if cooldown_key in son_squeeze_sinyalleri and time.time() - son_squeeze_sinyalleri[cooldown_key] < 43200: continue
-                    global_data = gj(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
-                    top_data = gj(f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
+                    global_data = gj(f"{FAPI}/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
+                    top_data = gj(f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period={tf}&limit=1")
                     if not global_data or not top_data: continue
                     g_long_pct = float(global_data[0]['longAccount']) * 100; t_long_pct = float(top_data[0]['longAccount']) * 100
                     if g_long_pct > 75 and t_long_pct < 50:
@@ -318,7 +336,10 @@ def midas_flow_loop():
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
-            if not isinstance(tickers, list): time.sleep(300); continue
+            if not isinstance(tickers, list): 
+                log("RAPOR", "Veri alınamadı, proxy veya API engeli olabilir.")
+                time.sleep(300); continue
+            log("RAPOR", "Piyasa verileri çekiliyor...")
             trend_text, avg_chg, ups, downs = get_market_trend(tickers)
             usdt_pairs = [t for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 5_000_000]
             usdt_pairs.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
@@ -343,6 +364,7 @@ def chartist_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("CHARTIST", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_CHARTIST]:
                 for tf in ['8h', '12h', '1d', '3d']:
                     cooldown_key = f"CH_{tf}_{symbol}"
@@ -374,6 +396,7 @@ def pump_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("PUMP", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_PUMP]:
                 if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=5m&limit=3")
@@ -396,6 +419,7 @@ def formasyon_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("FORMASYON", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FORMASYON]:
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 86400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=100")
@@ -403,10 +427,10 @@ def formasyon_loop():
                 closes = [float(k[4]) for k in klines]; curr = closes[-1]
                 if curr > max(closes[-20:-5]): 
                     msg = (f"🚀 <b>FORMASYON (LONG): {symbol}</b>\n<i>Ters OBO / İkili Dip</i>\n\n💡 <b>Açıklama:</b> Boyun çizgisi yukarı kırıldı. MSS gerçekleşti.")
-                    if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time()
+                    if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.sleep(86400)
                 elif curr < min(closes[-20:-5]):
                     msg = (f"💀 <b>FORMASYON (SHORT): {symbol}</b>\n<i>OBO / İkili Tepe</i>\n\n💡 <b>Açıklama:</b> Boyun çizgisi aşağı kırıldı. MSS gerçekleşti.")
-                    if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time()
+                    if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.sleep(86400)
                 time.sleep(0.1)
             time.sleep(FORMASYON_ARALIGI)
         except: time.sleep(60)
@@ -418,6 +442,7 @@ def ema_ribbon_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("EMA_RIBBON", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_EMA_RIBBON]:
                 if symbol in son_ema_ribbon_sinyalleri and time.time() - son_ema_ribbon_sinyalleri[symbol] < 86400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=200")
@@ -441,6 +466,7 @@ def macd_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("MACD", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MACD]:
                 if symbol in son_macd_sinyalleri and time.time() - son_macd_sinyalleri[symbol] < 14400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1d&limit=100")
@@ -465,6 +491,7 @@ def midas_setup_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("MIDAS_SETUP", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MIDAS_SETUP]:
                 if symbol in son_midas_setup_sinyalleri and time.time() - son_midas_setup_sinyalleri[symbol] < 14400: continue
                 klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=4h&limit=50")
@@ -489,6 +516,7 @@ def ath_atl_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("YILLIK_ZIRVE_DIP", "Piyasa taranıyor...")
             adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ATH_ATL]
             for symbol in adaylar:
                 if symbol in son_ath_atl_sinyalleri and time.time() - son_ath_atl_sinyalleri[symbol] < 86400: continue
@@ -518,6 +546,7 @@ def digital_chartist_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("DIGITAL_CHARTIST", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_DIGITAL]:
                 if symbol in son_chartist_sinyalleri and time.time() - son_chartist_sinyalleri[symbol] < 86400: continue
                 for tf in ['12h', '1d']:
@@ -550,6 +579,7 @@ def sma200_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("SMA200", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SMA200]:
                 for tf in ['3d', '1w']:
                     cooldown_key = f"SMA200_{tf}_{symbol}"
@@ -577,6 +607,7 @@ def bollinger_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("BOLLINGER", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_BOLLINGER]:
                 for tf in ['1w', '1d']:
                     cooldown_key = f"BOLL_{tf}_{symbol}"
@@ -603,6 +634,7 @@ def ichimoku_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("ICHIMOKU", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ICHIMOKU]:
                 for tf in ['1w', '1d']:
                     cooldown_key = f"ICHI_{tf}_{symbol}"
@@ -630,6 +662,7 @@ def binance_killers_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
+            log("BINANCE_KILLERS", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FVG]:
                 if symbol in son_fvg_sinyalleri and time.time() - son_fvg_sinyalleri[symbol] < 14400: continue
                 for tf in ['4h', '8h']:
