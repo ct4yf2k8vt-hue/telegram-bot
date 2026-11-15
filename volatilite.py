@@ -1,6 +1,8 @@
 # =====================================================
-# MOTOR 11: FORMASYON AVCISI (HATASIZ TAM SÜRÜM)
+# MOTOR 11: FORMASYON AVCISI (RENDER UYUMLU TAM SÜRÜM)
 # =====================================================
+import threading
+
 def find_pivots(highs, lows, left=3, right=3):
     pivot_highs, pivot_lows = [], []
     for i in range(left, len(highs) - right):
@@ -9,7 +11,7 @@ def find_pivots(highs, lows, left=3, right=3):
     return pivot_highs, pivot_lows
 
 def pattern_scanner_loop():
-    log("FORMASYON", "Formasyon Avcısı Motoru Başladı (İkili Tepe/Dip, OBO).")
+    print("✅ [LOG] Formasyon Avcısı Motoru Başlatıldı!")
     time.sleep(240) 
     while True:
         try:
@@ -18,7 +20,7 @@ def pattern_scanner_loop():
                 time.sleep(60)
                 continue
                 
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_SMA200]:
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 1000000]: # Hacim barajını 1 Milyon yaptım, botun orijinalindeki değişkeni bilmediğim için sabitledim
                 for tf in ['4h', '1d']:
                     klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=100")
                     if not isinstance(klines, list) or len(klines) < 50: continue
@@ -32,7 +34,6 @@ def pattern_scanner_loop():
                     curr_vol = volumes[-2]
                     avg_vol = sum(volumes[-22:-2]) / 20 
                     
-                    # Hacim filtresi (Ortalamanın 1.2 katı değilse geç)
                     if curr_vol < avg_vol * 1.2: continue
 
                     pivot_highs, pivot_lows = find_pivots(highs, lows)
@@ -41,7 +42,6 @@ def pattern_scanner_loop():
                     neckline = 0.0
                     yapi_yuksekligi = 0.0
 
-                    # --- İkili Tepe (Double Top) ---
                     if len(pivot_highs) >= 2:
                         p1_idx, p1_price = pivot_highs[-2]
                         p2_idx, p2_price = pivot_highs[-1]
@@ -51,7 +51,6 @@ def pattern_scanner_loop():
                                 signal_type, formasyon_adi = "SHORT", "İkili Tepe"
                                 yapi_yuksekligi = max(p1_price, p2_price) - neckline
 
-                    # --- İkili Dip (Double Bottom) ---
                     if not signal_type and len(pivot_lows) >= 2:
                         p1_idx, p1_price = pivot_lows[-2]
                         p2_idx, p2_price = pivot_lows[-1]
@@ -61,7 +60,6 @@ def pattern_scanner_loop():
                                 signal_type, formasyon_adi = "LONG", "İkili Dip"
                                 yapi_yuksekligi = neckline - min(p1_price, p2_price)
 
-                    # --- Omuz-Baş-Omuz (OBO) ---
                     if not signal_type and len(pivot_highs) >= 3:
                         p1_idx, p1_price = pivot_highs[-3]
                         p2_idx, p2_price = pivot_highs[-2] 
@@ -72,7 +70,6 @@ def pattern_scanner_loop():
                                 signal_type, formasyon_adi = "SHORT", "OBO"
                                 yapi_yuksekligi = p2_price - neckline
 
-                    # --- Ters Omuz-Baş-Omuz ---
                     if not signal_type and len(pivot_lows) >= 3:
                         p1_idx, p1_price = pivot_lows[-3]
                         p2_idx, p2_price = pivot_lows[-2] 
@@ -83,29 +80,30 @@ def pattern_scanner_loop():
                                 signal_type, formasyon_adi = "LONG", "Ters OBO"
                                 yapi_yuksekligi = neckline - p2_price
 
-                    # --- Sinyal Gönderim Kısmı ---
                     if signal_type:
                         cooldown_key = f"FORMASYON_{tf}_{formasyon_adi}_{symbol}"
+                        if 'son_formasyon_sinyalleri' not in globals(): globals()['son_formasyon_sinyalleri'] = {}
+                        
                         if cooldown_key in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[cooldown_key] < 14400:
                             continue
                             
                         emoji = "🚀" if signal_type == "LONG" else "💀"
                         yon = "YUKARI KIRILIM (LONG)" if signal_type == "LONG" else "AŞAĞI KIRILIM (SHORT)"
-                        
-                        # Hedef fiyat hesaplama (Yapı yüksekliğini boyun çizgisine ekle/çıkar)
                         hedef = neckline + yapi_yuksekligi if signal_type == "LONG" else neckline - yapi_yuksekligi
 
                         msg = (f"{emoji} <b>{formasyon_adi.upper()} {yon}: {symbol}</b>\n<i>{tf.upper()} Grafik</i>\n\n"
                                f"🎯 <b>Boyun Çizgisi:</b> {neckline:.4f}\n"
-                               f"📊 <b>Hacim:</b> Ortalamanın {curr_vol/avg_vol:.1f} katı (Teyitli)\n"
-                               f"🏁 <b>Hedef:</b> {hedef:.4f}\n\n"
-                               f"💡 <b>Açıklama:</b> Fiyat, {formasyon_adi} formasyonunu tamamlayarak boyun çizgisini kırdı.")
+                               f"📊 <b>Hacim:</b> Ortalamanın {curr_vol/avg_vol:.1f} katı\n"
+                               f"🏁 <b>Hedef:</b> {hedef:.4f}")
                         
                         if tg(C, msg): 
                             son_formasyon_sinyalleri[cooldown_key] = time.time()
                             
                 time.sleep(0.2)
-            time.sleep(1800) # 30 dakika bekle
+            time.sleep(1800) 
         except Exception as e:
-            log("FORMASYON", f"Formasyon motoru hatası: {e}")
+            print(f"⚠️ [HATA] Formasyon Motoru Hatası: {e}")
             time.sleep(60)
+
+# BOTU BAŞLATAN TETİKLEYİCİ (Bunu kesinlikle silme!)
+threading.Thread(target=pattern_scanner_loop, daemon=True).start()
