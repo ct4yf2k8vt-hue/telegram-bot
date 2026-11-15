@@ -18,11 +18,11 @@ socket.setdefaulttimeout(15)
 T = os.environ.get("BOT_TOKEN", "").strip()
 C = os.environ.get("CHAT_ID", "1623907197").strip()
 TR_Saati = timezone(timedelta(hours=3))
-BASE = "https://api.binance.com"
 
-HAFIZA_DOSYASI = "hafiza.json"
+# BINANCE API ENGELINI AŞMAK İÇİN YENİ ADRES
+BASE = "https://data-api.binance.vision" 
 
-# SİNYAL HAFIZALARI (Spam Engelleme)
+# SİNYAL HAFIZALARI (Spam Engelleme - Sadece zaman bazlı)
 son_formasyon_sinyalleri = {}
 son_midas_setup_sinyalleri = {}
 son_pump_sinyalleri = {}
@@ -30,45 +30,6 @@ son_macd_sinyalleri = {}
 son_bollinger_sinyalleri = {}
 son_ichimoku_sinyalleri = {}
 son_sma200_sinyalleri = {}
-
-# =====================================================
-# HAFIZA FONKSİYONLARI (JSON KAYIT)
-# =====================================================
-def hafiza_yukle():
-    global son_formasyon_sinyalleri, son_midas_setup_sinyalleri, son_pump_sinyalleri
-    global son_macd_sinyalleri, son_bollinger_sinyalleri, son_ichimoku_sinyalleri, son_sma200_sinyalleri
-    if os.path.exists(HAFIZA_DOSYASI):
-        try:
-            with open(HAFIZA_DOSYASI, "r") as f:
-                data = json.load(f)
-                son_formasyon_sinyalleri.update(data.get("son_formasyon_sinyalleri", {}))
-                son_midas_setup_sinyalleri.update(data.get("son_midas_setup_sinyalleri", {}))
-                son_pump_sinyalleri.update(data.get("son_pump_sinyalleri", {}))
-                son_macd_sinyalleri.update(data.get("son_macd_sinyalleri", {}))
-                son_bollinger_sinyalleri.update(data.get("son_bollinger_sinyalleri", {}))
-                son_ichimoku_sinyalleri.update(data.get("son_ichimoku_sinyalleri", {}))
-                son_sma200_sinyalleri.update(data.get("son_sma200_sinyalleri", {}))
-            log("HAFIZA", "Hafıza başarıyla yüklendi. (Eğer dünkü sinyaller varsa, cooldown süreleri devam ediyor demektir.)")
-        except Exception as e:
-            log("HAFIZA", f"Hafıza yüklenirken hata: {e}")
-    else:
-        log("HAFIZA", "Yeni hafıza dosyası oluşturulacak.")
-
-def hafiza_kaydet():
-    try:
-        data = {
-            "son_formasyon_sinyalleri": son_formasyon_sinyalleri,
-            "son_midas_setup_sinyalleri": son_midas_setup_sinyalleri,
-            "son_pump_sinyalleri": son_pump_sinyalleri,
-            "son_macd_sinyalleri": son_macd_sinyalleri,
-            "son_bollinger_sinyalleri": son_bollinger_sinyalleri,
-            "son_ichimoku_sinyalleri": son_ichimoku_sinyalleri,
-            "son_sma200_sinyalleri": son_sma200_sinyalleri
-        }
-        with open(HAFIZA_DOSYASI, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        log("HAFIZA", f"Hafıza kaydedilirken hata: {e}")
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -216,7 +177,7 @@ def formasyon_loop():
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            log("FORMASYON", f"Piyasa taranıyor ({len(tickers)} coin)...")
+            log("FORMASYON", "Piyasa taranıyor...")
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= 10_000_000]:
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 86400: continue
                 for tf in ['4h', '1d']:
@@ -241,7 +202,7 @@ def formasyon_loop():
                                f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
                                f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                                f"💡 <b>Açıklama:</b> Fiyat, {formasyon_adi} formasyonunun boyun çizgisini (Neckline) yukarı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) gerçekleşti. Alıcılar kontrolü ele geçirdi ve yeni bir yükseliş trendi (Higher High) başladı.")
-                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("FORMASYON", f"Sinyal: {symbol} (LONG)"); break
+                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); log("FORMASYON", f"Sinyal: {symbol} (LONG)"); break
                         
                     elif curr < min(closes[-20:-5]):
                         sirali_tepeler = sorted(list(set([round(x, 5) for x in son_30_zirve])), reverse=True)
@@ -254,7 +215,7 @@ def formasyon_loop():
                                f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
                                f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                                f"💡 <b>Açıklama:</b> Fiyat, {formasyon_adi} formasyonunun boyun çizgisini (Neckline) aşağı yönlü kırdı. Piyasa Yapısı Değişimi (MSS) aşağı yönlü gerçekleşti. Satıcılar kontrolü ele geçirdi ve yeni bir düşüş trendi (Lower Low) başladı.")
-                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("FORMASYON", f"Sinyal: {symbol} (SHORT)"); break
+                        if tg(C, msg): son_formasyon_sinyalleri[symbol] = time.time(); log("FORMASYON", f"Sinyal: {symbol} (SHORT)"); break
                 time.sleep(0.1)
             time.sleep(3600)
         except Exception as e:
@@ -289,13 +250,13 @@ def midas_setup_loop():
                            f"<i>4 Saatlik Hacimli Kırılım</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> 4 saatlik grafikte son 20 periyodun (yaklaşık 3 günün) direnci hacimle aşıldı. Kısa ve orta vadeli traderların dikkatini çeken, hızlı hareket potansiyeli yüksek bir kırılımdır.")
-                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MIDAS_SETUP", f"Sinyal: {symbol} (LONG)")
+                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); log("MIDAS_SETUP", f"Sinyal: {symbol} (LONG)")
                 elif curr < min(lows[-20:]) and is_vol:
                     msg = (f"⚡ <b>{symbol} SETUP (SHORT)</b>\n"
                            f"<i>4 Saatlik Hacimli Destek Kırılımı</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> 4 saatlik grafikte son 20 periyodun en düşük desteği hacimle aşağı kırıldı. Satış baskısının arttığını ve hızlı bir düşüşün başlayabileceğini gösterir.")
-                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MIDAS_SETUP", f"Sinyal: {symbol} (SHORT)")
+                    if tg(C, msg): son_midas_setup_sinyalleri[symbol] = time.time(); log("MIDAS_SETUP", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(7200)
         except Exception as e:
@@ -331,7 +292,7 @@ def pump_loop():
                            f"📊 Hacim Artışı: +%{((cv-pv)/pv)*100:.0f}\n\n"
                            f"{teyit}\n\n"
                            f"💡 <b>Açıklama:</b> 5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Trap Radar (OI ve CVD) sayesinde bu hareketin arkasında gerçek balinaların mı yoksa küçük yatırımcıyı çekmek isteyen sahte botların mı olduğunu analiz ettik. Açık Pozisyon (OI) ve Alıcı baskısı (CVD) verileri bu hareketin niteliğini belirler.")
-                    if tg(C, msg): son_pump_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("PUMP", f"Sinyal: {symbol}")
+                    if tg(C, msg): son_pump_sinyalleri[symbol] = time.time(); log("PUMP", f"Sinyal: {symbol}")
                 time.sleep(0.05)
             time.sleep(60)
         except Exception as e:
@@ -365,13 +326,13 @@ def macd_loop():
                            f"<i>1 Günlük Grafik - MACD Yukarı Kesti</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> MACD indikatörü, Sinyal çizgisini aşağıdan yukarı yönlü kesti (Golden Cross). Momentumun (ivmenin) satıcılardan alıcılara geçtiğini ve trendin yönünün yukarı döndüğünü gösteren klasik ve güvenilir bir alış sinyalidir.")
-                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MACD", f"Sinyal: {symbol} (LONG)")
+                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); log("MACD", f"Sinyal: {symbol} (LONG)")
                 elif pm >= ps and cm < cs:
                     msg = (f"💀 <b>MACD SAT SİNYALİ (SHORT): {symbol}</b>\n"
                            f"<i>1 Günlük Grafik - MACD Aşağı Kesti</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> MACD indikatörü, Sinyal çizgisini yukarıdan aşağı yönlü kesti (Death Cross). Momentumun alıcılardan satıcılara geçtiğini ve düşüş trendinin başladığını gösterir.")
-                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("MACD", f"Sinyal: {symbol} (SHORT)")
+                    if tg(C, msg): son_macd_sinyalleri[symbol] = time.time(); log("MACD", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
         except Exception as e:
@@ -404,13 +365,13 @@ def bollinger_loop():
                            f"<i>1 Haftalık Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, sıkışmanın (Squeeze) ardından Bollinger üst bandını yukarı yönlü kırdı. Volatilitenin arttığını ve güçlü bir alım dalgasının piyasaya giriş yaptığını gösterir. Haftalık kırılımlar büyük trendleri işaret eder.")
-                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("BOLLINGER", f"Sinyal: {symbol} (LONG)")
+                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); log("BOLLINGER", f"Sinyal: {symbol} (LONG)")
                 elif curr < lower and closes[-2] >= lower:
                     msg = (f"🩸 <b>BOLLINGER ALT BANT KIRILIMI (SHORT): {symbol}</b>\n"
                            f"<i>1 Haftalık Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Bollinger alt bandını aşağı yönlü kırdı. Aşırı satım bölgesine girildiğini veya sert bir düşüş dalgasının (Squeeze) başladığını gösterebilir. Dikkatli olunmalı.")
-                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("BOLLINGER", f"Sinyal: {symbol} (SHORT)")
+                    if tg(C, msg): son_bollinger_sinyalleri[symbol] = time.time(); log("BOLLINGER", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
         except Exception as e:
@@ -445,13 +406,13 @@ def ichimoku_loop():
                            f"<i>1 Haftalık Grafik - Kumo Breakout</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Japon trend sistemi Ichimoku'nun 'Kumo' (Bulut) direncini yukarı kırdı. Haftalık bulutun üzerine çıkılması, piyasanın makro anlamda 'Boğa' bölgesine girdiğini ve artık bulutun destek görevi göreceğini gösterir.")
-                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("ICHIMOKU", f"Sinyal: {symbol} (LONG)")
+                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); log("ICHIMOKU", f"Sinyal: {symbol} (LONG)")
                 elif curr < cloud_bottom and prev >= cloud_bottom:
                     msg = (f"☁️ <b>ICHIMOKU BULUTU KIRILIMI (SHORT): {symbol}</b>\n"
                            f"<i>1 Haftalık Grafik - Kumo Breakdown</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, Ichimoku Bulutunun altına sarktı. Bu durum piyasanın 'Ayı' bölgesine girdiğini ve bulutun artık devasa bir direnç (tavan) görevi göreceğini gösterir. Makro düşüş trendi başlıyor olabilir.")
-                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("ICHIMOKU", f"Sinyal: {symbol} (SHORT)")
+                    if tg(C, msg): son_ichimoku_sinyalleri[symbol] = time.time(); log("ICHIMOKU", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
         except Exception as e:
@@ -484,13 +445,13 @@ def sma200_loop():
                            f"<i>3 Günlük Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk basit ortalamanın (SMA200) üzerine çıktı. SMA200, kurumsal yatırımcıların ortalama maliyet çizgisidir. Bu çizginin üzerine çıkılması, piyasanın genel olarak 'Al' bölgesine geçtiğini gösterir.")
-                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("SMA200", f"Sinyal: {symbol} (LONG)")
+                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); log("SMA200", f"Sinyal: {symbol} (LONG)")
                 elif prev >= p_sma and curr < c_sma and curr < c_sma * 0.995:
                     msg = (f"💀 <b>SMA200 AŞAĞI KIRILIM (SHORT): {symbol}</b>\n"
                            f"<i>3 Günlük Grafik</i>\n\n"
                            f"💰 <b>Giriş Fiyatı:</b> {akilli_fiyat(curr)}\n\n"
                            f"💡 <b>Açıklama:</b> Fiyat, 200 periyotluk ortalamanın (SMA200) altına sarktı. Bu, büyük yatırımcıların bölgeden çıktığını ve piyasanın genel olarak 'Sat' (Ayı) bölgesine geçtiğini gösterir. Düşüş trendi hız kazanabilir.")
-                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); hafiza_kaydet(); log("SMA200", f"Sinyal: {symbol} (SHORT)")
+                    if tg(C, msg): son_sma200_sinyalleri[symbol] = time.time(); log("SMA200", f"Sinyal: {symbol} (SHORT)")
                 time.sleep(0.1)
             time.sleep(3600)
         except Exception as e:
@@ -517,21 +478,12 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
-    hafiza_yukle()
     log("SİSTEM", "Bot başlatıldı. Telegram'a onay mesajı gönderiliyor...")
     baslangic_mesaji = (
         "🤖 <b>SİSTEM AKTİF!</b>\n\n"
-        "Bot yeniden başlatıldı. Hafıza başarıyla yüklendi.\n"
-        "Sinyallerin sürekli gelmemesinin nedeni düzeltildi. Artık motorlar çalışırken loglarda 'Piyasa taranıyor' yazacak ve sadece cooldown süresi dolan yeni sinyalleri gönderecek. 🚀\n\n"
-        "Aktif Motorlar:\n"
-        "• Midas Flow Rapor (4s)\n"
-        "• Formasyon (4s, 1g)\n"
-        "• Midas Setup (4s)\n"
-        "• Pump Avcısı (5dk)\n"
-        "• MACD (1g)\n"
-        "• Bollinger (1h)\n"
-        "• Ichimoku (1h)\n"
-        "• SMA200 (3g)"
+        "Bot yeniden başlatıldı. Binance API engeli aşıldı (data-api.binance.vision kullanılıyor). 🚀\n"
+        "Gereksiz filtreler kaldırıldı, sadece zaman bazlı cooldown aktif.\n\n"
+        "Motorlar çalışırken loglarda 'Piyasa taranıyor' yazacak."
     )
     if tg(C, baslangic_mesaji):
         log("SİSTEM", "✅ Başlangıç mesajı başarıyla Telegram'a gönderildi.")
