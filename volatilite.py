@@ -105,7 +105,9 @@ def tg(chat_id, message):
             "disable_web_page_preview": "true"
         }).encode("utf-8")
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{T}/sendMessage", data=data
+            f"https://api.telegram.org/bot{T}/sendMessage",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
         )
         with urllib.request.urlopen(req, timeout=15) as response:
             return json.loads(response.read().decode("utf-8")).get("ok", False)
@@ -256,25 +258,43 @@ def top_gainers_loop():
                 time.sleep(300)
                 continue
 
+            # YalnÄ±zca gerÃ§ekten yÃ¼kseliÅte olan pariteler listelenir.
             temiz = [
                 t for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) > 5_000_000
+                if uygun_symbol(t)
+                and float(t.get("quoteVolume", 0)) > 5_000_000
+                and float(t.get("priceChangePercent", 0)) > 0
             ]
             temiz.sort(key=lambda x: float(x["priceChangePercent"]), reverse=True)
             top_5 = temiz[:5]
 
             if top_5:
-                msg = "ð¥ <b>GÃ¼nÃ¼n En Ä°yi Hareketleri (24 Saat)</b>\n"
-                msg += "<i>Maksimum yÃ¼kseliÅ yÃ¶nÃ¼, hacim teyitli</i>\n\n"
-                medals = ["ð¥", "ð¥", "ð¥", "ð", "â­ï¸"]
+                msg = (
+                    "ð¥ <b>GÃNÃN EN Ä°YÄ° HAREKETLERÄ°</b>\n"
+                    "ð <b>Son 24 Saat â En Ãok YÃ¼kselen Coinler</b>\n"
+                    "ââââââââââââââââââ\n\n"
+                    "ð <i>24 saatlik fiyat deÄiÅimine gÃ¶re sÄ±ralanmÄ±ÅtÄ±r.</i>\n\n"
+                )
+                medals = ["ð¥", "ð¥", "ð¥", "ð", "â­"]
                 for i, t in enumerate(top_5):
                     symbol = t["symbol"].replace("USDT", "")
                     change = float(t["priceChangePercent"])
                     price = float(t["lastPrice"])
-                    change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
-                    msg += f"{medals[i]} <b>{symbol}</b> {change_str} | Fiyat: {akilli_fiyat(price)}\n"
-                msg += "\nð <i>En Ã§ok kazandÄ±ran coinler listelendi.</i>"
+                    hacim = float(t.get("quoteVolume", 0))
+                    msg += (
+                        f"{medals[i]} <b>{symbol}</b> â <b>+{change:.2f}%</b>\n"
+                        f"   ð° Fiyat: <code>{akilli_fiyat(price)}</code>\n"
+                        f"   ð§ 24s Hacim: <b>{hacim / 1_000_000:.2f}M USDT</b>\n\n"
+                    )
+                msg += (
+                    "ââââââââââââââââââ\n"
+                    f"ð GÃ¼ncelleme: {simdi().strftime('%d.%m.%Y %H:%M')} (TSÄ°)\n\n"
+                    "â¹ï¸ <i>Liste, 5 milyon USDT Ã¼zeri 24 saatlik hacme sahip ve yÃ¼kseliÅte olan coinlerden oluÅturulur.</i>\n"
+                    "â ï¸ <i>GeÃ§miÅ performans gelecekteki yÃ¼kseliÅi garanti etmez. Bu mesaj yatÄ±rÄ±m tavsiyesi deÄildir.</i>"
+                )
                 tg(C, msg)
+            else:
+                log("TOP_GAINERS", "Filtrelere uyan yÃ¼kseliÅte coin bulunamadÄ±.")
 
             time.sleep(TOP_GAINERS_ARALIGI)
         except Exception as e:
@@ -445,7 +465,7 @@ def pump_loop():
                         f"ð <b>Pump - {symbol}</b>\n"
                         f"ð° <b>Fiyat:</b> {akilli_fiyat(cc)} (<b>{price_change:+.2f}%</b>)\n"
                         f"ð <b>Hacim ArtÄ±ÅÄ±:</b> {vol_change:+.0f}%\n"
-                        f"Volume increased by {vol_diff:.0f} â¬ï¸\n\n"
+                        f"ð <b>Hacim FarkÄ±:</b> {vol_diff:,.0f} USDT â¬ï¸\n\n"
                         f"{trap_radar}\n\n"
                         f"ð¡ <b>AÃ§Ä±klama:</b> 5 dakikalÄ±k grafikte hacim ve fiyat artÄ±ÅÄ± tespit edildi."
                     )
