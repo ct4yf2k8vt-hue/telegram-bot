@@ -26,6 +26,7 @@ FAPI = "https://fapi.binance.com"
 # MOTOR ÇALIŞMA SÜRELERİ
 CHARTIST_ARALIGI = 3600    # 1 Saat
 PUMP_ARALIGI = 60          # 1 Dakika
+VOLATILITE_ARALIGI = 60    # 1 Dakika (Yeni Eklendi)
 FORMASYON_ARALIGI = 3600   # 1 Saat
 EMA_RIBBON_ARALIGI = 3600  # 1 Saat
 MACD_ARALIGI = 3600        # 1 Saat
@@ -40,6 +41,7 @@ PUMP_WINNER_ARALIGI = 21600  # 6 Saat (Görsel 2)
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_PUMP = 5_000_000     
+MIN_HACIM_VOLATILITE = 10_000_000 # Yeni Eklendi
 MIN_HACIM_FORMASYON = 15_000_000 
 MIN_HACIM_EMA_RIBBON = 10_000_000 
 MIN_HACIM_MACD = 10_000_000 
@@ -58,6 +60,7 @@ YASAKLI_HISSELER = [
 # Sinyal Hafızaları
 son_sinyaller = {}
 son_pump_sinyalleri = {}
+son_volatilite_sinyalleri = {} # Yeni Eklendi
 son_formasyon_sinyalleri = {}
 son_ema_ribbon_sinyalleri = {}
 son_macd_sinyalleri = {}
@@ -284,7 +287,7 @@ def chartist_loop():
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 4: PUMP AVCISI
+# MOTOR 4: PUMP AVCISI (Anlık Yukarı Hareket)
 # =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı.")
@@ -319,7 +322,70 @@ def pump_loop():
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 5: FORMASYON (MSS) - FİLTRELİ
+# MOTOR 5: ANORMAL VOLATİLİTE VE DUMP AVCISI (YENİ EKLENDİ)
+# =====================================================
+def volatilite_loop():
+    log("VOLATILITE", "Anormal Volatilite ve Dump Avcısı Başladı (15m).")
+    time.sleep(55)
+    while True:
+        try:
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and float(t.get('quoteVolume', 0)) >= MIN_HACIM_VOLATILITE]:
+                if symbol in son_volatilite_sinyalleri and time.time() - son_volatilite_sinyalleri[symbol] < 1800: continue # 30 dk cooldown
+                
+                # 15 dakikalık grafikte son 25 mumu al
+                klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=25")
+                if not isinstance(klines, list) or len(klines) < 25: continue
+                
+                opens = [float(k[1]) for k in klines]
+                highs = [float(k[2]) for k in klines]
+                lows = [float(k[3]) for k in klines]
+                closes = [float(k[4]) for k in klines]
+                vols = [float(k[7]) for k in klines]
+                
+                # Son KAPANMIŞ mumu incele (fake fitilleri önlemek için)
+                curr_open = opens[-2]
+                curr_close = closes[-2]
+                curr_vol = vols[-2]
+                
+                # Son 20 mumun ortalama hacmi
+                avg_vol = sum(vols[-22:-2]) / 20 if len(vols) >= 22 else 1
+                
+                if curr_open == 0 or avg_vol == 0: continue
+                
+                price_change_pct = ((curr_close - curr_open) / curr_open) * 100
+                vol_multiplier = curr_vol / avg_vol
+                
+                # ANORMAL VOLATİLİTE ŞARTLARI:
+                # 1. Fiyat 15 dakikada en az %2.5 hareket etmiş olmalı
+                # 2. Hacim, son 20 mumun ortalamasının en az 3 katı olmalı
+                if abs(price_change_pct) >= 2.5 and vol_multiplier >= 3.0:
+                    
+                    yon = "DUMP (ANI DÜŞÜŞ) 🔻" if price_change_pct < 0 else "PUMP (ANI YÜKSELİŞ) 🚀"
+                    emoji = "🚨" if price_change_pct < 0 else "⚡"
+                    
+                    msg = (f"{emoji} <b>ANORMAL VOLATİLİTE UYARISI</b> {emoji}\n"
+                           f"<b>Coin:</b> {symbol} (15m Grafik)\n\n"
+                           f"📉 <b>Hareket:</b> {yon}\n"
+                           f"📊 <b>Değişim:</b> <b>{price_change_pct:+.2f}%</b>\n"
+                           f"📈 <b>Hacim Patlaması:</b> Ortalamanın <b>{vol_multiplier:.1f}x</b> katı\n"
+                           f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(curr_close)}\n\n"
+                           f"⚠️ <i>Piyasada ani bir likidite değişimi veya büyük bir emir gerçekleşmiş olabilir. Dikkatli olun!</i>")
+                    
+                    if tg(C, msg):
+                        son_volatilite_sinyalleri[symbol] = time.time()
+                        log("VOLATILITE", f"🔥 SİNYAL: {symbol} ({yon})")
+                        
+                time.sleep(0.1)
+            time.sleep(VOLATILITE_ARALIGI)
+        except Exception as e:
+            log("VOLATILITE", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# MOTOR 6: FORMASYON (MSS) - FİLTRELİ
 # =====================================================
 def formasyon_loop():
     log("FORMASYON", "Teyitli Formasyon ve Likidite Avcısı Başladı.")
@@ -404,9 +470,7 @@ def formasyon_loop():
                         hedef = current_price - (last_20_high - last_20_low); stop = last_20_high * 1.02
                         aciklama = "Fiyat dar bir bantta sıkıştı ve hacimle aşağı kırıldı. Volatilite patlaması başlıyor."
 
-                # =====================================================
                 # MANTIK FİLTRELERİ
-                # =====================================================
                 if sinyal:
                     hedef_pct = ((hedef - current_price) / current_price) * 100
                     stop_pct = ((stop - current_price) / current_price) * 100
@@ -415,7 +479,6 @@ def formasyon_loop():
                     if yon == "LONG" and hedef <= current_price: continue
                     if abs(stop_pct) > 10.0: continue 
                     if abs(hedef_pct) < 1.0 or abs(hedef_pct) > 20.0: continue
-                # =====================================================
 
                     msg = (f"{emoji} <b>TEYİTLİ DÖNÜŞ ({yon}): {symbol}</b>\n"
                            f"<i>5m Formasyon - 15m Trend Teyitli</i>\n\n"
@@ -437,7 +500,7 @@ def formasyon_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 6: EMA RIBBON
+# MOTOR 7: EMA RIBBON
 # =====================================================
 def ema_ribbon_loop():
     log("EMA_RIBBON", "EMA Dizilim Motoru Başladı.")
@@ -476,7 +539,7 @@ def ema_ribbon_loop():
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 7: MACD
+# MOTOR 8: MACD
 # =====================================================
 def macd_loop():
     log("MACD", "MACD Motoru Başladı.")
@@ -515,7 +578,7 @@ def macd_loop():
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 8: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
+# MOTOR 9: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
 # =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Kırılım Motoru Başladı.")
@@ -579,7 +642,7 @@ def ath_atl_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 9: ICHIMOKU BULUTU
+# MOTOR 10: ICHIMOKU BULUTU
 # =====================================================
 def ichimoku_loop():
     log("ICHIMOKU", "Zırhlı Ichimoku Bulut Motoru Başladı.")
@@ -674,7 +737,7 @@ def ichimoku_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 10: GRAFİK FORMASYONLARI (CHART PATTERNS) - FİLTRELİ
+# MOTOR 11: GRAFİK FORMASYONLARI (CHART PATTERNS) - FİLTRELİ
 # =====================================================
 def chart_patterns_loop():
     log("PATTERN", "Grafik Formasyon Avcısı Başladı (İkili Tepe/Dip, OBO).")
@@ -750,9 +813,7 @@ def chart_patterns_loop():
                                 stop = p3_price * 0.98
                                 hedef = neckline + (neckline - p2_price)
 
-                    # =====================================================
-                    # MANTIK FİLTRELERİ (GÜNCEL)
-                    # =====================================================
+                    # MANTIK FİLTRELERİ
                     if sinyal:
                         hedef_pct = ((hedef - curr_close) / curr_close) * 100
                         stop_pct = ((stop - curr_close) / curr_close) * 100
@@ -763,7 +824,6 @@ def chart_patterns_loop():
                         if abs(hedef_pct) < 1.5 or abs(hedef_pct) > 40.0: continue
                         if yon == "SHORT" and curr_close < hedef * 1.01: continue
                         if yon == "LONG" and curr_close > hedef * 0.99: continue
-                    # =====================================================
 
                         aciklama = "Fiyat, klasik bir dönüş formasyonunu tamamlayarak boyun çizgisini (Neckline) hacimle kırdı."
                         if "OBO" in formasyon_adi: aciklama = "Trendin tepe noktasında oluşan klasik dönüş formasyonu. Boyun çizgisi kırıldı, satıcılar kontrolü ele aldı."
@@ -815,6 +875,7 @@ if __name__ == "__main__":
     # Sinyal Botları
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
+    threading.Thread(target=volatilite_loop, daemon=True).start() # YENİ VOLATİLİTE MOTORU
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=ema_ribbon_loop, daemon=True).start()
     threading.Thread(target=macd_loop, daemon=True).start()
