@@ -33,7 +33,7 @@ MACD_ARALIGI = 3600        # 1 Saat
 ATH_ATL_ARALIGI = 3600     # 1 Saat
 ICHIMOKU_ARALIGI = 3600    # 1 Saat
 CHART_PATTERN_ARALIGI = 1800 # 30 Dakika
-SHORT_GAINERS_ARALIGI = 300  # 5 Dakika (Yeni Motor)
+SHORT_GAINERS_ARALIGI = 300  # 5 Dakika
 
 # RAPOR MOTORLARI SÜRELERİ
 TOP_GAINERS_ARALIGI = 14400  # 4 Saat
@@ -68,7 +68,7 @@ son_macd_sinyalleri = {}
 son_ath_atl_sinyalleri = {}
 son_ichimoku_sinyalleri = {}
 son_chart_pattern_sinyalleri = {}
-son_short_gainers_sinyalleri = {} # YENİ
+son_short_gainers_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -730,10 +730,10 @@ def ichimoku_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 11: GRAFİK FORMASYONLARI (CHART PATTERNS) - FİLTRELİ
+# MOTOR 11: GRAFİK FORMASYONLARI (CHART PATTERNS + FINCAN & KULP)
 # =====================================================
 def chart_patterns_loop():
-    log("PATTERN", "Grafik Formasyon Avcısı Başladı (İkili Tepe/Dip, OBO).")
+    log("PATTERN", "Formasyon Avcısı Başladı (İkili Tepe/Dip, OBO, Fincan & Kulp).")
     time.sleep(150)
     while True:
         try:
@@ -745,7 +745,8 @@ def chart_patterns_loop():
             for symbol in adaylar:
                 if symbol in son_chart_pattern_sinyalleri and time.time() - son_chart_pattern_sinyalleri[symbol] < 14400: continue
                 
-                for tf in ['4h', '1d']:
+                # KULLANICININ İSTEĞİ: 3 GÜNLÜK EKLENDİ (Sinyal sıklığı için 4h ve 1d de var)
+                for tf in ['4h', '1d', '3d']:
                     klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=100")
                     if not isinstance(klines, list) or len(klines) < 50: continue
                     
@@ -764,6 +765,7 @@ def chart_patterns_loop():
                     
                     sinyal = None; formasyon_adi = ""; yon = ""; emoji = ""; hedef = 0; stop = 0; neckline = 0
                     
+                    # 1. İKİLİ TEPE (M)
                     if len(p_highs) >= 2:
                         p1_idx, p1_price = p_highs[-2]
                         p2_idx, p2_price = p_highs[-1]
@@ -774,6 +776,7 @@ def chart_patterns_loop():
                                 stop = max(p1_price, p2_price) * 1.02
                                 hedef = neckline - (max(p1_price, p2_price) - neckline)
 
+                    # 2. İKİLİ DİP (W)
                     if not sinyal and len(p_lows) >= 2:
                         p1_idx, p1_price = p_lows[-2]
                         p2_idx, p2_price = p_lows[-1]
@@ -784,6 +787,7 @@ def chart_patterns_loop():
                                 stop = min(p1_price, p2_price) * 0.98
                                 hedef = neckline + (neckline - min(p1_price, p2_price))
 
+                    # 3. OBO
                     if not sinyal and len(p_highs) >= 3:
                         p1_idx, p1_price = p_highs[-3]
                         p2_idx, p2_price = p_highs[-2] 
@@ -795,6 +799,7 @@ def chart_patterns_loop():
                                 stop = p3_price * 1.02
                                 hedef = neckline - (p2_price - neckline)
 
+                    # 4. TERS OBO
                     if not sinyal and len(p_lows) >= 3:
                         p1_idx, p1_price = p_lows[-3]
                         p2_idx, p2_price = p_lows[-2] 
@@ -806,6 +811,42 @@ def chart_patterns_loop():
                                 stop = p3_price * 0.98
                                 hedef = neckline + (neckline - p2_price)
 
+                    # 5. FINCAN VE KULP (CUP & HANDLE) - YENİ
+                    if not sinyal and len(p_highs) >= 2 and len(p_lows) >= 1:
+                        # Sol kenar (p_highs[-2]), Fincan dibi (p_lows[-1]), Sağ kenar (p_highs[-1])
+                        left_rim_idx, left_rim = p_highs[-2]
+                        cup_low_idx, cup_low = p_lows[-1]
+                        right_rim_idx, right_rim = p_highs[-1]
+                        
+                        # Sol ve sağ kenar birbirine yakın olmalı (+/- %5)
+                        if left_rim_idx < cup_low_idx < right_rim_idx and abs(left_rim - right_rim) / left_rim <= 0.05:
+                            # Fincanın derinliği en az %5 olmalı (çok sığ olmasın)
+                            cup_depth = (left_rim - cup_low) / left_rim
+                            if cup_depth > 0.05:
+                                # Kırılım: Fiyat sağ kenarı yukarı kırdıysa (Kulp oluşumu ve kırılımı)
+                                if curr_close > right_rim * 1.01:
+                                    sinyal = True; formasyon_adi = "Fincan ve Kulp (Cup & Handle)"; yon = "LONG"; emoji = "☕"
+                                    neckline = right_rim
+                                    hedef = right_rim + (right_rim - cup_low) # Fincan derinliği kadar yukarı
+                                    stop = cup_low * 1.02 # Fincan dibinin hemen üstü
+
+                    # 6. TERS FINCAN VE KULP (INVERTED CUP & HANDLE) - YENİ
+                    if not sinyal and len(p_lows) >= 2 and len(p_highs) >= 1:
+                        left_rim_idx, left_rim = p_lows[-2]
+                        cup_high_idx, cup_high = p_highs[-1]
+                        right_rim_idx, right_rim = p_lows[-1]
+                        
+                        if left_rim_idx < cup_high_idx < right_rim_idx and abs(left_rim - right_rim) / left_rim <= 0.05:
+                            cup_depth = (cup_high - left_rim) / left_rim
+                            if cup_depth > 0.05:
+                                # Kırılım: Fiyat sağ kenarı aşağı kırdıysa
+                                if curr_close < right_rim * 0.99:
+                                    sinyal = True; formasyon_adi = "Ters Fincan ve Kulp"; yon = "SHORT"; emoji = "☕"
+                                    neckline = right_rim
+                                    hedef = right_rim - (cup_high - right_rim)
+                                    stop = cup_high * 0.98
+
+                    # MANTIK FİLTRELERİ
                     if sinyal:
                         hedef_pct = ((hedef - curr_close) / curr_close) * 100
                         stop_pct = ((stop - curr_close) / curr_close) * 100
@@ -820,6 +861,7 @@ def chart_patterns_loop():
                         aciklama = "Fiyat, klasik bir dönüş formasyonunu tamamlayarak boyun çizgisini (Neckline) hacimle kırdı."
                         if "OBO" in formasyon_adi: aciklama = "Trendin tepe noktasında oluşan klasik dönüş formasyonu. Boyun çizgisi kırıldı, satıcılar kontrolü ele aldı."
                         if "Dip" in formasyon_adi: aciklama = "Dipte oluşan çift dip formasyonu. Satıcılar tükendi, alıcılar hacimle boyun çizgisini yukarı kırdı."
+                        if "Fincan" in formasyon_adi: aciklama = "Uzun süreli bir birikim (fincan) ve ardından gelen kulp (düzeltme) sonrası direnç kırıldı. Güçlü bir boğa/ayı devam trendi başlıyor olabilir."
 
                         msg = (f"{emoji} <b>GRAFİK FORMASYONU ({yon}): {symbol}</b>\n"
                                f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
@@ -841,7 +883,7 @@ def chart_patterns_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 12: TOP GAINERS SHORT AVCISI (YENİ)
+# MOTOR 12: TOP GAINERS SHORT AVCISI
 # =====================================================
 def top_gainers_short_loop():
     log("SHORT_GAINERS", "Top Gainers Short Avcısı Başladı (Kâr Realizasyonu).")
@@ -851,7 +893,6 @@ def top_gainers_short_loop():
             tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
             
-            # Son 24 saatin en çok kazandıranlarını bul (İlk 5)
             temiz_tickers = [t for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER]
             temiz_tickers.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
             top_gainers = temiz_tickers[:5]
@@ -860,12 +901,10 @@ def top_gainers_short_loop():
                 symbol = t['symbol']
                 change_pct = float(t['priceChangePercent'])
                 
-                # Sadece çok pump yapanlar (en az %15) hedef alınır
                 if change_pct < 15: continue
                 
-                if symbol in son_short_gainers_sinyalleri and time.time() - son_short_gainers_sinyalleri[symbol] < 43200: continue # 12 saat bekle
+                if symbol in son_short_gainers_sinyalleri and time.time() - son_short_gainers_sinyalleri[symbol] < 43200: continue
                 
-                # 15 dakikalık grafik ile dönüşü teyit et
                 klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=50")
                 if not isinstance(klines, list) or len(klines) < 50: continue
                 
@@ -877,23 +916,19 @@ def top_gainers_short_loop():
                 curr_vol = vols[-1]
                 avg_vol = sum(vols[-21:-1]) / 20
                 
-                if curr_vol < avg_vol: continue # Satış için hacim gerekli
+                if curr_vol < avg_vol: continue
                 
                 ema9 = calculate_ema(closes, 9)[-1]
                 ema21 = calculate_ema(closes, 21)[-1]
                 rsi = calculate_rsi(closes)
                 
-                # DÖNÜŞ ŞARTLARI:
-                # 1. RSI hala yüksek ama düşmeye başlamış (>55)
-                # 2. EMA9, EMA21'in altına sarkmış (Ölüm Kesişimi)
-                # 3. Fiyat son 20 mumun zirvesinden en az %2 düşmüş
                 recent_high = max(highs[-20:])
                 drop_from_top = ((recent_high - curr_close) / recent_high) * 100
                 
                 if rsi > 55 and ema9 < ema21 and curr_close < closes[-2] and drop_from_top > 2.0:
-                    sl = recent_high * 1.01 # Stop üstüne
-                    tp1 = curr_close * 0.95 # İlk hedef %5 aşağı
-                    tp2 = curr_close * 0.90 # İkinci hedef %10 aşağı
+                    sl = recent_high * 1.01
+                    tp1 = curr_close * 0.95
+                    tp2 = curr_close * 0.90
                     
                     msg = (f"🩸 <b>TOP GAINERS SHORT FIRSATI: {symbol}</b>\n"
                            f"<i>15m Grafik - Kâr Realizasyonu</i>\n\n"
@@ -936,11 +971,9 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
-    # Rapor Botları
     threading.Thread(target=top_gainers_loop, daemon=True).start()
     threading.Thread(target=pump_winner_loop, daemon=True).start()
     
-    # Sinyal Botları
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
     threading.Thread(target=volatilite_loop, daemon=True).start()
@@ -950,7 +983,6 @@ if __name__ == "__main__":
     threading.Thread(target=ath_atl_loop, daemon=True).start()
     threading.Thread(target=ichimoku_loop, daemon=True).start()
     threading.Thread(target=chart_patterns_loop, daemon=True).start()
-    threading.Thread(target=top_gainers_short_loop, daemon=True).start() # YENİ STRATEJİ
+    threading.Thread(target=top_gainers_short_loop, daemon=True).start()
     
-    # Web Sunucusu
     run_web_server()
