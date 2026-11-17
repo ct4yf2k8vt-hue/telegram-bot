@@ -4,6 +4,8 @@ import json
 import time
 import socket
 import os
+import sys
+import re
 import threading
 import http.server
 from datetime import datetime, timedelta, timezone
@@ -12,7 +14,12 @@ from datetime import datetime, timedelta, timezone
 # AYARLAR
 # =====================================================
 
-socket.setdefaulttimeout(15)
+socket.setdefaulttimeout(20)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 T = os.environ.get("BOT_TOKEN", "").strip()
 C = os.environ.get("CHAT_ID", "1623907197").strip()
@@ -22,15 +29,15 @@ BASE = "https://api.binance.com"
 FAPI = "https://fapi.binance.com"
 
 CHARTIST_ARALIGI = 3600
-PUMP_ARALIGI = 60
-VOLATILITE_ARALIGI = 60
+PUMP_ARALIGI = 300
+VOLATILITE_ARALIGI = 300
 FORMASYON_ARALIGI = 3600
 EMA_RIBBON_ARALIGI = 3600
 MACD_ARALIGI = 3600
 ATH_ATL_ARALIGI = 3600
 ICHIMOKU_ARALIGI = 3600
 CHART_PATTERN_ARALIGI = 1800
-SHORT_GAINERS_ARALIGI = 300
+SHORT_GAINERS_ARALIGI = 900
 TOP_MOVERS_ARALIGI = 3600
 DOMINANS_ARALIGI = 14400
 TOP_GAINERS_ARALIGI = 14400
@@ -105,9 +112,7 @@ def tg(chat_id, message):
             "disable_web_page_preview": "true"
         }).encode("utf-8")
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{T}/sendMessage",
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            f"https://api.telegram.org/bot{T}/sendMessage", data=data
         )
         with urllib.request.urlopen(req, timeout=15) as response:
             return json.loads(response.read().decode("utf-8")).get("ok", False)
@@ -116,16 +121,121 @@ def tg(chat_id, message):
         return False
 
 
+# Binance koruma katmani: ortak istek hizi, URL onbellegi ve global ban beklemesi.
+API_MIN_REQUEST_INTERVAL = 0.30       # En fazla yaklasik 3.3 istek/sn
+API_CACHE_TTL = {
+    "ticker/24hr": 60,
+    "interval=1m": 20,
+    "interval=5m": 45,
+    "interval=15m": 90,
+    "interval=1h": 240,
+    "interval=4h": 600,
+    "interval=8h": 900,
+    "interval=12h": 1200,
+    "interval=1d": 1800,
+    "interval=3d": 3600,
+}
+API_MAX_SYMBOLS_PER_SCAN = 25
+_api_lock = threading.Lock()
+_api_cache = {}
+_api_next_request_at = 0.0
+_api_blocked_until = 0.0
+_api_last_block_log = 0.0
+
+
+def _cache_ttl(url):
+    for key, ttl in API_CACHE_TTL.items():
+        if key in url:
+            return ttl
+    return 30
+
+
+def _set_api_cooldown(seconds, reason):
+    global _api_blocked_until, _api_last_block_log
+    with _api_lock:
+        _api_blocked_until = max(_api_blocked_until, time.time() + seconds)
+        if time.time() - _api_last_block_log > 60:
+            kalan = max(0, int(_api_blocked_until - time.time()))
+            log("API", f"Binance guvenlik beklemesi aktif: {reason}. Kalan yaklasik {kalan} saniye.")
+            _api_last_block_log = time.time()
+
+
 def gj(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
+    global _api_next_request_at
+    now = time.time()
+    cached = _api_cache.get(url)
+    if cached and now - cached[0] < _cache_ttl(url):
+        return cached[1]
+
+    # Ban devam ederken yeni istek gonderme; motorlarin hata yagmurunu kes.
+    with _api_lock:
+        wait_for = _api_blocked_until - time.time()
+    if wait_for > 0:
+        return None
+
+    # Butun thread'ler tek bir ortak istek siralamasini kullanir.
+    with _api_lock:
+        now = time.time()
+        wait_for = max(0.0, _api_next_request_at - now)
+        _api_next_request_at = max(now, _api_next_request_at) + API_MIN_REQUEST_INTERVAL
+    if wait_for:
+        time.sleep(wait_for)
+
+    # Sira beklerken baska bir thread 418 almis olabilir; gondermeden once tekrar kontrol et.
+    with _api_lock:
+        if time.time() < _api_blocked_until:
+            return None
+
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except Exception as e:
-        # Binance/API geÃ§ici hatalarÄ±nda ilgili motor bir sonraki dÃ¶ngÃ¼de tekrar dener.
-        log("API", f"Ä°stek baÅarÄ±sÄ±z: {e}")
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            _api_cache[url] = (time.time(), result)
+            return result
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        if e.code == 418:
+            # Binance yanitinda ban bitis zamani varsa onu kullan; yoksa 30 dk bekle.
+            match = re.search(r"banned until (\d+)", body, re.I)
+            if match:
+                until = int(match.group(1)) / 1000.0
+                seconds = max(60, until - time.time())
+            else:
+                seconds = 1800
+            _set_api_cooldown(seconds, "HTTP 418 IP erisim engeli")
+            return None
+        if e.code == 429:
+            retry = e.headers.get("Retry-After") if e.headers else None
+            try:
+                seconds = max(120, int(retry)) if retry else 300
+            except (TypeError, ValueError):
+                seconds = 300
+            _set_api_cooldown(seconds, "HTTP 429 istek limiti")
+            return None
+        log("API", f"HTTP {e.code}: {body[:250]}")
         return None
+    except Exception as e:
+        log("API", f"Istek basarisiz: {e}")
+        return None
+
+
+def secili_symbol(tickers, min_hacim=0, limit=API_MAX_SYMBOLS_PER_SCAN):
+    """Her taramada tum piyasayi degil, hacmi en yuksek uygun coinleri tara."""
+    uygun = []
+    for t in tickers:
+        try:
+            hacim = float(t.get("quoteVolume", 0))
+            if uygun_symbol(t) and hacim >= min_hacim:
+                uygun.append((hacim, t["symbol"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    uygun.sort(reverse=True)
+    return [symbol for _, symbol in uygun[:limit]]
 
 
 def calculate_ema(prices, period):
@@ -258,43 +368,29 @@ def top_gainers_loop():
                 time.sleep(300)
                 continue
 
-            # YalnÄ±zca gerÃ§ekten yÃ¼kseliÅte olan pariteler listelenir.
             temiz = [
                 t for t in tickers
-                if uygun_symbol(t)
-                and float(t.get("quoteVolume", 0)) > 5_000_000
-                and float(t.get("priceChangePercent", 0)) > 0
+                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) > 5_000_000
             ]
+            temiz = [t for t in temiz if float(t.get("priceChangePercent", 0)) > 0]
             temiz.sort(key=lambda x: float(x["priceChangePercent"]), reverse=True)
             top_5 = temiz[:5]
 
             if top_5:
-                msg = (
-                    "ð¥ <b>GÃNÃN EN Ä°YÄ° HAREKETLERÄ°</b>\n"
-                    "ð <b>Son 24 Saat â En Ãok YÃ¼kselen Coinler</b>\n"
-                    "ââââââââââââââââââ\n\n"
-                    "ð <i>24 saatlik fiyat deÄiÅimine gÃ¶re sÄ±ralanmÄ±ÅtÄ±r.</i>\n\n"
-                )
+                msg = "ð¥ <b>GÃNÃN EN Ä°YÄ° HAREKETLERÄ°</b>\n"
+                msg += "ð <i>Son 24 Saat | Binance Spot verisi</i>\n\n"
                 medals = ["ð¥", "ð¥", "ð¥", "ð", "â­"]
                 for i, t in enumerate(top_5):
                     symbol = t["symbol"].replace("USDT", "")
                     change = float(t["priceChangePercent"])
                     price = float(t["lastPrice"])
-                    hacim = float(t.get("quoteVolume", 0))
-                    msg += (
-                        f"{medals[i]} <b>{symbol}</b> â <b>+{change:.2f}%</b>\n"
-                        f"   ð° Fiyat: <code>{akilli_fiyat(price)}</code>\n"
-                        f"   ð§ 24s Hacim: <b>{hacim / 1_000_000:.2f}M USDT</b>\n\n"
-                    )
-                msg += (
-                    "ââââââââââââââââââ\n"
-                    f"ð GÃ¼ncelleme: {simdi().strftime('%d.%m.%Y %H:%M')} (TSÄ°)\n\n"
-                    "â¹ï¸ <i>Liste, 5 milyon USDT Ã¼zeri 24 saatlik hacme sahip ve yÃ¼kseliÅte olan coinlerden oluÅturulur.</i>\n"
-                    "â ï¸ <i>GeÃ§miÅ performans gelecekteki yÃ¼kseliÅi garanti etmez. Bu mesaj yatÄ±rÄ±m tavsiyesi deÄildir.</i>"
-                )
+                    if change <= 0:
+                        continue
+                    msg += (f"{medals[i]} <b>{symbol}</b>  +{change:.2f}%\n"
+                            f"   ð° Fiyat: <code>{akilli_fiyat(price)}</code>\n\n")
+                msg += "ââââââââââââââââââ\n"
+                msg += "â¹ï¸ <i>Liste, 24 saatlik fiyat deÄiÅimine gÃ¶re hazÄ±rlanmÄ±ÅtÄ±r. GeÃ§miÅ performans geleceÄi garanti etmez.</i>"
                 tg(C, msg)
-            else:
-                log("TOP_GAINERS", "Filtrelere uyan yÃ¼kseliÅte coin bulunamadÄ±.")
 
             time.sleep(TOP_GAINERS_ARALIGI)
         except Exception as e:
@@ -371,10 +467,7 @@ def chartist_loop():
                 time.sleep(60)
                 continue
 
-            symbols = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_CHARTIST
-            ]
+            symbols = secili_symbol(tickers, MIN_HACIM_CHARTIST)
             for symbol in symbols:
                 for tf in ["8h", "12h", "1d", "3d"]:
                     cooldown_key = f"CH_{tf}_{symbol}"
@@ -435,10 +528,7 @@ def pump_loop():
                 time.sleep(60)
                 continue
 
-            symbols = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_PUMP
-            ]
+            symbols = secili_symbol(tickers, MIN_HACIM_PUMP)
             for symbol in symbols:
                 if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900:
                     continue
@@ -465,7 +555,7 @@ def pump_loop():
                         f"ð <b>Pump - {symbol}</b>\n"
                         f"ð° <b>Fiyat:</b> {akilli_fiyat(cc)} (<b>{price_change:+.2f}%</b>)\n"
                         f"ð <b>Hacim ArtÄ±ÅÄ±:</b> {vol_change:+.0f}%\n"
-                        f"ð <b>Hacim FarkÄ±:</b> {vol_diff:,.0f} USDT â¬ï¸\n\n"
+                        f"ð <b>Hacim FarkÄ±:</b> {vol_diff:.0f} USDT\n\n"
                         f"{trap_radar}\n\n"
                         f"ð¡ <b>AÃ§Ä±klama:</b> 5 dakikalÄ±k grafikte hacim ve fiyat artÄ±ÅÄ± tespit edildi."
                     )
@@ -492,10 +582,7 @@ def volatilite_loop():
                 time.sleep(60)
                 continue
 
-            symbols = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_VOLATILITE
-            ]
+            symbols = secili_symbol(tickers, MIN_HACIM_VOLATILITE)
             for symbol in symbols:
                 if symbol in son_volatilite_sinyalleri and time.time() - son_volatilite_sinyalleri[symbol] < 1800:
                     continue
@@ -553,10 +640,7 @@ def formasyon_loop():
                 time.sleep(60)
                 continue
 
-            symbols = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_FORMASYON
-            ]
+            symbols = secili_symbol(tickers, MIN_HACIM_FORMASYON)
             for symbol in symbols:
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 86400:
                     continue
@@ -696,10 +780,7 @@ def ema_ribbon_loop():
                 time.sleep(60)
                 continue
 
-            symbols = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_EMA_RIBBON
-            ]
+            symbols = secili_symbol(tickers, MIN_HACIM_EMA_RIBBON)
             for symbol in symbols:
                 if symbol in son_ema_ribbon_sinyalleri and time.time() - son_ema_ribbon_sinyalleri[symbol] < 86400:
                     continue
@@ -760,10 +841,7 @@ def macd_loop():
                 time.sleep(60)
                 continue
 
-            symbols = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_MACD
-            ]
+            symbols = secili_symbol(tickers, MIN_HACIM_MACD)
             for symbol in symbols:
                 if symbol in son_macd_sinyalleri and time.time() - son_macd_sinyalleri[symbol] < 14400:
                     continue
@@ -816,10 +894,7 @@ def ath_atl_loop():
                 time.sleep(60)
                 continue
 
-            adaylar = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_ATH_ATL
-            ]
+            adaylar = secili_symbol(tickers, MIN_HACIM_ATH_ATL)
             for symbol in adaylar:
                 if symbol in son_ath_atl_sinyalleri and time.time() - son_ath_atl_sinyalleri[symbol] < 86400:
                     continue
@@ -898,10 +973,7 @@ def ichimoku_loop():
                 time.sleep(60)
                 continue
 
-            adaylar = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_ICHIMOKU
-            ]
+            adaylar = secili_symbol(tickers, MIN_HACIM_ICHIMOKU)
             for symbol in adaylar:
                 if symbol in son_ichimoku_sinyalleri and time.time() - son_ichimoku_sinyalleri[symbol] < 14400:
                     continue
@@ -1018,10 +1090,7 @@ def chart_patterns_loop():
                 time.sleep(60)
                 continue
 
-            adaylar = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t) and float(t.get("quoteVolume", 0)) >= MIN_HACIM_PATTERN
-            ]
+            adaylar = secili_symbol(tickers, MIN_HACIM_PATTERN)
             for symbol in adaylar:
                 if symbol in son_chart_pattern_sinyalleri and time.time() - son_chart_pattern_sinyalleri[symbol] < 14400:
                     continue
@@ -1329,10 +1398,7 @@ def sma200_loop():
                 time.sleep(60)
                 continue
 
-            symbols = [
-                t["symbol"] for t in tickers
-                if uygun_symbol(t)
-            ]
+            symbols = secili_symbol(tickers, 0, 20)
 
             for symbol in symbols:
                 klines = gj(
