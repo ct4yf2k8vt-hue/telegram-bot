@@ -26,22 +26,23 @@ FAPI = "https://fapi.binance.com"
 # MOTOR ÇALIŞMA SÜRELERİ
 CHARTIST_ARALIGI = 3600    # 1 Saat
 PUMP_ARALIGI = 60          # 1 Dakika
-VOLATILITE_ARALIGI = 60    # 1 Dakika (Yeni Eklendi)
+VOLATILITE_ARALIGI = 60    # 1 Dakika
 FORMASYON_ARALIGI = 3600   # 1 Saat
 EMA_RIBBON_ARALIGI = 3600  # 1 Saat
 MACD_ARALIGI = 3600        # 1 Saat
 ATH_ATL_ARALIGI = 3600     # 1 Saat
 ICHIMOKU_ARALIGI = 3600    # 1 Saat
 CHART_PATTERN_ARALIGI = 1800 # 30 Dakika
+SHORT_GAINERS_ARALIGI = 300  # 5 Dakika (Yeni Motor)
 
 # RAPOR MOTORLARI SÜRELERİ
-TOP_GAINERS_ARALIGI = 14400  # 4 Saat (Görsel 1)
-PUMP_WINNER_ARALIGI = 21600  # 6 Saat (Görsel 2)
+TOP_GAINERS_ARALIGI = 14400  # 4 Saat
+PUMP_WINNER_ARALIGI = 21600  # 6 Saat
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_PUMP = 5_000_000     
-MIN_HACIM_VOLATILITE = 10_000_000 # Yeni Eklendi
+MIN_HACIM_VOLATILITE = 10_000_000 
 MIN_HACIM_FORMASYON = 15_000_000 
 MIN_HACIM_EMA_RIBBON = 10_000_000 
 MIN_HACIM_MACD = 10_000_000 
@@ -49,7 +50,7 @@ MIN_HACIM_ATH_ATL = 5_000_000
 MIN_HACIM_ICHIMOKU = 10_000_000 
 MIN_HACIM_PATTERN = 15_000_000 
 
-# YASAKLI VARLIKLAR (HİSSE SENETLERİ VE EMTİALAR)
+# YASAKLI VARLIKLAR
 YASAKLI_HISSELER = [
     "AAPLUSDT", "TSLAUSDT", "NVDAUSDT", "COINUSDT", "MSTRUSDT", 
     "SQQQUSDT", "TQQQUSDT", "SPYUSDT", "QQQUSDT", "AMZNUSDT", 
@@ -60,13 +61,14 @@ YASAKLI_HISSELER = [
 # Sinyal Hafızaları
 son_sinyaller = {}
 son_pump_sinyalleri = {}
-son_volatilite_sinyalleri = {} # Yeni Eklendi
+son_volatilite_sinyalleri = {}
 son_formasyon_sinyalleri = {}
 son_ema_ribbon_sinyalleri = {}
 son_macd_sinyalleri = {}
 son_ath_atl_sinyalleri = {}
 son_ichimoku_sinyalleri = {}
 son_chart_pattern_sinyalleri = {}
+son_short_gainers_sinyalleri = {} # YENİ
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -287,7 +289,7 @@ def chartist_loop():
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 4: PUMP AVCISI (Anlık Yukarı Hareket)
+# MOTOR 4: PUMP AVCISI
 # =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı.")
@@ -322,7 +324,7 @@ def pump_loop():
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 5: ANORMAL VOLATİLİTE VE DUMP AVCISI (YENİ EKLENDİ)
+# MOTOR 5: ANORMAL VOLATİLİTE VE DUMP AVCISI
 # =====================================================
 def volatilite_loop():
     log("VOLATILITE", "Anormal Volatilite ve Dump Avcısı Başladı (15m).")
@@ -333,24 +335,19 @@ def volatilite_loop():
             if not isinstance(tickers, list): time.sleep(60); continue
             
             for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and float(t.get('quoteVolume', 0)) >= MIN_HACIM_VOLATILITE]:
-                if symbol in son_volatilite_sinyalleri and time.time() - son_volatilite_sinyalleri[symbol] < 1800: continue # 30 dk cooldown
+                if symbol in son_volatilite_sinyalleri and time.time() - son_volatilite_sinyalleri[symbol] < 1800: continue
                 
-                # 15 dakikalık grafikte son 25 mumu al
                 klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=25")
                 if not isinstance(klines, list) or len(klines) < 25: continue
                 
                 opens = [float(k[1]) for k in klines]
-                highs = [float(k[2]) for k in klines]
-                lows = [float(k[3]) for k in klines]
                 closes = [float(k[4]) for k in klines]
                 vols = [float(k[7]) for k in klines]
                 
-                # Son KAPANMIŞ mumu incele (fake fitilleri önlemek için)
                 curr_open = opens[-2]
                 curr_close = closes[-2]
                 curr_vol = vols[-2]
                 
-                # Son 20 mumun ortalama hacmi
                 avg_vol = sum(vols[-22:-2]) / 20 if len(vols) >= 22 else 1
                 
                 if curr_open == 0 or avg_vol == 0: continue
@@ -358,9 +355,6 @@ def volatilite_loop():
                 price_change_pct = ((curr_close - curr_open) / curr_open) * 100
                 vol_multiplier = curr_vol / avg_vol
                 
-                # ANORMAL VOLATİLİTE ŞARTLARI:
-                # 1. Fiyat 15 dakikada en az %2.5 hareket etmiş olmalı
-                # 2. Hacim, son 20 mumun ortalamasının en az 3 katı olmalı
                 if abs(price_change_pct) >= 2.5 and vol_multiplier >= 3.0:
                     
                     yon = "DUMP (ANI DÜŞÜŞ) 🔻" if price_change_pct < 0 else "PUMP (ANI YÜKSELİŞ) 🚀"
@@ -470,7 +464,6 @@ def formasyon_loop():
                         hedef = current_price - (last_20_high - last_20_low); stop = last_20_high * 1.02
                         aciklama = "Fiyat dar bir bantta sıkıştı ve hacimle aşağı kırıldı. Volatilite patlaması başlıyor."
 
-                # MANTIK FİLTRELERİ
                 if sinyal:
                     hedef_pct = ((hedef - current_price) / current_price) * 100
                     stop_pct = ((stop - current_price) / current_price) * 100
@@ -813,7 +806,6 @@ def chart_patterns_loop():
                                 stop = p3_price * 0.98
                                 hedef = neckline + (neckline - p2_price)
 
-                    # MANTIK FİLTRELERİ
                     if sinyal:
                         hedef_pct = ((hedef - curr_close) / curr_close) * 100
                         stop_pct = ((stop - curr_close) / curr_close) * 100
@@ -849,6 +841,82 @@ def chart_patterns_loop():
             time.sleep(60)
 
 # =====================================================
+# MOTOR 12: TOP GAINERS SHORT AVCISI (YENİ)
+# =====================================================
+def top_gainers_short_loop():
+    log("SHORT_GAINERS", "Top Gainers Short Avcısı Başladı (Kâr Realizasyonu).")
+    time.sleep(180)
+    while True:
+        try:
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            # Son 24 saatin en çok kazandıranlarını bul (İlk 5)
+            temiz_tickers = [t for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER]
+            temiz_tickers.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
+            top_gainers = temiz_tickers[:5]
+
+            for t in top_gainers:
+                symbol = t['symbol']
+                change_pct = float(t['priceChangePercent'])
+                
+                # Sadece çok pump yapanlar (en az %15) hedef alınır
+                if change_pct < 15: continue
+                
+                if symbol in son_short_gainers_sinyalleri and time.time() - son_short_gainers_sinyalleri[symbol] < 43200: continue # 12 saat bekle
+                
+                # 15 dakikalık grafik ile dönüşü teyit et
+                klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=50")
+                if not isinstance(klines, list) or len(klines) < 50: continue
+                
+                closes = [float(k[4]) for k in klines[:-1]]
+                highs = [float(k[2]) for k in klines[:-1]]
+                vols = [float(k[7]) for k in klines[:-1]]
+                
+                curr_close = closes[-1]
+                curr_vol = vols[-1]
+                avg_vol = sum(vols[-21:-1]) / 20
+                
+                if curr_vol < avg_vol: continue # Satış için hacim gerekli
+                
+                ema9 = calculate_ema(closes, 9)[-1]
+                ema21 = calculate_ema(closes, 21)[-1]
+                rsi = calculate_rsi(closes)
+                
+                # DÖNÜŞ ŞARTLARI:
+                # 1. RSI hala yüksek ama düşmeye başlamış (>55)
+                # 2. EMA9, EMA21'in altına sarkmış (Ölüm Kesişimi)
+                # 3. Fiyat son 20 mumun zirvesinden en az %2 düşmüş
+                recent_high = max(highs[-20:])
+                drop_from_top = ((recent_high - curr_close) / recent_high) * 100
+                
+                if rsi > 55 and ema9 < ema21 and curr_close < closes[-2] and drop_from_top > 2.0:
+                    sl = recent_high * 1.01 # Stop üstüne
+                    tp1 = curr_close * 0.95 # İlk hedef %5 aşağı
+                    tp2 = curr_close * 0.90 # İkinci hedef %10 aşağı
+                    
+                    msg = (f"🩸 <b>TOP GAINERS SHORT FIRSATI: {symbol}</b>\n"
+                           f"<i>15m Grafik - Kâr Realizasyonu</i>\n\n"
+                           f"⚠️ <i>Coin 24 saatte <b>+{change_pct:.1f}%</b> yükselmiş ve aşırı alım (Overbought) bölgesinde. Balina çıkışı / Short fırsatı başlıyor olabilir!</i>\n\n"
+                           f"💰 <b>Giriş (Short):</b> {akilli_fiyat(curr_close)}\n"
+                           f"🛑 <b>Stop-Loss (İptal):</b> {akilli_fiyat(sl)}\n"
+                           f"🎯 <b>Hedef 1:</b> {akilli_fiyat(tp1)} (-5.0%)\n"
+                           f"🎯 <b>Hedef 2:</b> {akilli_fiyat(tp2)} (-10.0%)\n\n"
+                           f"📊 <b>RSI:</b> {rsi:.1f} (Aşırı Alımdan Dönüş)\n"
+                           f"📉 <b>EMA:</b> 9 Periyot, 21'in altına sarktı (Ölüm Kesişimi)\n"
+                           f"🔊 <b>Hacim:</b> Satış hacmi ortalamanın üzerinde\n\n"
+                           f"💡 <b>Strateji:</b> En çok yükselenler listesine giren coinlerde, trendin kırıldığı ve kâr satışlarının başladığı noktada kısa pozisyon (Short) alınır.")
+                    
+                    if tg(C, msg):
+                        son_short_gainers_sinyalleri[symbol] = time.time()
+                        log("SHORT_GAINERS", f"🔥 SİNYAL: {symbol} (SHORT)")
+                        
+            time.sleep(SHORT_GAINERS_ARALIGI)
+        except Exception as e:
+            log("SHORT_GAINERS", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
 # RENDER WEB SUNUCUSU
 # =====================================================
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -875,13 +943,14 @@ if __name__ == "__main__":
     # Sinyal Botları
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
-    threading.Thread(target=volatilite_loop, daemon=True).start() # YENİ VOLATİLİTE MOTORU
+    threading.Thread(target=volatilite_loop, daemon=True).start()
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=ema_ribbon_loop, daemon=True).start()
     threading.Thread(target=macd_loop, daemon=True).start()
     threading.Thread(target=ath_atl_loop, daemon=True).start()
     threading.Thread(target=ichimoku_loop, daemon=True).start()
     threading.Thread(target=chart_patterns_loop, daemon=True).start()
+    threading.Thread(target=top_gainers_short_loop, daemon=True).start() # YENİ STRATEJİ
     
     # Web Sunucusu
     run_web_server()
