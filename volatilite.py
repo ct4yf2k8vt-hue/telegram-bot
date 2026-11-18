@@ -24,34 +24,56 @@ BASE = "https://api.binance.com"
 FAPI = "https://fapi.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
-RAPOR_ARALIGI = 14400      # 4 Saat
 CHARTIST_ARALIGI = 3600    # 1 Saat
 PUMP_ARALIGI = 60          # 1 Dakika
+VOLATILITE_ARALIGI = 60    # 1 Dakika
 FORMASYON_ARALIGI = 3600   # 1 Saat
 EMA_RIBBON_ARALIGI = 3600  # 1 Saat
 MACD_ARALIGI = 3600        # 1 Saat
-MIDAS_SETUP_ARALIGI = 7200 # 2 Saat
 ATH_ATL_ARALIGI = 3600     # 1 Saat
 ICHIMOKU_ARALIGI = 3600    # 1 Saat
+CHART_PATTERN_ARALIGI = 1800 # 30 Dakika
+SHORT_GAINERS_ARALIGI = 300  # 5 Dakika
+TOP_MOVERS_ARALIGI = 3600  # 1 Saat
+DOMINANS_ARALIGI = 14400   # 4 Saat
+
+# RAPOR MOTORLARI SÜRELERİ
+TOP_GAINERS_ARALIGI = 14400  # 4 Saat
+PUMP_WINNER_ARALIGI = 21600  # 6 Saat
 
 # FİLTRELER
 MIN_HACIM_CHARTIST = 10_000_000 
 MIN_HACIM_PUMP = 5_000_000     
+MIN_HACIM_VOLATILITE = 10_000_000 
 MIN_HACIM_FORMASYON = 15_000_000 
 MIN_HACIM_EMA_RIBBON = 10_000_000 
 MIN_HACIM_MACD = 10_000_000 
-MIN_HACIM_MIDAS_SETUP = 15_000_000 
 MIN_HACIM_ATH_ATL = 5_000_000 
 MIN_HACIM_ICHIMOKU = 10_000_000 
+MIN_HACIM_PATTERN = 15_000_000 
+MIN_HACIM_MOVERS = 5_000_000
 
+# YASAKLI VARLIKLAR
+YASAKLI_HISSELER = [
+    "AAPLUSDT", "TSLAUSDT", "NVDAUSDT", "COINUSDT", "MSTRUSDT", 
+    "SQQQUSDT", "TQQQUSDT", "SPYUSDT", "QQQUSDT", "AMZNUSDT", 
+    "GOOGLUSDT", "METAUSDT", "NFLXUSDT", "BABAUSDT", "MSFTUSDT", 
+    "HOODUSDT", "CRCLUSDT", "XAUUSDT", "XAGUSDT", "PAXGUSDT"
+]
+
+# Sinyal Hafızaları
 son_sinyaller = {}
 son_pump_sinyalleri = {}
+son_volatilite_sinyalleri = {}
 son_formasyon_sinyalleri = {}
 son_ema_ribbon_sinyalleri = {}
 son_macd_sinyalleri = {}
-son_midas_setup_sinyalleri = {}
 son_ath_atl_sinyalleri = {}
 son_ichimoku_sinyalleri = {}
+son_chart_pattern_sinyalleri = {}
+son_short_gainers_sinyalleri = {}
+son_movers_sinyalleri = {}
+son_dominans_sinyalleri = {}
 
 # =====================================================
 # YARDIMCI FONKSİYONLAR
@@ -124,24 +146,6 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     if not signal_line: return None, None, None, None
     return macd_line[-1], signal_line[-1], macd_line[-2], signal_line[-2]
 
-def get_market_trend(tickers):
-    try:
-        sorted_tickers = sorted(tickers, key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)[:100]
-        changes, up_count, down_count = [], 0, 0
-        for t in sorted_tickers:
-            change = float(t.get('priceChangePercent', 0))
-            changes.append(change)
-            if change > 0: up_count += 1
-            elif change < 0: down_count += 1
-        if not changes: return "Bilinmiyor", 0, 0, 0
-        avg_change = sum(changes) / len(changes)
-        if avg_change > 1.5 and up_count > down_count: trend = "🟢 YUKARI (Boğa)"
-        elif avg_change < -1.5 and down_count > up_count: trend = "🔴 AŞAĞI (Ayı)"
-        else: trend = "🟡 YATAY (Kararsız)"
-        return trend, avg_change, up_count, down_count
-    except:
-        return "Bilinmiyor", 0, 0, 0
-
 def trap_radar_check(symbol):
     try:
         oi_data = gj(f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=2")
@@ -164,46 +168,107 @@ def trap_radar_check(symbol):
         else: return "⚖️ <b>Kısmi Teyit</b>"
     except: return ""
 
+def find_pivots(highs, lows, window=3):
+    pivot_highs = []
+    pivot_lows = []
+    for i in range(window, len(highs) - window):
+        if highs[i] == max(highs[i-window:i+window+1]): pivot_highs.append((i, highs[i]))
+        if lows[i] == min(lows[i-window:i+window+1]): pivot_lows.append((i, lows[i]))
+    return pivot_highs, pivot_lows
+
 # =====================================================
-# MOTOR 1: MİDAS FLOW (RAPOR)
+# MOTOR 1: TOP GAINERS (Görsel 1)
 # =====================================================
-def midas_flow_loop():
-    log("RAPOR", "Midas Flow Motoru Başladı.")
-    time.sleep(5)
+def top_gainers_loop():
+    log("TOP_GAINERS", "Günlük En İyi Hareketler Rapor Botu Başladı.")
+    time.sleep(10)
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(300); continue
-            trend_text, avg_chg, ups, downs = get_market_trend(tickers)
-            usdt_pairs = [t for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 5_000_000]
-            usdt_pairs.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
-            top_5 = usdt_pairs[:5]
+            
+            temiz_tickers = [t for t in tickers if t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 5_000_000]
+            temiz_tickers.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
+            top_5 = temiz_tickers[:5]
 
             if top_5:
-                msg = "🔥 <b>24 saatteki en iyi hareketler</b>\n"
-                msg += f"\n🌍 <b>Piyasa Yönü (24s):</b> {trend_text}\n"
-                msg += f"📊 Ortalama Değişim: %{avg_chg:.2f} | Yükselen: {ups} | Düşen: {downs}\n\n"
+                msg = "🔥 <b>Günün En İyi Hareketleri (24 Saat)</b>\n"
+                msg += "<i>Maksimum yükseliş yönü, hacim teyitli</i>\n\n"
                 medals = ["🥇", "🥈", "🥉", "🏅", "⭐️"]
                 for i, t in enumerate(top_5):
                     symbol = t['symbol'].replace("USDT", "")
                     change = float(t['priceChangePercent'])
+                    price = float(t['lastPrice'])
                     change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
-                    msg += f"{medals[i]} {symbol} {change_str}\n"
+                    msg += f"{medals[i]} <b>{symbol}</b> {change_str} | Fiyat: {akilli_fiyat(price)}\n"
+                
+                msg += "\n👉 <i>En çok kazandıran coinler listelendi.</i>"
                 tg(C, msg)
-            time.sleep(RAPOR_ARALIGI)
-        except: time.sleep(60)
+            time.sleep(TOP_GAINERS_ARALIGI)
+        except Exception as e:
+            log("TOP_GAINERS", f"Hata: {e}")
+            time.sleep(60)
 
 # =====================================================
-# MOTOR 2: CHARTIST (EMA200)
+# MOTOR 2: PUMP WINNER (Görsel 2)
+# =====================================================
+def pump_winner_loop():
+    log("PUMP_WINNER", "Günün Kazananı (Pump Dedektör) Rapor Botu Başladı.")
+    time.sleep(20)
+    while True:
+        try:
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(300); continue
+            
+            temiz_tickers = [t for t in tickers if t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 10_000_000]
+            temiz_tickers.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
+            
+            if not temiz_tickers: 
+                time.sleep(300)
+                continue
+            
+            winner = temiz_tickers[0]
+            symbol = winner['symbol']
+            change_pct = float(winner['priceChangePercent'])
+            
+            if change_pct < 15: 
+                time.sleep(PUMP_WINNER_ARALIGI)
+                continue
+
+            klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=1d&limit=1")
+            if not isinstance(klines, list) or len(klines) < 1: 
+                time.sleep(PUMP_WINNER_ARALIGI)
+                continue
+                
+            day_low = float(klines[0][3])
+            day_high = float(klines[0][2])
+            max_move = ((day_high - day_low) / day_low) * 100
+
+            msg = (f"🏆 <b>GÜNÜN KAZANANI: {symbol}</b>\n\n"
+                   f"🔥 24 saat içinde en çok yükselen coin!\n\n"
+                   f"📉 <b>Dip Fiyat:</b> {akilli_fiyat(day_low)}\n"
+                   f"🚀 <b>Zirve Fiyat:</b> {akilli_fiyat(day_high)}\n"
+                   f"📈 <b>Maksimum Yükseliş:</b> <b>+{max_move:.1f}%</b>\n\n"
+                   f"💡 <b>Değerlendirme:</b> {symbol} gün içerisinde muazzam bir hacim ve fiyat patlaması yaşadı. Pump Dedektör verilerimize göre günün en kârlı hareketi bu coinde gerçekleşti.")
+            
+            tg(C, msg)
+            time.sleep(PUMP_WINNER_ARALIGI) 
+            
+        except Exception as e:
+            log("PUMP_WINNER", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# MOTOR 3: CHARTIST (EMA200) - RİSK FİLTRELİ
 # =====================================================
 def chartist_loop():
     log("CHARTIST", "Zırhlı EMA200 Motoru Başladı.")
-    time.sleep(15)
+    time.sleep(30)
     while True:
         try:
             tickers = gj(f"{BASE}/api/v3/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_CHARTIST]:
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_CHARTIST]:
                 for tf in ['8h', '12h', '1d', '3d']:
                     cooldown_key = f"CH_{tf}_{symbol}"
                     if cooldown_key in son_sinyaller and time.time() - son_sinyaller[cooldown_key] < 86400: continue
@@ -212,34 +277,42 @@ def chartist_loop():
                     closes = [float(k[4]) for k in klines[:-1]]
                     curr, prev = closes[-1], closes[-2]
                     ema200 = calculate_ema(closes, 200)
+                    
                     if len(ema200) >= 2 and prev <= ema200[-2] and curr > ema200[-1] and curr > ema200[-1]*1.01:
                         vol = [float(k[7]) for k in klines[:-1]]
                         if vol[-1] > sum(vol[-21:-1])/20:
                             sl = ema200[-1] * 0.97 
-                            aciklama = "EMA200, uzun vadeli trend çizgisidir. Fiyatın bu devasa çizgiyi hacimle yukarı kırması, ayı piyasasının sona erip boğa piyasasının başladığını gösterir."
+                            hedef = curr * 1.15
+                            
+                            sl_pct = ((sl - curr) / curr) * 100
+                            hedef_pct = ((hedef - curr) / curr) * 100
+                            
+                            if abs(sl_pct) > 12.0: continue
+                            if abs(sl_pct) > abs(hedef_pct): continue
+
                             msg = (f"📈 <b>UZUN VADELİ SPOT (LONG): {symbol}</b>\n"
                                    f"<i>{tf.upper()} EMA200 Kırılımı</i>\n\n"
                                    f"💰 <b>Giriş:</b> {akilli_fiyat(curr)}\n"
-                                   f"🛑 <b>SL:</b> {akilli_fiyat(sl)}\n"
-                                   f"🎯 <b>Hedef:</b> {akilli_fiyat(curr * 1.15)}\n\n"
+                                   f"🛑 <b>SL:</b> {akilli_fiyat(sl)} (<b>{sl_pct:+.1f}%</b>)\n"
+                                   f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n\n"
                                    f"📊 <b>Teyit:</b> Hacim Onaylı ve %1 üzeri kapanış.\n\n"
-                                   f"💡 <b>Açıklama:</b> {aciklama}")
+                                   f"💡 <b>Açıklama:</b> EMA200, uzun vadeli trend çizgisidir. Fiyatın bu devasa çizgiyi hacimle yukarı kırması, ayı piyasasının sona erip boğa piyasasının başladığını gösterir.")
                             tg(C, msg); son_sinyaller[cooldown_key] = time.time()
                 time.sleep(0.05)
             time.sleep(CHARTIST_ARALIGI)
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 3: PUMP AVCISI
+# MOTOR 4: PUMP AVCISI
 # =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı.")
-    time.sleep(30)
+    time.sleep(45)
     while True:
         try:
             tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_PUMP]:
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_PUMP]:
                 if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900: continue
                 klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=5m&limit=3")
                 if not isinstance(klines, list) or len(klines) < 3: continue
@@ -253,37 +326,83 @@ def pump_loop():
                 
                 if price_change >= 3.0 and vol_change >= 100.0 and vol_diff >= 50_000:
                     trap_radar = trap_radar_check(symbol)
-                    aciklama = "5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Trap Radar sayesinde bu hareketin arkasında gerçek balinaların mı yoksa sahte botların mı olduğu analiz edildi."
                     msg = (f"🚀 <b>Pump - {symbol}</b>\n"
                            f"💰 <b>Fiyat:</b> {akilli_fiyat(cc)} (<b>{price_change:+.2f}%</b>)\n"
                            f"📊 <b>Hacim Artışı:</b> {vol_change:+.0f}%\n"
                            f"Volume increased by {vol_diff:.0f} ⬆️\n\n"
                            f"{trap_radar}\n\n"
-                           f"💡 <b>Açıklama:</b> {aciklama}")
+                           f"💡 <b>Açıklama:</b> 5 dakikalık grafikte aniden sert bir hacim ve fiyat patlaması yaşandı. Trap Radar sayesinde bu hareketin arkasında gerçek balinaların mı yoksa sahte botların mı olduğu analiz edildi.")
                     tg(C, msg); son_pump_sinyalleri[symbol] = time.time()
                 time.sleep(0.05)
             time.sleep(PUMP_ARALIGI)
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 4: FORMASYON (MSS)
+# MOTOR 5: ANORMAL VOLATİLİTE VE DUMP AVCISI
 # =====================================================
-def find_pivots(highs, lows, window=3):
-    pivot_highs = []
-    pivot_lows = []
-    for i in range(window, len(highs) - window):
-        if highs[i] == max(highs[i-window:i+window+1]): pivot_highs.append((i, highs[i]))
-        if lows[i] == min(lows[i-window:i+window+1]): pivot_lows.append((i, lows[i]))
-    return pivot_highs, pivot_lows
-
-def formasyon_loop():
-    log("FORMASYON", "Teyitli Formasyon ve Likidite Avcısı Başladı.")
-    time.sleep(45)
+def volatilite_loop():
+    log("VOLATILITE", "Anormal Volatilite ve Dump Avcısı Başladı (15m).")
+    time.sleep(55)
     while True:
         try:
             tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FORMASYON]:
+            
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_VOLATILITE]:
+                if symbol in son_volatilite_sinyalleri and time.time() - son_volatilite_sinyalleri[symbol] < 1800: continue
+                
+                klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=25")
+                if not isinstance(klines, list) or len(klines) < 25: continue
+                
+                opens = [float(k[1]) for k in klines]
+                closes = [float(k[4]) for k in klines]
+                vols = [float(k[7]) for k in klines]
+                
+                curr_open = opens[-2]
+                curr_close = closes[-2]
+                curr_vol = vols[-2]
+                
+                avg_vol = sum(vols[-22:-2]) / 20 if len(vols) >= 22 else 1
+                
+                if curr_open == 0 or avg_vol == 0: continue
+                
+                price_change_pct = ((curr_close - curr_open) / curr_open) * 100
+                vol_multiplier = curr_vol / avg_vol
+                
+                if abs(price_change_pct) >= 2.5 and vol_multiplier >= 3.0:
+                    
+                    yon = "DUMP (ANI DÜŞÜŞ) 🔻" if price_change_pct < 0 else "PUMP (ANI YÜKSELİŞ) 🚀"
+                    emoji = "🚨" if price_change_pct < 0 else "⚡"
+                    
+                    msg = (f"{emoji} <b>ANORMAL VOLATİLİTE UYARISI</b> {emoji}\n"
+                           f"<b>Coin:</b> {symbol} (15m Grafik)\n\n"
+                           f"📉 <b>Hareket:</b> {yon}\n"
+                           f"📊 <b>Değişim:</b> <b>{price_change_pct:+.2f}%</b>\n"
+                           f"📈 <b>Hacim Patlaması:</b> Ortalamanın <b>{vol_multiplier:.1f}x</b> katı\n"
+                           f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(curr_close)}\n\n"
+                           f"⚠️ <i>Piyasada ani bir likidite değişimi veya büyük bir emir gerçekleşmiş olabilir. Dikkatli olun!</i>")
+                    
+                    if tg(C, msg):
+                        son_volatilite_sinyalleri[symbol] = time.time()
+                        log("VOLATILITE", f"🔥 SİNYAL: {symbol} ({yon})")
+                        
+                time.sleep(0.1)
+            time.sleep(VOLATILITE_ARALIGI)
+        except Exception as e:
+            log("VOLATILITE", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# MOTOR 6: FORMASYON (MSS) - FİLTRELİ
+# =====================================================
+def formasyon_loop():
+    log("FORMASYON", "Teyitli Formasyon ve Likidite Avcısı Başladı.")
+    time.sleep(60)
+    while True:
+        try:
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_FORMASYON]:
                 if symbol in son_formasyon_sinyalleri and time.time() - son_formasyon_sinyalleri[symbol] < 86400: continue
                 
                 klines_5m = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=5m&limit=100")
@@ -313,13 +432,7 @@ def formasyon_loop():
                 last_h = p_highs[-3:]
                 last_l = p_lows[-3:]
                 
-                sinyal = None
-                formasyon_adi = ""
-                yon = ""
-                emoji = ""
-                hedef = 0
-                stop = 0
-                aciklama = ""
+                sinyal = None; formasyon_adi = ""; yon = ""; emoji = ""; hedef = 0; stop = 0; aciklama = ""
 
                 if abs(last_h[0][1] - last_h[2][1]) / last_h[0][1] < 0.03 and current_price < last_l[-1][1] and is_vol_teyit:
                     if rsi < 50 and ema11 < ema21:
@@ -369,6 +482,11 @@ def formasyon_loop():
                     hedef_pct = ((hedef - current_price) / current_price) * 100
                     stop_pct = ((stop - current_price) / current_price) * 100
                     
+                    if yon == "SHORT" and hedef >= current_price: continue
+                    if yon == "LONG" and hedef <= current_price: continue
+                    if abs(stop_pct) > 10.0: continue 
+                    if abs(hedef_pct) < 1.0 or abs(hedef_pct) > 20.0: continue
+
                     msg = (f"{emoji} <b>TEYİTLİ DÖNÜŞ ({yon}): {symbol}</b>\n"
                            f"<i>5m Formasyon - 15m Trend Teyitli</i>\n\n"
                            f"💰 <b>Giriş:</b> {akilli_fiyat(current_price)}\n"
@@ -389,7 +507,7 @@ def formasyon_loop():
             time.sleep(60)
 
 # =====================================================
-# MOTOR 5: EMA RIBBON
+# MOTOR 7: EMA RIBBON
 # =====================================================
 def ema_ribbon_loop():
     log("EMA_RIBBON", "EMA Dizilim Motoru Başladı.")
@@ -398,7 +516,7 @@ def ema_ribbon_loop():
         try:
             tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_EMA_RIBBON]:
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_EMA_RIBBON]:
                 if symbol in son_ema_ribbon_sinyalleri and time.time() - son_ema_ribbon_sinyalleri[symbol] < 86400: continue
                 klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=1d&limit=200")
                 if not isinstance(klines, list) or len(klines) < 200: continue
@@ -412,7 +530,6 @@ def ema_ribbon_loop():
                 e7, e25, e99, e200 = calculate_ema(closes, 7)[-1], calculate_ema(closes, 25)[-1], calculate_ema(closes, 99)[-1], calculate_ema(closes, 200)[-1]
                 
                 if curr > e7 > e25 > e99 > e200:
-                    aciklama = "EMA Ribbon (Hareketli Ortalama Şeridi) dizilimi, piyasanın tüm zaman dilimlerinde mükemmel bir uyum içinde olduğunu gösterir. Trendin en güçlü olduğu 'tatlı nokta'dır."
                     msg = (f"🚀 <b>EMA DİZİLİMİ (LONG): {symbol}</b>\n"
                            f"<i>1 Günlük Grafik - Çoklu EMA Dizilimi</i>\n\n"
                            f"💰 <b>Giriş:</b> {akilli_fiyat(curr)}\n"
@@ -422,14 +539,14 @@ def ema_ribbon_loop():
                            f"EMA7: {akilli_fiyat(e7)} | EMA25: {akilli_fiyat(e25)}\n"
                            f"EMA99: {akilli_fiyat(e99)} | EMA200: {akilli_fiyat(e200)}\n"
                            f"📈 <b>Hacim Teyidi:</b> Alındı ({curr_vol/avg_vol:.1f}x)\n\n"
-                           f"💡 <b>Açıklama:</b> {aciklama}")
+                           f"💡 <b>Açıklama:</b> EMA Ribbon dizilimi, piyasanın tüm zaman dilimlerinde mükemmel bir uyum içinde olduğunu gösterir. Trendin en güçlü olduğu 'tatlı nokta'dır.")
                     tg(C, msg); son_ema_ribbon_sinyalleri[symbol] = time.time()
                 time.sleep(0.1)
             time.sleep(EMA_RIBBON_ARALIGI)
         except: time.sleep(60)
 
 # =====================================================
-# MOTOR 6: MACD
+# MOTOR 8: MACD
 # =====================================================
 def macd_loop():
     log("MACD", "MACD Motoru Başladı.")
@@ -438,7 +555,7 @@ def macd_loop():
         try:
             tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MACD]:
+            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MACD]:
                 if symbol in son_macd_sinyalleri and time.time() - son_macd_sinyalleri[symbol] < 14400: continue
                 klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=1d&limit=100")
                 if not isinstance(klines, list) or len(klines) < 80: continue
@@ -454,7 +571,6 @@ def macd_loop():
                 cm, cs, pm, ps = macd_res
                 
                 if pm <= ps and cm > cs:
-                    aciklama = "MACD çizgisinin (Mavi) Sinyal çizgisini (Turuncu) yukarı yönlü kesmesine 'Golden Cross' (Altın Kesişim) denir. Bu, satıcıların gücünü kaybettiğini ve yükseliş trendinin başladığını teyit eder."
                     msg = (f"🚀 <b>MACD SİNYALİ (LONG): {symbol}</b>\n"
                            f"<i>1 Günlük Grafik - MACD Momentum Kırılımı</i>\n\n"
                            f"💰 <b>Giriş:</b> {akilli_fiyat(curr_price)}\n"
@@ -462,91 +578,14 @@ def macd_loop():
                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(curr_price * 0.97)} (-3.0%)\n\n"
                            f"📊 <b>MACD Çizgisi:</b> {cm:.5f} | <b>Sinyal Çizgisi:</b> {cs:.5f}\n"
                            f"📈 <b>Hacim Teyidi:</b> Alındı\n\n"
-                           f"💡 <b>Açıklama:</b> {aciklama}")
+                           f"💡 <b>Açıklama:</b> MACD çizgisinin Sinyal çizgisini yukarı yönlü kesmesine 'Golden Cross' (Altın Kesişim) denir. Bu, satıcıların gücünü kaybettiğini ve yükseliş trendinin başladığını teyit eder.")
                     tg(C, msg); son_macd_sinyalleri[symbol] = time.time()
                 time.sleep(0.1)
             time.sleep(MACD_ARALIGI)
         except: time.sleep(60)
 
 # =====================================================
-# 7. MOTOR: MIDAS SETUP (TAM KAPASİTELİ - POC / VAH / VAL)
-# =====================================================
-def midas_setup_loop():
-    log("MIDAS_SETUP", "Midas Setup (POC/VAH/VAL & Order Book) Motoru Başladı.")
-    time.sleep(120)
-    while True:
-        try:
-            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
-            if not isinstance(tickers, list): time.sleep(60); continue
-            for symbol in [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_MIDAS_SETUP]:
-                if symbol in son_midas_setup_sinyalleri and time.time() - son_midas_setup_sinyalleri[symbol] < 14400: continue
-                
-                klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=1h&limit=50")
-                if not isinstance(klines, list) or len(klines) < 50: continue
-                
-                highs = [float(k[2]) for k in klines]
-                lows = [float(k[3]) for k in klines]
-                closes = [float(k[4]) for k in klines]
-                vols = [float(k[7]) for k in klines]
-                
-                current_price = closes[-1]
-                recent_highs = highs[-24:]
-                recent_lows = lows[-24:]
-                recent_vols = vols[-24:]
-                
-                # VAH: Son 24 saatin en yükseği, VAL: En düşüğü
-                vah = max(recent_highs)
-                val = min(recent_lows)
-                
-                # POC: En yüksek hacimli mumun kapanışı
-                poc_idx = recent_vols.index(max(recent_vols))
-                poc = closes[-24 + poc_idx] 
-                
-                # Fiyat POC seviyesine çok yakınsa veya altına sarktıysa (Zayıflık)
-                if current_price <= poc * 1.01 and current_price < vah:
-                    
-                    low_1h = min(lows[-1:])
-                    low_4h = min(lows[-4:])
-                    
-                    # Hedefleri mantıklı sırala
-                    hedefler = sorted(list(set([low_1h, low_4h, val])), reverse=True)
-                    hedefler = [h for h in hedefler if h < current_price]
-                    
-                    if len(hedefler) >= 3:
-                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[2]
-                    elif len(hedefler) == 2:
-                        tp1, tp2, tp3 = hedefler[0], hedefler[1], hedefler[1] * 0.98
-                    else:
-                        continue
-                    
-                    stop = vah * 1.02 # VAH'ın hemen üstü (Stop-Loss)
-                    
-                    tp1_pct = ((tp1 - current_price) / current_price) * 100
-                    tp2_pct = ((tp2 - current_price) / current_price) * 100
-                    tp3_pct = ((tp3 - current_price) / current_price) * 100
-                    stop_pct = ((stop - current_price) / current_price) * 100
-
-                    coin = symbol.replace("USDT", "")
-                    
-                    msg = (f"🔻 <b>SETUP SİNYALİ (SHORT): {symbol}</b>\n\n"
-                           f"Fiyat: <b>{akilli_fiyat(current_price)}</b>\n"
-                           f"Hedefler: <b>{akilli_fiyat(tp1)}</b> ({tp1_pct:+.1f}%) → <b>{akilli_fiyat(tp2)}</b> ({tp2_pct:+.1f}%) → <b>{akilli_fiyat(tp3)}</b> ({tp3_pct:+.1f}%)\n"
-                           f"İptal: <b>{akilli_fiyat(stop)}</b> ({stop_pct:+.1f}%) üzerinde\n\n"
-                           f"{coin}, VAH <b>{akilli_fiyat(vah)}</b> ile VAL <b>{akilli_fiyat(val)}</b> arasında havada asılı kaldı. Merkezde POC <b>{akilli_fiyat(poc)}</b> var ve şu an hakem konumunda. Fiyat <b>{akilli_fiyat(current_price)}</b> ile onun üzerinde tutunmaya çalışıyor ancak yukarı ivme zayıf. 🧊\n\n"
-                           f"Kilit ayrım: POC kaybı aşağıya ilk olarak 1s dip <b>{akilli_fiyat(low_1h)}</b> ve 4s dip <b>{akilli_fiyat(low_4h)}</b> yolunu açar. Akış borsalarda senkronize, zayıflık devam ederse VAL <b>{akilli_fiyat(val)}</b> hedefe girer. 🎯")
-                    
-                    if tg(C, msg):
-                        son_midas_setup_sinyalleri[symbol] = time.time()
-                        log("MIDAS_SETUP", f"🔥 SİNYAL: {symbol} (SHORT)")
-                
-                time.sleep(0.1)
-            time.sleep(MIDAS_SETUP_ARALIGI)
-        except Exception as e:
-            log("MIDAS_SETUP", f"Hata: {e}")
-            time.sleep(60)
-
-# =====================================================
-# 8. MOTOR: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
+# MOTOR 9: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
 # =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Kırılım Motoru Başladı.")
@@ -555,7 +594,7 @@ def ath_atl_loop():
         try:
             tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ATH_ATL]
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ATH_ATL]
             
             for symbol in adaylar:
                 if symbol in son_ath_atl_sinyalleri and time.time() - son_ath_atl_sinyalleri[symbol] < 86400: continue
@@ -610,7 +649,7 @@ def ath_atl_loop():
             time.sleep(60)
 
 # =====================================================
-# 9. MOTOR: ICHIMOKU BULUTU
+# MOTOR 10: ICHIMOKU BULUTU
 # =====================================================
 def ichimoku_loop():
     log("ICHIMOKU", "Zırhlı Ichimoku Bulut Motoru Başladı.")
@@ -619,7 +658,7 @@ def ichimoku_loop():
         try:
             tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
-            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ICHIMOKU]
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_ICHIMOKU]
             
             for symbol in adaylar:
                 if symbol in son_ichimoku_sinyalleri and time.time() - son_ichimoku_sinyalleri[symbol] < 14400: continue
@@ -662,12 +701,7 @@ def ichimoku_loop():
                 cloud_top_prev = max(span_a_prev, span_b_prev)
                 cloud_bottom_prev = min(span_a_prev, span_b_prev)
 
-                sinyal = None
-                yon = ""
-                emoji = ""
-                stop = 0
-                hedef = 0
-                aciklama = ""
+                sinyal = None; yon = ""; emoji = ""; stop = 0; hedef = 0; aciklama = ""
 
                 if prev_close <= cloud_top_prev and curr_close > cloud_top_curr and curr_close > kijun_curr and tenkan_curr > kijun_curr:
                     if cloud_thickness > (curr_close * 0.005):
@@ -710,6 +744,310 @@ def ichimoku_loop():
             time.sleep(60)
 
 # =====================================================
+# MOTOR 11: GRAFİK FORMASYONLARI (CHART PATTERNS + FINCAN & KULP)
+# =====================================================
+def chart_patterns_loop():
+    log("PATTERN", "Formasyon Avcısı Başladı (İkili Tepe/Dip, OBO, Fincan & Kulp).")
+    time.sleep(150)
+    while True:
+        try:
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            adaylar = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) >= MIN_HACIM_PATTERN]
+            
+            for symbol in adaylar:
+                if symbol in son_chart_pattern_sinyalleri and time.time() - son_chart_pattern_sinyalleri[symbol] < 14400: continue
+                
+                for tf in ['4h', '1d', '3d']:
+                    klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=100")
+                    if not isinstance(klines, list) or len(klines) < 50: continue
+                    
+                    highs = [float(k[2]) for k in klines]
+                    lows = [float(k[3]) for k in klines]
+                    closes = [float(k[4]) for k in klines]
+                    vols = [float(k[7]) for k in klines]
+                    
+                    curr_close = closes[-2] 
+                    curr_vol = vols[-2]
+                    avg_vol = sum(vols[-22:-2]) / 20 
+                    
+                    if curr_vol < avg_vol * 1.2: continue
+
+                    p_highs, p_lows = find_pivots(highs, lows) 
+                    
+                    sinyal = None; formasyon_adi = ""; yon = ""; emoji = ""; hedef = 0; stop = 0; neckline = 0
+                    
+                    if len(p_highs) >= 2:
+                        p1_idx, p1_price = p_highs[-2]
+                        p2_idx, p2_price = p_highs[-1]
+                        if 5 <= (p2_idx - p1_idx) <= 30 and abs(p1_price - p2_price) / p1_price <= 0.02:
+                            neckline = min(lows[p1_idx:p2_idx+1])
+                            if curr_close < neckline * 0.99:
+                                sinyal = True; formasyon_adi = "İkili Tepe (M)"; yon = "SHORT"; emoji = "🔻"
+                                stop = max(p1_price, p2_price) * 1.02
+                                hedef = neckline - (max(p1_price, p2_price) - neckline)
+
+                    if not sinyal and len(p_lows) >= 2:
+                        p1_idx, p1_price = p_lows[-2]
+                        p2_idx, p2_price = p_lows[-1]
+                        if 5 <= (p2_idx - p1_idx) <= 30 and abs(p1_price - p2_price) / p1_price <= 0.02:
+                            neckline = max(highs[p1_idx:p2_idx+1])
+                            if curr_close > neckline * 1.01:
+                                sinyal = True; formasyon_adi = "İkili Dip (W)"; yon = "LONG"; emoji = "🚀"
+                                stop = min(p1_price, p2_price) * 0.98
+                                hedef = neckline + (neckline - min(p1_price, p2_price))
+
+                    if not sinyal and len(p_highs) >= 3:
+                        p1_idx, p1_price = p_highs[-3]
+                        p2_idx, p2_price = p_highs[-2] 
+                        p3_idx, p3_price = p_highs[-1] 
+                        if p2_price > p1_price and p2_price > p3_price and abs(p1_price - p3_price) / p1_price <= 0.03:
+                            neckline = min(lows[p1_idx:p3_idx+1])
+                            if curr_close < neckline * 0.99:
+                                sinyal = True; formasyon_adi = "Omuz-Baş-Omuz"; yon = "SHORT"; emoji = "💀"
+                                stop = p3_price * 1.02
+                                hedef = neckline - (p2_price - neckline)
+
+                    if not sinyal and len(p_lows) >= 3:
+                        p1_idx, p1_price = p_lows[-3]
+                        p2_idx, p2_price = p_lows[-2] 
+                        p3_idx, p3_price = p_lows[-1] 
+                        if p2_price < p1_price and p2_price < p3_price and abs(p1_price - p3_price) / p1_price <= 0.03:
+                            neckline = max(highs[p1_idx:p3_idx+1])
+                            if curr_close > neckline * 1.01:
+                                sinyal = True; formasyon_adi = "Ters Omuz-Baş-Omuz"; yon = "LONG"; emoji = "🚀"
+                                stop = p3_price * 0.98
+                                hedef = neckline + (neckline - p2_price)
+
+                    if not sinyal and len(p_highs) >= 2 and len(p_lows) >= 1:
+                        left_rim_idx, left_rim = p_highs[-2]
+                        cup_low_idx, cup_low = p_lows[-1]
+                        right_rim_idx, right_rim = p_highs[-1]
+                        if left_rim_idx < cup_low_idx < right_rim_idx and abs(left_rim - right_rim) / left_rim <= 0.05:
+                            cup_depth = (left_rim - cup_low) / left_rim
+                            if cup_depth > 0.05:
+                                if curr_close > right_rim * 1.01:
+                                    sinyal = True; formasyon_adi = "Fincan ve Kulp (Cup & Handle)"; yon = "LONG"; emoji = "☕"
+                                    neckline = right_rim
+                                    hedef = right_rim + (right_rim - cup_low)
+                                    stop = cup_low * 1.02
+
+                    if not sinyal and len(p_lows) >= 2 and len(p_highs) >= 1:
+                        left_rim_idx, left_rim = p_lows[-2]
+                        cup_high_idx, cup_high = p_highs[-1]
+                        right_rim_idx, right_rim = p_lows[-1]
+                        if left_rim_idx < cup_high_idx < right_rim_idx and abs(left_rim - right_rim) / left_rim <= 0.05:
+                            cup_depth = (cup_high - left_rim) / left_rim
+                            if cup_depth > 0.05:
+                                if curr_close < right_rim * 0.99:
+                                    sinyal = True; formasyon_adi = "Ters Fincan ve Kulp"; yon = "SHORT"; emoji = "☕"
+                                    neckline = right_rim
+                                    hedef = right_rim - (cup_high - right_rim)
+                                    stop = cup_high * 0.98
+
+                    if sinyal:
+                        hedef_pct = ((hedef - curr_close) / curr_close) * 100
+                        stop_pct = ((stop - curr_close) / curr_close) * 100
+                        
+                        if yon == "SHORT" and hedef >= curr_close: continue
+                        if yon == "LONG" and hedef <= curr_close: continue
+                        if abs(stop_pct) > 15.0: continue 
+                        if abs(hedef_pct) < 1.5 or abs(hedef_pct) > 40.0: continue
+                        if yon == "SHORT" and curr_close < hedef * 1.01: continue
+                        if yon == "LONG" and curr_close > hedef * 0.99: continue
+
+                        aciklama = "Fiyat, klasik bir dönüş formasyonunu tamamlayarak boyun çizgisini (Neckline) hacimle kırdı."
+                        if "OBO" in formasyon_adi: aciklama = "Trendin tepe noktasında oluşan klasik dönüş formasyonu. Boyun çizgisi kırıldı, satıcılar kontrolü ele aldı."
+                        if "Dip" in formasyon_adi: aciklama = "Dipte oluşan çift dip formasyonu. Satıcılar tükendi, alıcılar hacimle boyun çizgisini yukarı kırdı."
+                        if "Fincan" in formasyon_adi: aciklama = "Uzun süreli bir birikim (fincan) ve ardından gelen kulp (düzeltme) sonrası direnç kırıldı. Güçlü bir boğa/ayı devam trendi başlıyor olabilir."
+
+                        msg = (f"{emoji} <b>GRAFİK FORMASYONU ({yon}): {symbol}</b>\n"
+                               f"<i>{tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
+                               f"💰 <b>Giriş:</b> {akilli_fiyat(curr_close)}\n"
+                               f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
+                               f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
+                               f"📊 <b>Boyun Çizgisi:</b> {akilli_fiyat(neckline)}\n"
+                               f"📈 <b>Hacim Teyidi:</b> Alındı ({curr_vol/avg_vol:.1f}x)\n\n"
+                               f"💡 <b>Açıklama:</b> {aciklama}")
+                        
+                        if tg(C, msg):
+                            son_chart_pattern_sinyalleri[symbol] = time.time()
+                            log("PATTERN", f"🔥 SİNYAL: {symbol} ({yon} - {formasyon_adi})")
+                            
+                    time.sleep(0.1)
+            time.sleep(CHART_PATTERN_ARALIGI)
+        except Exception as e:
+            log("PATTERN", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# MOTOR 12: TOP GAINERS SHORT AVCISI
+# =====================================================
+def top_gainers_short_loop():
+    log("SHORT_GAINERS", "Top Gainers Short Avcısı Başladı (Kâr Realizasyonu).")
+    time.sleep(180)
+    while True:
+        try:
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            temiz_tickers = [t for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S'])]
+            temiz_tickers.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
+            top_gainers = temiz_tickers[:5]
+
+            for t in top_gainers:
+                symbol = t['symbol']
+                change_pct = float(t['priceChangePercent'])
+                
+                if change_pct < 15: continue
+                
+                if symbol in son_short_gainers_sinyalleri and time.time() - son_short_gainers_sinyalleri[symbol] < 43200: continue
+                
+                klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=50")
+                if not isinstance(klines, list) or len(klines) < 50: continue
+                
+                closes = [float(k[4]) for k in klines[:-1]]
+                highs = [float(k[2]) for k in klines[:-1]]
+                vols = [float(k[7]) for k in klines[:-1]]
+                
+                curr_close = closes[-1]
+                curr_vol = vols[-1]
+                avg_vol = sum(vols[-21:-1]) / 20
+                
+                if curr_vol < avg_vol: continue
+                
+                ema9 = calculate_ema(closes, 9)[-1]
+                ema21 = calculate_ema(closes, 21)[-1]
+                rsi = calculate_rsi(closes)
+                
+                recent_high = max(highs[-20:])
+                drop_from_top = ((recent_high - curr_close) / recent_high) * 100
+                
+                if rsi > 55 and ema9 < ema21 and curr_close < closes[-2] and drop_from_top > 2.0:
+                    sl = recent_high * 1.01
+                    tp1 = curr_close * 0.95
+                    tp2 = curr_close * 0.90
+                    
+                    msg = (f"🩸 <b>TOP GAINERS SHORT FIRSATI: {symbol}</b>\n"
+                           f"<i>15m Grafik - Kâr Realizasyonu</i>\n\n"
+                           f"⚠️ <i>Coin 24 saatte <b>+{change_pct:.1f}%</b> yükselmiş ve aşırı alım (Overbought) bölgesinde. Balina çıkışı / Short fırsatı başlıyor olabilir!</i>\n\n"
+                           f"💰 <b>Giriş (Short):</b> {akilli_fiyat(curr_close)}\n"
+                           f"🛑 <b>Stop-Loss (İptal):</b> {akilli_fiyat(sl)}\n"
+                           f"🎯 <b>Hedef 1:</b> {akilli_fiyat(tp1)} (-5.0%)\n"
+                           f"🎯 <b>Hedef 2:</b> {akilli_fiyat(tp2)} (-10.0%)\n\n"
+                           f"📊 <b>RSI:</b> {rsi:.1f} (Aşırı Alımdan Dönüş)\n"
+                           f"📉 <b>EMA:</b> 9 Periyot, 21'in altına sarktı (Ölüm Kesişimi)\n"
+                           f"🔊 <b>Hacim:</b> Satış hacmi ortalamanın üzerinde\n\n"
+                           f"💡 <b>Strateji:</b> En çok yükselenler listesine giren coinlerde, trendin kırıldığı ve kâr satışlarının başladığı noktada kısa pozisyon (Short) alınır.")
+                    
+                    if tg(C, msg):
+                        son_short_gainers_sinyalleri[symbol] = time.time()
+                        log("SHORT_GAINERS", f"🔥 SİNYAL: {symbol} (SHORT)")
+                        
+            time.sleep(SHORT_GAINERS_ARALIGI)
+        except Exception as e:
+            log("SHORT_GAINERS", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# MOTOR 13: 1 SAATLİK EN ÇOK HAREKET EDENLER (TOP MOVERS)
+# =====================================================
+def top_movers_loop():
+    log("TOP_MOVERS", "Saatlik En Çok Hareket Edenler Raporu Başladı.")
+    time.sleep(200)
+    while True:
+        try:
+            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            if not isinstance(tickers, list): time.sleep(60); continue
+            
+            # Hacmi yüksek olanları al
+            temiz_tickers = [t for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in YASAKLI_HISSELER and not any(x in t['symbol'] for x in ['3L', '3S', '5L', '5S']) and float(t.get('quoteVolume', 0)) > MIN_HACIM_MOVERS]
+            
+            saatlik_veriler = []
+            for t in temiz_tickers:
+                symbol = t['symbol']
+                klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval=1h&limit=2")
+                if not isinstance(klines, list) or len(klines) < 2: continue
+                
+                open_price = float(klines[-2][1])
+                close_price = float(klines[-2][4])
+                
+                if open_price == 0: continue
+                
+                degisim = ((close_price - open_price) / open_price) * 100
+                saatlik_veriler.append({'symbol': symbol, 'change': degisim, 'price': close_price})
+                
+                time.sleep(0.05) # API limitini koru
+
+            if not saatlik_veriler: 
+                time.sleep(TOP_MOVERS_ARALIGI)
+                continue
+                
+            saatlik_veriler.sort(key=lambda x: x['change'], reverse=True)
+            
+            top_3_up = saatlik_veriler[:3]
+            top_3_down = saatlik_veriler[-3:]
+            top_3_down.reverse() # En çok düşenden en aza doğru sırala
+
+            msg = "⏱️ <b>Son 1 Saatin Hareketlileri</b>\n\n"
+            msg += "🟢 <b>En Çok Yükselenler:</b>\n"
+            for i, item in enumerate(top_3_up):
+                sym = item['symbol'].replace("USDT", "")
+                msg += f"{i+1}. <b>{sym}</b> +{item['change']:.2f}% | {akilli_fiyat(item['price'])}\n"
+                
+            msg += "\n🔴 <b>En Çok Düşenler:</b>\n"
+            for i, item in enumerate(top_3_down):
+                sym = item['symbol'].replace("USDT", "")
+                msg += f"{i+1}. <b>{sym}</b> {item['change']:.2f}% | {akilli_fiyat(item['price'])}\n"
+                
+            tg(C, msg)
+            time.sleep(TOP_MOVERS_ARALIGI)
+        except Exception as e:
+            log("TOP_MOVERS", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
+# MOTOR 14: BTC DOMİNANS TAKİBİ (PİYASA YÖNÜ)
+# =====================================================
+def dominans_loop():
+    log("DOMINANS", "Piyasa Yönü ve BTC Dominans Motoru Başladı.")
+    time.sleep(240)
+    while True:
+        try:
+            # CoinGecko API'sinden Global verileri çek
+            data = gj("https://api.coingecko.com/api/v3/global")
+            if not data or 'data' not in data: 
+                time.sleep(DOMINANS_ARALIGI)
+                continue
+                
+            btc_d = data['data']['market_cap_percentage']['btc']
+            eth_d = data['data']['market_cap_percentage']['eth']
+            
+            # Dominans yönünü anlamak için basit bir trend kontrolü
+            yon = "🟢 Yükselişte"
+            aciklama = "Piyasadaki para Bitcoin'e akıyor. Altcoinlerde (küçük coinlerde) dikkatli olunmalı. BTC ağırlıklı işlemler ön planda."
+            emoji = "👑"
+
+            # Eğer BTC.D 59'un altındaysa veya düşüş eğilimindeyse genelde altcoin sezonudur.
+            if btc_d < 58.0 or (btc_d < 60.0 and eth_d > 12.0):
+                yon = "🔴 Düşüşte (Altcoin Sezonu)"
+                aciklama = "Bitcoin Dominansı zayıflıyor. Piyasadaki para Altcoinlere kayıyor. Küçük coinlerde sert yükselişler (Pump) görülebilir."
+                emoji = "🔥"
+                
+            msg = (f"{emoji} <b>PİYASA YÖNÜ & DOMİNANS RAPORU</b>\n\n"
+                   f"🪙 <b>BTC Dominansı:</b> %{btc_d:.2f}\n"
+                   f"💎 <b>ETH Dominansı:</b> %{eth_d:.2f}\n\n"
+                   f"📊 <b>Durum:</b> {yon}\n"
+                   f"💡 <b>Değerlendirme:</b> {aciklama}")
+            
+            tg(C, msg)
+            time.sleep(DOMINANS_ARALIGI)
+        except Exception as e:
+            log("DOMINANS", f"Hata: {e}")
+            time.sleep(60)
+
+# =====================================================
 # RENDER WEB SUNUCUSU
 # =====================================================
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -729,14 +1067,20 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
-    threading.Thread(target=midas_flow_loop, daemon=True).start()
+    threading.Thread(target=top_gainers_loop, daemon=True).start()
+    threading.Thread(target=pump_winner_loop, daemon=True).start()
+    
     threading.Thread(target=chartist_loop, daemon=True).start()
     threading.Thread(target=pump_loop, daemon=True).start()
+    threading.Thread(target=volatilite_loop, daemon=True).start()
     threading.Thread(target=formasyon_loop, daemon=True).start()
     threading.Thread(target=ema_ribbon_loop, daemon=True).start()
     threading.Thread(target=macd_loop, daemon=True).start()
-    threading.Thread(target=midas_setup_loop, daemon=True).start()
     threading.Thread(target=ath_atl_loop, daemon=True).start()
     threading.Thread(target=ichimoku_loop, daemon=True).start()
+    threading.Thread(target=chart_patterns_loop, daemon=True).start()
+    threading.Thread(target=top_gainers_short_loop, daemon=True).start()
+    threading.Thread(target=top_movers_loop, daemon=True).start() # YENİ
+    threading.Thread(target=dominans_loop, daemon=True).start()   # YENİ
     
     run_web_server()
