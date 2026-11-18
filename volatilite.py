@@ -7,6 +7,9 @@ import socket
 import os
 import threading
 import http.server
+import zlib
+import struct
+import uuid
 from datetime import datetime, timedelta, timezone
 
 # =====================================================
@@ -33,7 +36,8 @@ FORMASYON_ARALIGI = 3600      # 1 Saat
 EMA_RIBBON_ARALIGI = 3600     # 1 Saat
 SMA200_ARALIGI = 3600         # 1 Saat
 MACD_ARALIGI = 3600           # 1 Saat
-ATH_ATL_ARALIGI = 3600        # 1 Saat
+ATH_ATL_ARALIGI = 3600        # 1 Saat (Kapanmış mum, 200+ gün)
+ANLIK_ATH_ATL_ARALIGI = 180   # 3 Dakika (Anlık ATH/ATL + Grafik)
 ICHIMOKU_ARALIGI = 3600       # 1 Saat
 CHART_PATTERN_ARALIGI = 1800  # 30 Dakika
 TOP_MOVERS_ARALIGI = 3600     # 1 Saat
@@ -52,6 +56,7 @@ MIN_HACIM_EMA_RIBBON = 10_000_000
 MIN_HACIM_SMA200 = 5_000_000
 MIN_HACIM_MACD = 10_000_000
 MIN_HACIM_ATH_ATL = 5_000_000
+MIN_HACIM_ANLIK_ATH_ATL = 3_000_000
 MIN_HACIM_ICHIMOKU = 10_000_000
 MIN_HACIM_PATTERN = 15_000_000
 MIN_HACIM_MOVERS = 5_000_000
@@ -77,6 +82,7 @@ son_ema_ribbon_sinyalleri = {}
 son_sma200_sinyalleri = {}
 son_macd_sinyalleri = {}
 son_ath_atl_sinyalleri = {}
+son_anlik_ath_atl_sinyalleri = {}
 son_ichimoku_sinyalleri = {}
 son_chart_pattern_sinyalleri = {}
 
@@ -140,6 +146,15 @@ def akilli_fiyat(p):
     return f"{p:.8f}"
 
 
+def format_hacim(v):
+    v = float(v)
+    if v >= 1_000_000_000:
+        return f"{v / 1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.0f}M"
+    return f"{v / 1_000:.0f}K"
+
+
 def tg(chat_id, message):
     global _telegram_status
     if not T or not chat_id:
@@ -177,6 +192,203 @@ def tg(chat_id, message):
         _telegram_status = f"Hata: {e}"
         log("TELEGRAM", f"Gönderim hatası: {e}")
         return False
+
+
+def tg_photo(chat_id, png_bytes, caption):
+    """Ek kütüphanesiz multipart/form-data ile Telegram'a grafik PNG gönderir."""
+    global _telegram_status
+    if not T or not chat_id:
+        return False
+    if not png_bytes:
+        return tg(chat_id, caption)
+    boundary = f"----BotBoundary{uuid.uuid4().hex}"
+    parts = []
+    for name, val in (("chat_id", str(chat_id)), ("caption", caption), ("parse_mode", "HTML")):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n".encode("utf-8")
+        )
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"chart.png\"\r\n"
+        f"Content-Type: image/png\r\n\r\n".encode("utf-8") + png_bytes + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{T}/sendPhoto",
+            data=body,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body))
+            }
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            ok = res.get("ok", False)
+            if ok:
+                _telegram_status = "OK"
+                return True
+    except Exception as e:
+        log("TELEGRAM", f"Fotoğraf gönderim hatası, metin olarak deneniyor: {e}")
+    return tg(chat_id, caption)
+
+
+# =====================================================
+# SAF PYTHON GRAFİK PNG ÇİZİCİ (Ek kütüphane gerektirmez)
+# =====================================================
+_FONT_5X7 = {
+    "0": [0x0E,0x11,0x13,0x15,0x19,0x11,0x0E], "1": [0x04,0x0C,0x04,0x04,0x04,0x04,0x0E],
+    "2": [0x0E,0x11,0x01,0x06,0x08,0x10,0x1F], "3": [0x1F,0x02,0x04,0x06,0x01,0x11,0x0E],
+    "4": [0x02,0x06,0x0A,0x12,0x1F,0x02,0x02], "5": [0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E],
+    "6": [0x06,0x08,0x10,0x1E,0x11,0x11,0x0E], "7": [0x1F,0x01,0x02,0x04,0x08,0x08,0x08],
+    "8": [0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E], "9": [0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C],
+    "A": [0x0E,0x11,0x11,0x1F,0x11,0x11,0x11], "B": [0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E],
+    "C": [0x0E,0x11,0x10,0x10,0x10,0x11,0x0E], "D": [0x1C,0x12,0x11,0x11,0x11,0x12,0x1C],
+    "E": [0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F], "F": [0x1F,0x10,0x10,0x1E,0x10,0x10,0x10],
+    "G": [0x0E,0x11,0x10,0x17,0x11,0x11,0x0F], "H": [0x11,0x11,0x11,0x1F,0x11,0x11,0x11],
+    "I": [0x0E,0x04,0x04,0x04,0x04,0x04,0x0E], "J": [0x07,0x02,0x02,0x02,0x12,0x12,0x0C],
+    "K": [0x11,0x12,0x14,0x18,0x14,0x12,0x11], "L": [0x10,0x10,0x10,0x10,0x10,0x10,0x1F],
+    "M": [0x11,0x1B,0x15,0x15,0x11,0x11,0x11], "N": [0x11,0x19,0x15,0x13,0x11,0x11,0x11],
+    "O": [0x0E,0x11,0x11,0x11,0x11,0x11,0x0E], "P": [0x1E,0x11,0x11,0x1E,0x10,0x10,0x10],
+    "Q": [0x0E,0x11,0x11,0x11,0x15,0x12,0x0D], "R": [0x1E,0x11,0x11,0x1E,0x14,0x12,0x11],
+    "S": [0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E], "T": [0x1F,0x04,0x04,0x04,0x04,0x04,0x04],
+    "U": [0x11,0x11,0x11,0x11,0x11,0x11,0x0E], "V": [0x11,0x11,0x11,0x11,0x11,0x0A,0x04],
+    "W": [0x11,0x11,0x11,0x15,0x15,0x1B,0x11], "X": [0x11,0x11,0x0A,0x04,0x0A,0x11,0x11],
+    "Y": [0x11,0x11,0x0A,0x04,0x04,0x04,0x04], "Z": [0x1F,0x01,0x02,0x04,0x08,0x10,0x1F],
+    ".": [0x00,0x00,0x00,0x00,0x00,0x0C,0x0C], "-": [0x00,0x00,0x00,0x1F,0x00,0x00,0x00],
+    "+": [0x00,0x04,0x04,0x1F,0x04,0x04,0x00], "%": [0x19,0x19,0x02,0x04,0x08,0x13,0x13],
+    ":": [0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00], "/": [0x01,0x02,0x02,0x04,0x08,0x08,0x10],
+    " ": [0x00,0x00,0x00,0x00,0x00,0x00,0x00],
+}
+
+
+def render_chart_png(symbol, klines, title_text):
+    """Saf Python ile Mum + Hacim + RSI koyu tema PNG grafik üretir."""
+    if not klines or len(klines) < 2:
+        return None
+    bars = klines[-50:]
+    W, H = 720, 460
+    BG = (20, 22, 27)
+    GRID = (42, 46, 55)
+    GREEN = (14, 173, 128)
+    RED = (234, 67, 83)
+    TEXT = (225, 229, 236)
+    RSI_CLR = (78, 185, 166)
+    LINE_CLR = (245, 190, 65)
+
+    img = bytearray(BG * (W * H))
+
+    def set_px(x, y, clr):
+        if 0 <= x < W and 0 <= y < H:
+            i = (y * W + x) * 3
+            img[i], img[i + 1], img[i + 2] = clr
+
+    def fill_rect(x0, y0, x1, y1, clr):
+        x0, x1 = max(0, min(x0, x1)), min(W - 1, max(x0, x1))
+        y0, y1 = max(0, min(y0, y1)), min(H - 1, max(y0, y1))
+        for yy in range(y0, y1 + 1):
+            row_start = (yy * W + x0) * 3
+            img[row_start:row_start + (x1 - x0 + 1) * 3] = bytes(clr) * (x1 - x0 + 1)
+
+    def draw_line(x0, y0, x1, y1, clr):
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx + dy
+        while True:
+            set_px(x0, y0, clr)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy; x0 += sx
+            if e2 <= dx:
+                err += dx; y0 += sy
+
+    def draw_text(x, y, text, clr=TEXT, scale=2):
+        cx = x
+        for ch in str(text).upper():
+            glyph = _FONT_5X7.get(ch, _FONT_5X7[" "])
+            for r in range(7):
+                bits = glyph[r]
+                for c in range(5):
+                    if bits & (1 << (4 - c)):
+                        fill_rect(cx + c * scale, y + r * scale, cx + c * scale + scale - 1, y + r * scale + scale - 1, clr)
+            cx += 6 * scale
+
+    L, R = 66, W - 24
+    P_TOP, P_BOT = 36, 290
+    V_TOP, V_BOT = 304, 368
+    R_TOP, R_BOT = 382, 442
+
+    for y_g in (P_TOP, 99, 163, 226, P_BOT, V_TOP, V_BOT, R_TOP, 412, R_BOT):
+        draw_line(L, y_g, R, y_g, GRID)
+    draw_line(L, P_TOP, L, R_BOT, GRID)
+    draw_line(R, P_TOP, R, R_BOT, GRID)
+
+    opens = [float(k[1]) for k in bars]
+    highs = [float(k[2]) for k in bars]
+    lows = [float(k[3]) for k in bars]
+    closes = [float(k[4]) for k in bars]
+    vols = [float(k[7]) for k in bars]
+
+    p_min, p_max = min(lows), max(highs)
+    if p_max <= p_min:
+        p_max = p_min * 1.01 + 1e-9
+    pad = (p_max - p_min) * 0.08
+    p_min, p_max = p_min - pad, p_max + pad
+    v_max = max(vols) if max(vols) > 0 else 1.0
+
+    def py(val):
+        return int(P_BOT - ((val - p_min) / (p_max - p_min)) * (P_BOT - P_TOP))
+
+    n = len(bars)
+    slot = (R - L) / max(n, 1)
+    bw = max(2, int(slot * 0.68))
+
+    for i in range(n):
+        xc = int(L + (i + 0.5) * slot)
+        clr = GREEN if closes[i] >= opens[i] else RED
+        draw_line(xc, py(highs[i]), xc, py(lows[i]), clr)
+        y_o, y_c = py(opens[i]), py(closes[i])
+        if abs(y_o - y_c) < 2:
+            y_c = y_o + 2
+        fill_rect(xc - bw // 2, min(y_o, y_c), xc + bw // 2, max(y_o, y_c), clr)
+        vh = int((vols[i] / v_max) * (V_BOT - V_TOP))
+        fill_rect(xc - bw // 2, V_BOT - vh, xc + bw // 2, V_BOT, clr)
+
+    y_last = py(closes[-1])
+    for xx in range(L, R, 6):
+        draw_line(xx, y_last, min(xx + 3, R), y_last, LINE_CLR)
+
+    if n >= 15:
+        rsi_pts = []
+        for i in range(14, n):
+            rv = calculate_rsi(closes[:i + 1], 14)
+            rx = int(L + (i + 0.5) * slot)
+            ry = int(R_BOT - (rv / 100.0) * (R_BOT - R_TOP))
+            rsi_pts.append((rx, ry))
+        for j in range(1, len(rsi_pts)):
+            draw_line(rsi_pts[j - 1][0], rsi_pts[j - 1][1], rsi_pts[j][0], rsi_pts[j][1], RSI_CLR)
+
+    draw_text(L, 12, title_text, TEXT, scale=2)
+    draw_text(6, P_TOP, akilli_fiyat(p_max)[:8], TEXT, scale=1)
+    draw_text(6, (P_TOP + P_BOT) // 2, akilli_fiyat((p_max + p_min) / 2)[:8], TEXT, scale=1)
+    draw_text(6, P_BOT - 7, akilli_fiyat(p_min)[:8], TEXT, scale=1)
+    draw_text(6, V_TOP + 2, "VOL", TEXT, scale=1)
+    draw_text(6, R_TOP + 2, "RSI", TEXT, scale=1)
+
+    raw_rows = bytearray()
+    stride = W * 3
+    for y in range(H):
+        raw_rows.append(0)
+        raw_rows.extend(img[y * stride:(y + 1) * stride])
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw_rows), 6)) + chunk(b"IEND", b"")
 
 
 def _source_blocked(source):
@@ -1230,7 +1442,7 @@ def sma200_loop():
 
 
 # =====================================================
-# MOTOR 12: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
+# MOTOR 12: TARİHİ ZİRVE / DİP KIRILIMI (1d Kapanış)
 # =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Kırılım Motoru Başladı.")
@@ -1389,7 +1601,72 @@ def chart_patterns_loop():
 
 
 # =====================================================
-# MOTOR 14: SON 1 SAATİN HAREKETLİLERİ (TOP MOVERS)
+# MOTOR 14: ANLIK ALL-TIME HIGH / LOW (Yeni Coinler + PNG Grafik)
+# =====================================================
+def anlik_ath_atl_loop():
+    log("ANLIK_ATH_ATL", "Anlık Tarihi Zirve/Dip + Grafik Motoru Başladı.")
+    time.sleep(160)
+    while True:
+        try:
+            tickers, src = get_futures_tickers()
+            if not tickers:
+                time.sleep(60)
+                continue
+            for t in filter_candidates(tickers, MIN_HACIM_ANLIK_ATH_ATL, MAX_TARAMA):
+                symbol = t["symbol"]
+                curr_price = t["lastPrice"]
+                if curr_price <= 0:
+                    continue
+                ks = get_klines(symbol, "1d", 500, source=src)
+                if not isinstance(ks, list) or len(ks) < 2:
+                    continue
+
+                prior_highs = [float(k[2]) for k in ks[:-1]]
+                prior_lows = [float(k[3]) for k in ks[:-1]]
+                prior_ath = max(prior_highs)
+                prior_atl = min(prior_lows)
+                today_high = float(ks[-1][2])
+                today_low = float(ks[-1][3])
+
+                tip = None
+                if curr_price < prior_atl and curr_price <= today_low * 1.003:
+                    tip = "ATL"
+                elif curr_price > prior_ath and curr_price >= today_high * 0.997:
+                    tip = "ATH"
+
+                if not tip:
+                    continue
+                ckey = f"{tip}_{symbol}"
+                if ckey in son_anlik_ath_atl_sinyalleri and time.time() - son_anlik_ath_atl_sinyalleri[ckey] < 86400:
+                    continue
+
+                chg = t["priceChangePercent"]
+                vol_txt = format_hacim(t["quoteVolume"])
+                if tip == "ATL":
+                    caption = (
+                        f"#{symbol} ${akilli_fiyat(curr_price)} <b>all time low</b> 👎🚨😭\n"
+                        f"24s <b>{chg:+.2f}%</b> | Hacim <b>{vol_txt}</b>\n"
+                        f"📉 Önceki Tarihi Dip: {akilli_fiyat(prior_atl)} ({len(prior_lows)} günlük geçmiş)"
+                    )
+                else:
+                    caption = (
+                        f"#{symbol} ${akilli_fiyat(curr_price)} <b>all time high</b> 🚀🔥🏆\n"
+                        f"24s <b>{chg:+.2f}%</b> | Hacim <b>{vol_txt}</b>\n"
+                        f"📈 Önceki Tarihi Zirve: {akilli_fiyat(prior_ath)} ({len(prior_highs)} günlük geçmiş)"
+                    )
+
+                png = render_chart_png(symbol, ks, f"{symbol} 1D {tip}")
+                if tg_photo(C, png, caption):
+                    son_anlik_ath_atl_sinyalleri[ckey] = time.time()
+                    log("ANLIK_ATH_ATL", f"Grafikli {tip} sinyali gönderildi: {symbol}")
+            time.sleep(ANLIK_ATH_ATL_ARALIGI)
+        except Exception as e:
+            log("ANLIK_ATH_ATL", f"Hata: {e}")
+            time.sleep(60)
+
+
+# =====================================================
+# MOTOR 15: SON 1 SAATİN HAREKETLİLERİ (TOP MOVERS)
 # =====================================================
 def top_movers_loop():
     log("TOP_MOVERS", "Son 1 Saatin Hareketlileri Motoru Başladı.")
@@ -1455,7 +1732,7 @@ def startup_health_check():
 class Handler(http.server.BaseHTTPRequestHandler):
     def _status_bytes(self):
         lines = [
-            "Ultimate Futures Bot - Canli Durum (14 Motor)",
+            "Ultimate Futures Bot - Canli Durum (15 Motor)",
             f"Saat (TR): {simdi().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Telegram: {_telegram_status}",
             f"Aktif Futures Kaynagi: {_active_futures_source}",
@@ -1511,5 +1788,6 @@ if __name__ == "__main__":
     threading.Thread(target=sma200_loop, daemon=True).start()
     threading.Thread(target=ath_atl_loop, daemon=True).start()
     threading.Thread(target=chart_patterns_loop, daemon=True).start()
+    threading.Thread(target=anlik_ath_atl_loop, daemon=True).start()
     threading.Thread(target=top_movers_loop, daemon=True).start()
     run_web_server()
