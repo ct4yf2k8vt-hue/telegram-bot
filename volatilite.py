@@ -21,6 +21,7 @@ T = os.environ.get("BOT_TOKEN", "").strip()
 C = os.environ.get("CHAT_ID", "1623907197").strip()
 
 TR_Saati = timezone(timedelta(hours=3))
+BASE = "https://api.binance.com"
 FAPI = "https://fapi.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
@@ -109,12 +110,12 @@ def tg(chat_id, message):
         return False
 
 son_uyari = {"t": 0}
-ban = {"until": 0}
+ban = {"fapi": 0, "spot": 0}
 istek_kuyrugu = collections.deque()
 kuyruk_kilit = threading.Lock()
 ticker_kilit = threading.Lock()
 ticker_cache = {"t": 0, "data": None}
-BUTCE = 1000  # dakikada en fazla bu kadar Binance ağırlığı (limit 2400)
+BUTCE = 1000  # dakikada en fazla bu kadar Binance ağırlığı
 
 IPUCLARI = {
     "HTTP 451": "Binance bu sunucunun bölgesini engelliyor. Render'da servisi Frankfurt veya Singapore bölgesinde aç.",
@@ -128,14 +129,14 @@ def api_uyari(neden, url, ek=""):
     son_uyari["t"] = time.time()
     tg(C, f"⚠️ <b>Binance bağlantı sorunu</b>\nNeden: {neden}\nAdres: ...{url.split('?')[0][-40:]}\n{IPUCLARI.get(neden, '')} {ek}")
 
-def ban_ayarla(e):
+def ban_ayarla(e, host):
     ra = e.headers.get("Retry-After") if e.headers else None
     sure = int(ra) if ra and ra.isdigit() else (300 if e.code == 418 else 60)
-    ban["until"] = max(ban["until"], time.time() + sure + 5)
+    ban[host] = max(ban[host], time.time() + sure + 5)
     return sure
 
 def agirlik(url):
-    if "ticker/24hr" in url and "symbol=" not in url: return 40
+    if "ticker/24hr" in url and "symbol=" not in url: return 80 if url.startswith(BASE) else 40
     if "/klines" in url:
         m = re.search(r"limit=(\d+)", url)
         l = int(m.group(1)) if m else 500
@@ -153,7 +154,16 @@ def butce_bekle(w):
         time.sleep(1)
 
 def _istek(url):
-    if time.time() < ban["until"]:
+    host = "fapi" if url.startswith(FAPI) else "spot"
+    # Futures banlıysa ticker/mum verisini otomatik Spot'tan çek
+    if host == "fapi" and time.time() < ban["fapi"]:
+        yol = url[len(FAPI):]
+        if yol.startswith("/fapi/v1/ticker/24hr") or yol.startswith("/fapi/v1/klines"):
+            url = BASE + yol.replace("/fapi/v1/", "/api/v3/", 1)
+            host = "spot"
+        else:
+            return None
+    if time.time() < ban[host]:
         time.sleep(1)
         return None
     butce_bekle(agirlik(url))
@@ -165,8 +175,9 @@ def _istek(url):
         log("API", f"HTTP {e.code} -> {url.split('?')[0][-45:]}")
         ek = ""
         if e.code in (418, 429):
-            sure = ban_ayarla(e)
-            ek = f"Bot {sure // 60 + 1} dk boyunca Binance'e istek atmayacak."
+            sure = ban_ayarla(e, host)
+            ek = f"Bot {sure // 60 + 1} dk boyunca {'Futures' if host == 'fapi' else 'Spot'} isteklerini durdurdu."
+            if host == "fapi": ek += " Spot verisiyle devam edecek."
         if e.code not in (400, 404): api_uyari(f"HTTP {e.code}", url, ek)
         return None
     except Exception as e:
@@ -187,20 +198,22 @@ def gj(url):
             return data
     return _istek(url)
 
-def baglanti_testi():
+def baglanti_testi(host="fapi"):
+    url = f"{FAPI}/fapi/v1/ticker/24hr" if host == "fapi" else f"{BASE}/api/v3/ticker/24hr"
+    ad = "Futures" if host == "fapi" else "Spot"
     try:
-        req = urllib.request.Request(f"{FAPI}/fapi/v1/ticker/24hr", headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read().decode("utf-8"))
         n = len(hacim_filtre(data, MIN_HACIM_PUMP))
-        return True, f"✅ Binance Futures: bağlı ({len(data)} çift, {n} tanesi taranıyor)"
+        return True, f"✅ Binance {ad}: bağlı ({len(data)} çift, {n} tanesi taranıyor)"
     except urllib.error.HTTPError as e:
         ek = ""
         if e.code in (418, 429):
-            ek = f" Yaklaşık {ban_ayarla(e) // 60 + 1} dk sonra tekrar denenecek."
-        return False, f"❌ Binance Futures: HTTP {e.code}\n{IPUCLARI.get(f'HTTP {e.code}', '')}{ek}"
+            ek = f" Yaklaşık {ban_ayarla(e, host) // 60 + 1} dk sonra tekrar denenecek."
+        return False, f"❌ Binance {ad}: HTTP {e.code}\n{IPUCLARI.get(f'HTTP {e.code}', '')}{ek}"
     except Exception as e:
-        return False, f"❌ Binance Futures: {type(e).__name__}"
+        return False, f"❌ Binance {ad}: {type(e).__name__}"
 
 def hacim_filtre(tickers, min_hacim):
     """USDT çiftleri, yasaklı varlıklar hariç, minimum hacim üstü."""
@@ -281,6 +294,7 @@ def trap_radar_check(symbol):
             total = buy_vol + sell_vol
             if total > 0 and (buy_vol / total) * 100 > 55: alici_baskin = True
 
+        if not oi_data and not taker_data: return ""
         if oi_artiyor and alici_baskin: return "🐋 <b>BALİNA TEYİDİ (Gerçek Pump)</b>"
         elif not alici_baskin: return "⚠️ <b>DİKKAT: SAHTE PUMP (TUZAK OLABİLİR)</b>"
         else: return "⚖️ <b>Kısmi Teyit</b>"
@@ -311,7 +325,7 @@ def top_gainers_loop():
             top_5 = temiz[:5]
 
             if top_5:
-                msg = "🔥 <b>Günün En İyi Hareketleri (Binance Futures)</b>\n"
+                msg = f"🔥 <b>Günün En İyi Hareketleri (Binance {'Spot' if time.time() < ban['fapi'] else 'Futures'})</b>\n"
                 msg += "<i>24 saatlik yükseliş ve USDT hacmine göre</i>\n\n"
                 medals = ["🥇", "🥈", "🥉", "🏅", "⭐️"]
                 for i, t in enumerate(top_5):
@@ -1147,8 +1161,14 @@ if __name__ == "__main__":
     for m in motorlar:
         threading.Thread(target=m, daemon=True).start()
 
-    ok, binance_durum = baglanti_testi()
-    bilgi = "İlk rapor birkaç saniye içinde gelecek." if ok else "Bot çalışıyor ama Binance verisi alınamıyor, sinyal gelmez."
+    ok, binance_durum = baglanti_testi("fapi")
+    if ok:
+        bilgi = "İlk rapor birkaç saniye içinde gelecek."
+    else:
+        ok2, spot_durum = baglanti_testi("spot")
+        binance_durum += "\n" + spot_durum
+        bilgi = ("Futures banlı, bot Spot verisiyle çalışıyor. Ban bitince otomatik Futures'a döner."
+                 if ok2 else "Binance verisi alınamıyor, sinyal gelmez.")
     if tg(C, f"🤖 <b>Bot başladı</b> ({simdi().strftime('%d.%m %H:%M')})\n✅ Telegram: bağlı\n{binance_durum}\n\n{bilgi}"):
         log("SİSTEM", "Telegram bağlantısı OK.")
     else:
