@@ -96,8 +96,8 @@ _source_backoff_until = {}
 _source_last_error = {}
 _last_top_gainers_ts = 0
 _last_dominans_ts = 0
-_ticker_cache = {}   # key -> (ts, data, src)
-_kline_cache = {}    # key -> (ts, data, src)
+_ticker_cache = {}
+_kline_cache = {}
 CACHE_TTL_TICKER = 45
 CACHE_TTL_KLINE = 45
 
@@ -238,6 +238,13 @@ def tg_photo(chat_id, png_bytes, caption):
         return False
     if not png_bytes:
         return tg(chat_id, caption)
+
+    safe_caption = caption
+    overflow = False
+    if len(caption) > 1000:
+        safe_caption = caption.split("\n")[0][:900]
+        overflow = True
+
     boundary = uuid.uuid4().hex
     parts = []
 
@@ -248,7 +255,7 @@ def tg_photo(chat_id, png_bytes, caption):
         parts.append(b"\r\n")
 
     add_field("chat_id", chat_id)
-    add_field("caption", caption)
+    add_field("caption", safe_caption)
     add_field("parse_mode", "HTML")
 
     parts.append(f"--{boundary}\r\n".encode("utf-8"))
@@ -268,7 +275,16 @@ def tg_photo(chat_id, png_bytes, caption):
         with urllib.request.urlopen(req, timeout=20) as resp:
             ok = json.loads(resp.read().decode("utf-8")).get("ok", False)
             if ok:
+                if overflow:
+                    tg(chat_id, caption)
                 return True
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="ignore")[:200]
+        except Exception:
+            pass
+        log("TG_PHOTO", f"Fotoğraf HTTP {e.code} (metin gönderilecek): {err_body}")
     except Exception as e:
         log("TG_PHOTO", f"Fotoğraf hatası (metin gönderilecek): {e}")
     return tg(chat_id, caption)
@@ -285,7 +301,6 @@ def get_futures_tickers():
         if c and (now - c[0]) < CACHE_TTL_TICKER and not _source_blocked(c[2]):
             return c[1], c[2]
 
-    # 1. Binance Futures
     data = gj(f"{FAPI}/fapi/v1/ticker/24hr", "FAPI")
     if isinstance(data, list) and len(data) > 0:
         out = [{
@@ -298,7 +313,6 @@ def get_futures_tickers():
             _ticker_cache["FUTURES"] = (now, out, "Binance Futures")
         return out, "Binance Futures"
 
-    # 2. Bybit Linear Futures
     b = gj(f"{BYBIT}/v5/market/tickers?category=linear", "BYBIT")
     if isinstance(b, dict) and b.get("retCode") == 0:
         lst = b.get("result", {}).get("list", [])
@@ -308,14 +322,11 @@ def get_futures_tickers():
             if not sym.endswith("USDT"):
                 continue
             try:
-                pct = float(t.get("price24hPcnt", 0)) * 100.0
-                lp = float(t.get("lastPrice", 0))
-                qv = float(t.get("turnover24h", 0))
                 out.append({
                     "symbol": sym,
-                    "priceChangePercent": pct,
-                    "lastPrice": lp,
-                    "quoteVolume": qv,
+                    "priceChangePercent": float(t.get("price24hPcnt", 0)) * 100.0,
+                    "lastPrice": float(t.get("lastPrice", 0)),
+                    "quoteVolume": float(t.get("turnover24h", 0)),
                 })
             except Exception:
                 continue
@@ -324,7 +335,6 @@ def get_futures_tickers():
                 _ticker_cache["FUTURES"] = (now, out, "Futures (BYBIT)")
             return out, "Futures (BYBIT)"
 
-    # 3. Gate.io Futures
     g = gj(f"{GATE}/futures/usdt/tickers", "GATE")
     if isinstance(g, list) and len(g) > 0:
         out = []
@@ -333,9 +343,8 @@ def get_futures_tickers():
             if not c_name.endswith("_USDT"):
                 continue
             try:
-                sym = c_name.replace("_", "")
                 out.append({
-                    "symbol": sym,
+                    "symbol": c_name.replace("_", ""),
                     "priceChangePercent": float(t.get("change_percentage", 0)),
                     "lastPrice": float(t.get("last", 0)),
                     "quoteVolume": float(t.get("volume_24h_quote", 0)),
@@ -347,7 +356,6 @@ def get_futures_tickers():
                 _ticker_cache["FUTURES"] = (now, out, "Futures (GATE)")
             return out, "Futures (GATE)"
 
-    # 4. Son çare Binance Spot Data-API
     d = gj(f"{DATA_API}/api/v3/ticker/24hr", "DATA_API")
     if isinstance(d, list) and len(d) > 0:
         out = [{
@@ -429,7 +437,6 @@ def get_klines(symbol, interval, limit, market="FUTURES"):
         if c and (now - c[0]) < CACHE_TTL_KLINE and len(c[1]) >= limit:
             return c[1][-limit:], c[2]
 
-    # 1. Binance Futures / Spot
     if market == "FUTURES":
         sources = [("FAPI", f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}", "Binance Futures")]
     else:
@@ -445,7 +452,6 @@ def get_klines(symbol, interval, limit, market="FUTURES"):
                 _kline_cache[cache_key] = (now, k, label)
             return k, label
 
-    # 2. Bybit fallback (8. eleman turnover/quote volume olduğu için indeks 7'ye konur)
     btf = _BYBIT_TF.get(interval)
     if btf and interval != "3d":
         bcat = "linear" if market == "FUTURES" else "spot"
@@ -455,14 +461,12 @@ def get_klines(symbol, interval, limit, market="FUTURES"):
             if raw_list:
                 norm = []
                 for row in reversed(raw_list):
-                    # [openTime, open, high, low, close, baseVol, closeTime, quoteVol]
                     norm.append([int(row[0]), row[1], row[2], row[3], row[4], row[5], int(row[0]), row[6]])
                 blabel = "Futures (BYBIT)" if market == "FUTURES" else "Spot (BYBIT)"
                 with _lock:
                     _kline_cache[cache_key] = (now, norm, blabel)
                 return norm, blabel
 
-    # 3. Gate.io Futures fallback
     gtf = _GATE_TF.get(interval)
     if market == "FUTURES" and gtf and symbol.endswith("USDT"):
         contract = symbol[:-4] + "_USDT"
@@ -477,7 +481,6 @@ def get_klines(symbol, interval, limit, market="FUTURES"):
                 _kline_cache[cache_key] = (now, norm, "Futures (GATE)")
             return norm, "Futures (GATE)"
 
-    # 4. Son çare Binance Data-API
     k = gj(f"{DATA_API}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}", "DATA_API")
     if isinstance(k, list) and len(k) > 0:
         with _lock:
@@ -488,7 +491,7 @@ def get_klines(symbol, interval, limit, market="FUTURES"):
 
 
 # =====================================================
-# TEKNİK ANALİZ VE SAF PYTHON PNG GRAFİK MOTORU
+# TEKNİK ANALİZ YARDIMCILARI
 # =====================================================
 
 def calculate_ema(prices, period):
@@ -499,6 +502,25 @@ def calculate_ema(prices, period):
     for price in prices[period:]:
         ema.append(price * k + ema[-1] * (1.0 - k))
     return ema
+
+
+def calculate_ema_series_aligned(prices, period):
+    if len(prices) < period:
+        return [None] * len(prices)
+    ema_vals = calculate_ema(prices, period)
+    return [None] * (period - 1) + ema_vals
+
+
+def calculate_sma_series_aligned(prices, period):
+    out = [None] * len(prices)
+    if len(prices) < period:
+        return out
+    running = sum(prices[:period])
+    out[period - 1] = running / period
+    for i in range(period, len(prices)):
+        running += prices[i] - prices[i - period]
+        out[i] = running / period
+    return out
 
 
 def calculate_rsi(prices, period=14):
@@ -620,28 +642,38 @@ def trap_radar_check(symbol, ksrc="Futures"):
         return ""
 
 
+# =====================================================
+# SAF PYTHON GÖRSEL MOTORU (CANDLESTICK + KARTLAR)
+# =====================================================
+
 _FONT_5X7 = {
     "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
     "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
     "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+    "Ç": ["01110", "10001", "10000", "10000", "10001", "01110", "00100"],
     "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
     "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
     "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
     "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+    "Ğ": ["01110", "00000", "01110", "10000", "10111", "10001", "01110"],
     "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
     "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    "İ": ["00100", "00000", "01110", "00100", "00100", "00100", "01110"],
     "J": ["00111", "00010", "00010", "00010", "10010", "10010", "01100"],
     "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
     "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
     "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
     "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
     "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "Ö": ["01010", "00000", "01110", "10001", "10001", "10001", "01110"],
     "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
     "Q": ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
     "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
     "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    "Ş": ["01111", "10000", "01110", "00001", "11110", "00100", "01000"],
     "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
     "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "Ü": ["01010", "00000", "10001", "10001", "10001", "10001", "01110"],
     "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
     "W": ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
     "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
@@ -658,86 +690,141 @@ _FONT_5X7 = {
     "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
     "9": ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
     ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+    ",": ["00000", "00000", "00000", "00000", "00110", "00100", "01000"],
     "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
     ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
+    "/": ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
+    "|": ["00100", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "(": ["00010", "00100", "01000", "01000", "01000", "00100", "00010"],
+    ")": ["01000", "00100", "00010", "00010", "00010", "00100", "01000"],
     "$": ["00100", "01111", "10100", "01110", "00101", "11110", "00100"],
     "%": ["11001", "11010", "00010", "00100", "01000", "01011", "10011"],
     " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
 }
 
 
-def render_chart_png(symbol, klines, title_suffix="D1"):
-    try:
-        candles = klines[-60:] if len(klines) > 60 else klines
-        if len(candles) < 2:
-            return None
+def _tr_upper(text):
+    return text.replace("i", "İ").replace("ı", "I").upper()
 
-        W, H = 720, 460
-        bg = (19, 23, 34)
+
+class _Canvas:
+    def __init__(self, w, h, bg=(19, 23, 34)):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(bytes(bg) * (w * h))
+
+    def px(self, x, y, col):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y * self.w + x) * 3
+            self.buf[i], self.buf[i + 1], self.buf[i + 2] = col
+
+    def rect(self, x0, y0, x1, y1, col):
+        x0, x1 = max(0, min(x0, x1)), min(self.w - 1, max(x0, x1))
+        y0, y1 = max(0, min(y0, y1)), min(self.h - 1, max(y0, y1))
+        if x1 < x0 or y1 < y0:
+            return
+        r_bytes = bytes(col) * (x1 - x0 + 1)
+        for yy in range(y0, y1 + 1):
+            i = (yy * self.w + x0) * 3
+            self.buf[i:i + len(r_bytes)] = r_bytes
+
+    def line(self, x0, y0, x1, y1, col, dashed=False):
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx + dy
+        step = 0
+        while True:
+            if not dashed or (step % 8 < 5):
+                self.px(x0, y0, col)
+            step += 1
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def text(self, x, y, txt, col, scale=2):
+        cx = x
+        for ch in _tr_upper(str(txt)):
+            glyph = _FONT_5X7.get(ch)
+            if glyph:
+                for ry, row in enumerate(glyph):
+                    for rx, bit in enumerate(row):
+                        if bit == "1":
+                            self.rect(
+                                cx + rx * scale,
+                                y + ry * scale,
+                                cx + (rx + 1) * scale - 1,
+                                y + (ry + 1) * scale - 1,
+                                col,
+                            )
+            cx += 6 * scale
+
+    def to_png(self):
+        raw_rows = bytearray()
+        stride = self.w * 3
+        for y in range(self.h):
+            raw_rows.append(0)
+            raw_rows.extend(self.buf[y * stride:(y + 1) * stride])
+
+        def chunk(ctype, cdata):
+            crc = zlib.crc32(ctype + cdata) & 0xFFFFFFFF
+            return struct.pack(">I", len(cdata)) + ctype + cdata + struct.pack(">I", crc)
+
+        png = bytearray(b"\x89PNG\r\n\x1a\n")
+        png.extend(chunk(b"IHDR", struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0)))
+        png.extend(chunk(b"IDAT", zlib.compress(bytes(raw_rows), 6)))
+        png.extend(chunk(b"IEND", b""))
+        return bytes(png)
+
+
+def render_chart_png(symbol, klines, title_suffix="D1", subtitle="", overlays=None, hlines=None):
+    try:
+        win = min(len(klines), 60)
+        if win < 2:
+            return None
+        candles = klines[-win:]
+
+        W, H = 760, 480
+        cv = _Canvas(W, H, bg=(19, 23, 34))
         grid = (42, 46, 57)
         green = (8, 153, 129)
         red = (242, 54, 69)
-        white = (225, 228, 235)
+        white = (232, 236, 245)
         cyan = (56, 189, 248)
-        muted = (140, 146, 160)
+        muted = (145, 152, 168)
 
-        buf = bytearray(bytes(bg) * (W * H))
-
-        def px(x, y, col):
-            if 0 <= x < W and 0 <= y < H:
-                i = (y * W + x) * 3
-                buf[i], buf[i + 1], buf[i + 2] = col
-
-        def rect(x0, y0, x1, y1, col):
-            x0, x1 = max(0, min(x0, x1)), min(W - 1, max(x0, x1))
-            y0, y1 = max(0, min(y0, y1)), min(H - 1, max(y0, y1))
-            r_bytes = bytes(col) * (x1 - x0 + 1)
-            for yy in range(y0, y1 + 1):
-                i = (yy * W + x0) * 3
-                buf[i:i + len(r_bytes)] = r_bytes
-
-        def line(x0, y0, x1, y1, col):
-            dx, dy = abs(x1 - x0), -abs(y1 - y0)
-            sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
-            err = dx + dy
-            while True:
-                px(x0, y0, col)
-                if x0 == x1 and y0 == y1:
-                    break
-                e2 = 2 * err
-                if e2 >= dy:
-                    err += dy
-                    x0 += sx
-                if e2 <= dx:
-                    err += dx
-                    y0 += sy
-
-        def draw_text(x, y, text, col, scale=2):
-            cx = x
-            for ch in text.upper():
-                glyph = _FONT_5X7.get(ch)
-                if glyph:
-                    for ry, row in enumerate(glyph):
-                        for rx, bit in enumerate(row):
-                            if bit == "1":
-                                rect(cx + rx * scale, y + ry * scale, cx + (rx + 1) * scale - 1, y + (ry + 1) * scale - 1, col)
-                cx += 6 * scale
-
-        # Bölgeler: Fiyat [36..275], Hacim [288..360], RSI [374..440]
-        left, right = 18, W - 76
-        for gy in (36, 95, 155, 215, 275, 288, 360, 374, 407, 440):
-            line(left, gy, right, gy, grid)
-        for gx in range(left, right + 1, (right - left) // 5):
-            line(gx, 36, gx, 440, grid)
+        left, right = 18, W - 94
+        for gy in (42, 102, 162, 222, 282, 296, 372, 386, 421, 456):
+            cv.line(left, gy, right, gy, grid)
+        for gx in range(left, right + 1, max(1, (right - left) // 5)):
+            cv.line(gx, 42, gx, 456, grid)
 
         opens = [float(k[1]) for k in candles]
         highs = [float(k[2]) for k in candles]
         lows = [float(k[3]) for k in candles]
         closes = [float(k[4]) for k in candles]
         vols = [float(k[7]) for k in candles]
-        rsis = calculate_rsi_series([float(k[4]) for k in klines], 14)[-len(candles):]
+        rsis = calculate_rsi_series([float(k[4]) for k in klines], 14)[-win:]
 
-        p_min, p_max = min(lows), max(highs)
+        vals_for_scale = list(highs) + list(lows)
+        if overlays:
+            for _, series, _ in overlays:
+                for v in series[-win:]:
+                    if v is not None:
+                        vals_for_scale.append(float(v))
+        if hlines:
+            p_cur = closes[-1]
+            for _, hp, _ in hlines:
+                if hp and abs(hp - p_cur) / max(p_cur, 1e-9) < 0.35:
+                    vals_for_scale.append(float(hp))
+
+        p_min, p_max = min(vals_for_scale), max(vals_for_scale)
         if p_max == p_min:
             p_max += p_min * 0.01 or 1.0
         pad = (p_max - p_min) * 0.08
@@ -745,65 +832,108 @@ def render_chart_png(symbol, klines, title_suffix="D1"):
         p_max += pad
 
         def py_price(val):
-            return int(275 - ((val - p_min) / (p_max - p_min)) * (275 - 36))
+            return int(282 - ((val - p_min) / (p_max - p_min)) * (282 - 42))
 
         v_max = max(vols) or 1.0
         n = len(candles)
         slot_w = max(4.0, (right - left) / n)
         body_w = max(2, int(slot_w * 0.64))
 
+        if hlines:
+            for lbl, hp, col in hlines:
+                if hp is None:
+                    continue
+                if p_min <= hp <= p_max:
+                    yy = py_price(hp)
+                    cv.line(left, yy, right, yy, col, dashed=True)
+                    cv.rect(right + 2, yy - 5, W - 4, yy + 7, col)
+                    cv.text(right + 5, yy - 2, lbl[:10], (15, 18, 25), scale=1)
+
         for i in range(n):
             cx = int(left + (i + 0.5) * slot_w)
             col = green if closes[i] >= opens[i] else red
-            yh = py_price(highs[i])
-            yl = py_price(lows[i])
-            yo = py_price(opens[i])
-            yc = py_price(closes[i])
-            line(cx, yh, cx, yl, col)
+            yh, yl = py_price(highs[i]), py_price(lows[i])
+            yo, yc = py_price(opens[i]), py_price(closes[i])
+            cv.line(cx, yh, cx, yl, col)
             y_top, y_bot = min(yo, yc), max(yo, yc)
             if y_bot - y_top < 2:
                 y_bot = y_top + 2
-            rect(cx - body_w // 2, y_top, cx + body_w // 2, y_bot, col)
+            cv.rect(cx - body_w // 2, y_top, cx + body_w // 2, y_bot, col)
 
-            vh = int((vols[i] / v_max) * (360 - 292))
+            vh = int((vols[i] / v_max) * (372 - 300))
             if vh > 0:
-                rect(cx - body_w // 2, 360 - vh, cx + body_w // 2, 360, col)
+                cv.rect(cx - body_w // 2, 372 - vh, cx + body_w // 2, 372, col)
+
+        if overlays:
+            lx = left + 220
+            for idx_ov, (oname, series, ocol) in enumerate(overlays):
+                sub = series[-win:]
+                prev_pt = None
+                for i, val in enumerate(sub):
+                    if val is None or not (p_min <= val <= p_max):
+                        prev_pt = None
+                        continue
+                    cx = int(left + (i + 0.5) * slot_w)
+                    cy = py_price(val)
+                    if prev_pt is not None:
+                        cv.line(prev_pt[0], prev_pt[1], cx, cy, ocol)
+                        cv.line(prev_pt[0], prev_pt[1] + 1, cx, cy + 1, ocol)
+                    prev_pt = (cx, cy)
+                cv.text(lx + idx_ov * 85, 16, oname, ocol, scale=1)
 
         for i in range(1, n):
             x0 = int(left + (i - 0.5) * slot_w)
             x1 = int(left + (i + 0.5) * slot_w)
-            y0 = int(440 - (max(0.0, min(100.0, rsis[i - 1])) / 100.0) * (440 - 374))
-            y1 = int(440 - (max(0.0, min(100.0, rsis[i])) / 100.0) * (440 - 374))
-            line(x0, y0, x1, y1, cyan)
+            y0 = int(456 - (max(0.0, min(100.0, rsis[i - 1])) / 100.0) * (456 - 386))
+            y1 = int(456 - (max(0.0, min(100.0, rsis[i])) / 100.0) * (456 - 386))
+            cv.line(x0, y0, x1, y1, cyan)
 
-        draw_text(left, 12, f"{symbol} {title_suffix}", white, scale=2)
-        draw_text(right + 6, 36, akilli_fiyat(p_max), muted, scale=1)
-        draw_text(right + 6, 152, akilli_fiyat((p_max + p_min) / 2), muted, scale=1)
-        draw_text(right + 6, 268, akilli_fiyat(p_min), muted, scale=1)
-        draw_text(right + 6, 290, "VOL", muted, scale=1)
-        draw_text(right + 6, 376, f"RSI {rsis[-1]:.0f}", cyan, scale=1)
+        cv.text(left, 12, f"{symbol} {title_suffix}", white, scale=2)
+        if subtitle:
+            cv.text(left, 30, subtitle, cyan, scale=1)
+        cv.text(right + 6, 44, akilli_fiyat(p_max), muted, scale=1)
+        cv.text(right + 6, 274, akilli_fiyat(p_min), muted, scale=1)
+        cv.text(right + 6, 300, "VOL", muted, scale=1)
+        cv.text(right + 6, 388, f"RSI {rsis[-1]:.0f}", cyan, scale=1)
+        return cv.to_png()
+    except Exception:
+        return None
 
-        raw_rows = bytearray()
-        stride = W * 3
-        for y in range(H):
-            raw_rows.append(0)
-            raw_rows.extend(buf[y * stride:(y + 1) * stride])
 
-        def chunk(ctype, cdata):
-            crc = zlib.crc32(ctype + cdata) & 0xFFFFFFFF
-            return struct.pack(">I", len(cdata)) + ctype + cdata + struct.pack(">I", crc)
+def render_card_png(title, subtitle, rows, footer=""):
+    try:
+        W = 720
+        H = max(280, 120 + len(rows) * 52 + (36 if footer else 0))
+        cv = _Canvas(W, H, bg=(19, 23, 34))
+        card_bg = (28, 33, 48)
+        white = (235, 240, 248)
+        cyan = (56, 189, 248)
+        muted = (148, 156, 175)
 
-        png = bytearray(b"\x89PNG\r\n\x1a\n")
-        png.extend(chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)))
-        png.extend(chunk(b"IDAT", zlib.compress(bytes(raw_rows), 6)))
-        png.extend(chunk(b"IEND", b""))
-        return bytes(png)
+        cv.rect(18, 16, W - 18, 86, card_bg)
+        cv.text(32, 26, title, white, scale=2)
+        if subtitle:
+            cv.text(32, 56, subtitle, cyan, scale=1)
+
+        y = 104
+        for lbl, rtxt, ratio, col in rows:
+            cv.rect(18, y, W - 18, y + 42, card_bg)
+            cv.rect(18, y, 24, y + 42, col)
+            cv.text(36, y + 12, lbl[:24], white, scale=2)
+            cv.text(W - 32 - len(rtxt) * 12, y + 12, rtxt, col, scale=2)
+            bar_w = int(max(0.03, min(1.0, float(ratio))) * (W - 72))
+            cv.rect(36, y + 34, 36 + bar_w, y + 38, col)
+            y += 52
+
+        if footer:
+            cv.text(24, H - 24, footer[:80], muted, scale=1)
+        return cv.to_png()
     except Exception:
         return None
 
 
 # =====================================================
-# MOTOR 1: GÜNÜN EN İYİ HAREKETLERİ (TOP GAINERS)
+# MOTOR 1: GÜNÜN EN İYİ HAREKETLERİ (TOP GAINERS - GÖRSEL)
 # =====================================================
 def top_gainers_loop():
     global _last_top_gainers_ts
@@ -826,19 +956,29 @@ def top_gainers_loop():
             top_5 = temiz[:5]
 
             if top_5:
+                max_chg = max(abs(float(t["priceChangePercent"])) for t in top_5) or 1.0
+                card_rows = []
                 msg = f"🔥 <b>Günün En İyi Hareketleri ({src})</b>\n"
                 msg += "<i>24 saatlik yükseliş ve USDT hacmine göre</i>\n\n"
                 medals = ["🥇", "🥈", "🥉", "🏅", "⭐"]
+                green = (8, 153, 129)
                 for i, t in enumerate(top_5):
                     sym = t["symbol"].replace("USDT", "")
                     chg = float(t["priceChangePercent"])
                     prc = float(t["lastPrice"])
                     chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
                     msg += f"{medals[i]} <b>{sym}</b> {chg_str} | {akilli_fiyat(prc)}\n"
+                    card_rows.append((f"{i+1}. {sym}", f"{chg_str} | {akilli_fiyat(prc)}", chg / max_chg, green))
 
-                if tg(C, msg):
+                png = render_card_png(
+                    "GUNUN EN IYI HAREKETLERI",
+                    f"{src} - 24 SAATLIK YUKSELIS VE HACIM TEYITLI",
+                    card_rows,
+                    footer=f"TSI {simdi().strftime('%H:%M')} | EN COK KAZANDIRAN TOP 5",
+                )
+                if tg_photo(C, png, msg):
                     _last_top_gainers_ts = time.time()
-                    log("TOP_GAINERS", f"Rapor gönderildi ({src}).")
+                    log("TOP_GAINERS", f"Görsel rapor gönderildi ({src}).")
             time.sleep(TOP_GAINERS_ARALIGI)
         except Exception as e:
             log("TOP_GAINERS HATA", e)
@@ -846,7 +986,7 @@ def top_gainers_loop():
 
 
 # =====================================================
-# MOTOR 2: GÜNÜN KAZANANI (PUMP WINNER)
+# MOTOR 2: GÜNÜN KAZANANI (PUMP WINNER - GÖRSEL)
 # =====================================================
 def pump_winner_loop():
     log("PUMP_WINNER", "Günün Kazananı Rapor Botu Başladı.")
@@ -871,13 +1011,15 @@ def pump_winner_loop():
 
             winner = temiz[0]
             sym = winner["symbol"]
-            klines, ksrc = get_klines(sym, "1d", 2, "FUTURES")
-            if not klines:
+            klines_1h, ksrc = get_klines(sym, "1h", 48, "FUTURES")
+            klines_1d, _ = get_klines(sym, "1d", 2, "FUTURES")
+            ksrc = ksrc or src
+            if not klines_1d:
                 time.sleep(PUMP_WINNER_ARALIGI)
                 continue
 
-            day_low = float(klines[-1][3])
-            day_high = float(klines[-1][2])
+            day_low = float(klines_1d[-1][3])
+            day_high = float(klines_1d[-1][2])
             if day_low <= 0:
                 time.sleep(PUMP_WINNER_ARALIGI)
                 continue
@@ -889,10 +1031,15 @@ def pump_winner_loop():
                 f"🔥 24 saat içinde en çok yükselen coin!\n\n"
                 f"📉 <b>Dip Fiyat:</b> {akilli_fiyat(day_low)}\n"
                 f"🚀 <b>Zirve Fiyat:</b> {akilli_fiyat(day_high)}\n"
-                f"📈 <b>Maksimum Yükseliş:</b> <b>+{max_move:.1f}%</b>\n\n"
-                f"💡 <b>Değerlendirme:</b> {sym} gün içerisinde güçlü hacim ve fiyat patlaması yaşadı."
+                f"📈 <b>Maksimum Yükseliş:</b> <b>+{max_move:.1f}%</b>"
             )
-            tg(C, msg)
+            chart_k = klines_1h if klines_1h and len(klines_1h) >= 6 else klines_1d
+            png = render_chart_png(
+                sym, chart_k, "H1",
+                subtitle=f"GUNUN KAZANANI +{max_move:.1f}%",
+                hlines=[("ZIRVE", day_high, (8, 153, 129)), ("DIP", day_low, (242, 54, 69))],
+            )
+            tg_photo(C, png, msg)
             time.sleep(PUMP_WINNER_ARALIGI)
         except Exception as e:
             log("PUMP_WINNER HATA", e)
@@ -900,7 +1047,7 @@ def pump_winner_loop():
 
 
 # =====================================================
-# MOTOR 3: PİYASA YÖNÜ & DOMİNANS RAPORU
+# MOTOR 3: PİYASA YÖNÜ & DOMİNANS RAPORU (GÖRSEL)
 # =====================================================
 def dominans_loop():
     global _last_dominans_ts
@@ -914,15 +1061,19 @@ def dominans_loop():
                 pct_map = d.get("market_cap_percentage", {})
                 btc_d = float(pct_map.get("btc", 0))
                 eth_d = float(pct_map.get("eth", 0))
+                alt_d = max(0.0, 100.0 - btc_d - eth_d)
                 mcap_chg = float(d.get("market_cap_change_percentage_24h_usd", 0))
 
                 if btc_d > 0:
                     if mcap_chg >= 0.5:
                         durum = "🟢 Yükselişte"
+                        d_col = (8, 153, 129)
                     elif mcap_chg <= -0.5:
                         durum = "🔴 Düşüşte"
+                        d_col = (242, 54, 69)
                     else:
                         durum = "🟡 Yatay"
+                        d_col = (245, 158, 11)
 
                     if btc_d >= 56.0:
                         degerlendirme = (
@@ -947,9 +1098,21 @@ def dominans_loop():
                         f"📊 <b>Durum:</b> {durum} ({mcap_chg:+.2f}% 24s)\n"
                         f"💡 <b>Değerlendirme:</b> {degerlendirme}"
                     )
-                    if tg(C, msg):
+                    card_rows = [
+                        ("BTC DOMINANS", f"%{btc_d:.2f}", btc_d / 100.0, (245, 158, 11)),
+                        ("ETH DOMINANS", f"%{eth_d:.2f}", eth_d / 100.0, (56, 189, 248)),
+                        ("DIGER ALTCOINLER", f"%{alt_d:.2f}", alt_d / 100.0, (168, 85, 247)),
+                        ("PIYASA 24S DEGISIM", f"{mcap_chg:+.2f}%", min(1.0, abs(mcap_chg) / 10.0), d_col),
+                    ]
+                    png = render_card_png(
+                        "PIYASA YONU VE DOMINANS",
+                        f"COINGECKO KURESEL VERI | TSI {simdi().strftime('%H:%M')}",
+                        card_rows,
+                        footer=f"BTC AGIRLIGI: %{btc_d:.2f} | ETH: %{eth_d:.2f}",
+                    )
+                    if tg_photo(C, png, msg):
                         _last_dominans_ts = time.time()
-                        log("DOMINANS", f"Rapor gönderildi (BTC={btc_d:.2f}%).")
+                        log("DOMINANS", f"Görsel rapor gönderildi (BTC={btc_d:.2f}%).")
             time.sleep(DOMINANS_ARALIGI)
         except Exception as e:
             log("DOMINANS HATA", e)
@@ -957,7 +1120,7 @@ def dominans_loop():
 
 
 # =====================================================
-# MOTOR 4: CHARTIST (SPOT EMA200 KIRILIMI)
+# MOTOR 4: CHARTIST (SPOT EMA200 KIRILIMI - GÖRSEL)
 # =====================================================
 def chartist_loop():
     log("CHARTIST", "Zırhlı Spot EMA200 Motoru Başladı.")
@@ -995,17 +1158,24 @@ def chartist_loop():
                             vol = [float(k[7]) for k in klines[:-1]]
                             if len(vol) >= 21 and vol[-1] > sum(vol[-21:-1]) / 20.0:
                                 sl = ema200[-1] * 0.97
+                                hedef = curr * 1.15
+                                ema200_series = calculate_ema_series_aligned(closes_all, 200)
                                 msg = (
                                     f"📈 <b>UZUN VADELİ SPOT (LONG): {symbol}</b>\n"
                                     f"<i>{ksrc} - {tf.upper()} EMA200 Kırılımı</i>\n\n"
                                     f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(curr)}\n"
                                     f"⚡ <b>Anlık Fiyat:</b> {akilli_fiyat(live_price)}\n"
                                     f"🛑 <b>SL:</b> {akilli_fiyat(sl)}\n"
-                                    f"🎯 <b>Hedef:</b> {akilli_fiyat(curr * 1.15)}\n\n"
-                                    f"📊 <b>Teyit:</b> Hacim Onaylı ve %1 üzeri kapanış.\n\n"
-                                    f"💡 <b>Açıklama:</b> EMA200 uzun vadeli ana trend çizgisidir. Fiyatın hacimle yukarı kırıp üstünde kalması güçlü boğa sinyalidir."
+                                    f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)}\n\n"
+                                    f"📊 <b>Teyit:</b> Hacim Onaylı ve %1 üzeri kapanış."
                                 )
-                                if tg(C, msg):
+                                png = render_chart_png(
+                                    symbol, klines, tf.upper(),
+                                    subtitle="SPOT EMA200 KIRILIMI (LONG)",
+                                    overlays=[("EMA200", ema200_series, (245, 158, 11))],
+                                    hlines=[("HEDEF", hedef, (8, 153, 129)), ("SL", sl, (242, 54, 69))],
+                                )
+                                if tg_photo(C, png, msg):
                                     son_sinyaller[cooldown_key] = time.time()
                     time.sleep(0.05)
             time.sleep(CHARTIST_ARALIGI)
@@ -1015,7 +1185,7 @@ def chartist_loop():
 
 
 # =====================================================
-# MOTOR 5: ANLIK PUMP AVCISI (5m + TRAP RADAR)
+# MOTOR 5: ANLIK PUMP AVCISI (5m + TRAP RADAR - GÖRSEL)
 # =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı (5m).")
@@ -1035,7 +1205,7 @@ def pump_loop():
                     symbol = coin["symbol"]
                     if symbol in son_pump_sinyalleri and time.time() - son_pump_sinyalleri[symbol] < 900:
                         continue
-                    klines, ksrc = get_klines(symbol, "5m", 3, "FUTURES")
+                    klines, ksrc = get_klines(symbol, "5m", 40, "FUTURES")
                     if not klines or len(klines) < 3:
                         continue
                     curr_k, prev_k = klines[-2], klines[-3]
@@ -1051,14 +1221,19 @@ def pump_loop():
                         trap_line = f"{trap_radar}\n\n" if trap_radar else ""
                         msg = (
                             f"🚀 <b>Pump - {symbol}</b>\n"
-                            f"<i>{ksrc}</i>\n"
+                            f"<i>{ksrc} - 5m Grafik</i>\n"
                             f"💰 <b>Fiyat:</b> {akilli_fiyat(cc)} (<b>{price_change:+.2f}%</b>)\n"
                             f"📊 <b>Hacim Artışı:</b> {vol_change:+.0f}%\n"
                             f"Volume increased by {vol_diff:.0f} ⬆️\n\n"
                             f"{trap_line}"
                             f"💡 <b>Açıklama:</b> 5 dakikalık grafikte hacim ve fiyat artışı tespit edildi."
                         )
-                        if tg(C, msg):
+                        png = render_chart_png(
+                            symbol, klines, "M5",
+                            subtitle=f"PUMP {price_change:+.2f}% | HACIM +{vol_change:.0f}%",
+                            hlines=[("PUMP", cc, (8, 153, 129))],
+                        )
+                        if tg_photo(C, png, msg):
                             son_pump_sinyalleri[symbol] = time.time()
                             log("PUMP", f"🔥 {symbol} ({price_change:+.2f}%)")
                     time.sleep(0.05)
@@ -1069,7 +1244,7 @@ def pump_loop():
 
 
 # =====================================================
-# MOTOR 6: ANORMAL VOLATİLİTE VE DUMP AVCISI (15m)
+# MOTOR 6: ANORMAL VOLATİLİTE VE DUMP AVCISI (15m - GÖRSEL)
 # =====================================================
 def volatilite_loop():
     log("VOLATILITE", "Anormal Volatilite ve Dump Avcısı Başladı (15m).")
@@ -1089,7 +1264,7 @@ def volatilite_loop():
                     symbol = coin["symbol"]
                     if symbol in son_volatilite_sinyalleri and time.time() - son_volatilite_sinyalleri[symbol] < 1800:
                         continue
-                    klines, ksrc = get_klines(symbol, "15m", 25, "FUTURES")
+                    klines, ksrc = get_klines(symbol, "15m", 45, "FUTURES")
                     if not klines or len(klines) < 25:
                         continue
                     curr_open = float(klines[-2][1])
@@ -1105,16 +1280,21 @@ def volatilite_loop():
                     if abs(price_change_pct) >= 2.5 and vol_multiplier >= 3.0:
                         yon = "DUMP (ANI DÜŞÜŞ) 🔻" if price_change_pct < 0 else "PUMP (ANI YÜKSELİŞ) 🚀"
                         emoji = "🚨" if price_change_pct < 0 else "⚡"
+                        lcol = (242, 54, 69) if price_change_pct < 0 else (8, 153, 129)
                         msg = (
                             f"{emoji} <b>ANORMAL VOLATİLİTE UYARISI</b> {emoji}\n"
                             f"<b>Coin:</b> {symbol} ({ksrc} - 15m)\n\n"
                             f"📉 <b>Hareket:</b> {yon}\n"
                             f"📊 <b>Değişim:</b> <b>{price_change_pct:+.2f}%</b>\n"
                             f"📈 <b>Hacim Patlaması:</b> Ortalamanın <b>{vol_multiplier:.1f}x</b> katı\n"
-                            f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(curr_close)}\n\n"
-                            f"⚠️ <i>Piyasada ani likidite değişimi tespit edildi. Dikkatli olun!</i>"
+                            f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(curr_close)}"
                         )
-                        if tg(C, msg):
+                        png = render_chart_png(
+                            symbol, klines, "M15",
+                            subtitle=f"VOLATILITE {price_change_pct:+.2f}% | {vol_multiplier:.1f}X HACIM",
+                            hlines=[("KAPANIS", curr_close, lcol)],
+                        )
+                        if tg_photo(C, png, msg):
                             son_volatilite_sinyalleri[symbol] = time.time()
                             log("VOLATILITE", f"🔥 {symbol} ({yon})")
                     time.sleep(0.05)
@@ -1125,7 +1305,7 @@ def volatilite_loop():
 
 
 # =====================================================
-# MOTOR 7: TEYİTLİ FORMASYON (5m FORMASYON - 15m TREND)
+# MOTOR 7: TEYİTLİ FORMASYON (5m FORMASYON - GÖRSEL)
 # =====================================================
 def formasyon_loop():
     log("FORMASYON", "Teyitli Formasyon ve Likidite Avcısı Başladı.")
@@ -1217,11 +1397,11 @@ def formasyon_loop():
                         l20h, l20l = max(highs[-20:]), min(lows[-20:])
                         range_pct = ((l20h - l20l) / l20l) * 100.0 if l20l > 0 else 99.0
                         if range_pct < 5 and current_price > l20h and is_vol_teyit and rsi > 50:
-                            sinyal = True; formasyon_adi = "Sıkışma ve Yukarı Kırılım (Bayrak)"; yon = "LONG"; emoji = "🚀"
+                            sinyal = True; formasyon_adi = "Sıkışma ve Yukarı Kırılım"; yon = "LONG"; emoji = "🚀"
                             hedef = current_price + (l20h - l20l); stop = l20l * 0.98
                             aciklama = "Dar bant sıkışması hacimle yukarı kırıldı."
                         elif range_pct < 5 and current_price < l20l and is_vol_teyit and rsi < 50:
-                            sinyal = True; formasyon_adi = "Sıkışma ve Aşağı Kırılım (Ters Bayrak)"; yon = "SHORT"; emoji = "🔻"
+                            sinyal = True; formasyon_adi = "Sıkışma ve Aşağı Kırılım"; yon = "SHORT"; emoji = "🔻"
                             hedef = current_price - (l20h - l20l); stop = l20h * 1.02
                             aciklama = "Dar bant sıkışması hacimle aşağı kırıldı."
 
@@ -1242,10 +1422,15 @@ def formasyon_loop():
                             f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
                             f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
                             f"📊 <b>Formasyon:</b> {formasyon_adi}\n"
-                            f"📊 <b>Teyitler:</b> Hacim ({current_vol/avg_vol:.1f}x), RSI ({rsi:.1f}), EMA (15m)\n\n"
+                            f"📊 <b>Teyitler:</b> Hacim ({current_vol/avg_vol:.1f}x), RSI ({rsi:.1f})\n"
                             f"💡 <b>Açıklama:</b> {aciklama}"
                         )
-                        if tg(C, msg):
+                        png = render_chart_png(
+                            symbol, klines_5m, "M5",
+                            subtitle=f"{formasyon_adi} ({yon})",
+                            hlines=[("GIRIS", current_price, (56, 189, 248)), ("HEDEF", hedef, (8, 153, 129)), ("STOP", stop, (242, 54, 69))],
+                        )
+                        if tg_photo(C, png, msg):
                             son_formasyon_sinyalleri[symbol] = time.time()
                             log("FORMASYON", f"🔥 {symbol} ({yon} - {formasyon_adi})")
                     time.sleep(0.05)
@@ -1256,7 +1441,7 @@ def formasyon_loop():
 
 
 # =====================================================
-# MOTOR 8: ICHIMOKU BULUTU (1h)
+# MOTOR 8: ICHIMOKU BULUTU (1h - GÖRSEL)
 # =====================================================
 def ichimoku_loop():
     log("ICHIMOKU", "Zırhlı Ichimoku Bulut Motoru Başladı.")
@@ -1352,15 +1537,18 @@ def ichimoku_loop():
                         msg = (
                             f"{emoji} <b>ICHIMOKU SİNYALİ ({yon}): {symbol}</b>\n"
                             f"<i>{ksrc} - 1 Saatlik Grafik</i>\n\n"
-                            f"💰 <b>Kapanış Fiyatı:</b> {akilli_fiyat(curr_close)}\n"
-                            f"⚡ <b>Anlık Fiyat:</b> {akilli_fiyat(live_price)}\n"
+                            f"💰 <b>Kapanış:</b> {akilli_fiyat(curr_close)} | ⚡ <b>Canlı:</b> {akilli_fiyat(live_price)}\n"
                             f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
-                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                            f"☁️ <b>Bulut:</b> {akilli_fiyat(cloud_bottom_curr)} - {akilli_fiyat(cloud_top_curr)}\n"
-                            f"📈 <b>Tenkan:</b> {akilli_fiyat(tenkan_curr)} | <b>Kijun:</b> {akilli_fiyat(kijun_curr)}\n\n"
+                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n"
+                            f"☁️ <b>Bulut:</b> {akilli_fiyat(cloud_bottom_curr)} - {akilli_fiyat(cloud_top_curr)}\n\n"
                             f"💡 <b>Açıklama:</b> {aciklama}"
                         )
-                        if tg(C, msg):
+                        png = render_chart_png(
+                            symbol, klines, "H1",
+                            subtitle=f"ICHIMOKU {yon}",
+                            hlines=[("BULUT UST", cloud_top_curr, (245, 158, 11)), ("HEDEF", hedef, (8, 153, 129)), ("STOP", stop, (242, 54, 69))],
+                        )
+                        if tg_photo(C, png, msg):
                             son_ichimoku_sinyalleri[symbol] = time.time()
                             log("ICHIMOKU", f"🔥 {symbol} ({yon})")
                     time.sleep(0.05)
@@ -1371,7 +1559,7 @@ def ichimoku_loop():
 
 
 # =====================================================
-# MOTOR 9: EMA RIBBON (1d - TAZELİK & CANLI FİYAT TEYİTLİ)
+# MOTOR 9: EMA RIBBON (1d - GÖRSEL)
 # =====================================================
 def ema_ribbon_loop():
     log("EMA_RIBBON", "EMA Dizilim Motoru Başladı.")
@@ -1417,20 +1605,26 @@ def ema_ribbon_loop():
                     e7, e25, e99, e200 = ema7[-1], ema25[-1], ema99[-1], ema200[-1]
 
                     if curr > e7 > e25 > e99 > e200 and live_price > e25:
+                        hedef, sl = curr * 1.20, e25 * 0.95
                         msg = (
                             f"🚀 <b>EMA DİZİLİMİ (LONG): {symbol}</b>\n"
                             f"<i>{ksrc} - 1 Günlük Grafik</i>\n\n"
-                            f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(curr)}\n"
-                            f"⚡ <b>Anlık Fiyat:</b> {akilli_fiyat(live_price)}\n"
-                            f"🎯 <b>Hedef:</b> {akilli_fiyat(curr * 1.20)} (+20.0%)\n"
-                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(e25 * 0.95)}\n\n"
-                            f"📊 <b>EMA Dizilimi:</b>\n"
-                            f"EMA7: {akilli_fiyat(e7)} | EMA25: {akilli_fiyat(e25)}\n"
-                            f"EMA99: {akilli_fiyat(e99)} | EMA200: {akilli_fiyat(e200)}\n"
-                            f"📈 <b>Hacim Teyidi:</b> {curr_vol/avg_vol:.1f}x\n\n"
-                            f"💡 <b>Açıklama:</b> Tüm EMA ortalamaları boğa dizilimine geçti."
+                            f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(curr)} | ⚡ <b>Canlı:</b> {akilli_fiyat(live_price)}\n"
+                            f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (+20.0%)\n"
+                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(sl)}\n"
+                            f"📊 <b>EMA7:</b> {akilli_fiyat(e7)} | <b>EMA25:</b> {akilli_fiyat(e25)} | <b>EMA200:</b> {akilli_fiyat(e200)}"
                         )
-                        if tg(C, msg):
+                        png = render_chart_png(
+                            symbol, klines, "D1",
+                            subtitle="EMA RIBBON BOGA DIZILIMI (LONG)",
+                            overlays=[
+                                ("EMA7", calculate_ema_series_aligned(closes_all, 7), (56, 189, 248)),
+                                ("EMA25", calculate_ema_series_aligned(closes_all, 25), (245, 158, 11)),
+                                ("EMA200", calculate_ema_series_aligned(closes_all, 200), (168, 85, 247)),
+                            ],
+                            hlines=[("HEDEF", hedef, (8, 153, 129)), ("SL", sl, (242, 54, 69))],
+                        )
+                        if tg_photo(C, png, msg):
                             son_ema_ribbon_sinyalleri[symbol] = time.time()
                     time.sleep(0.05)
             time.sleep(EMA_RIBBON_ARALIGI)
@@ -1440,7 +1634,7 @@ def ema_ribbon_loop():
 
 
 # =====================================================
-# MOTOR 10: MACD GOLDEN CROSS (1d - TAZELİK & CANLI FİYAT TEYİTLİ)
+# MOTOR 10: MACD GOLDEN CROSS (1d - GÖRSEL)
 # =====================================================
 def macd_loop():
     log("MACD", "MACD Motoru Başladı.")
@@ -1482,17 +1676,25 @@ def macd_loop():
                         continue
                     cm, cs, pm, ps = macd_res
                     if pm <= ps and cm > cs and live_price >= prev_price:
+                        hedef, sl = curr_price * 1.10, curr_price * 0.97
                         msg = (
                             f"🚀 <b>MACD SİNYALİ (LONG): {symbol}</b>\n"
                             f"<i>{ksrc} - 1 Günlük Grafik</i>\n\n"
-                            f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(curr_price)}\n"
-                            f"⚡ <b>Anlık Fiyat:</b> {akilli_fiyat(live_price)}\n"
-                            f"🎯 <b>Hedef:</b> {akilli_fiyat(curr_price * 1.10)} (+10.0%)\n"
-                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(curr_price * 0.97)} (-3.0%)\n\n"
-                            f"📊 <b>MACD:</b> {cm:.5f} | <b>Sinyal:</b> {cs:.5f}\n\n"
-                            f"💡 <b>Açıklama:</b> MACD çizgisi sinyal çizgisini hacimle yukarı kesti (Golden Cross)."
+                            f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(curr_price)} | ⚡ <b>Canlı:</b> {akilli_fiyat(live_price)}\n"
+                            f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (+10.0%)\n"
+                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(sl)} (-3.0%)\n"
+                            f"📊 <b>MACD:</b> {cm:.5f} | <b>Sinyal:</b> {cs:.5f}"
                         )
-                        if tg(C, msg):
+                        png = render_chart_png(
+                            symbol, klines, "D1",
+                            subtitle="MACD GOLDEN CROSS (LONG)",
+                            overlays=[
+                                ("EMA12", calculate_ema_series_aligned(closes_all, 12), (56, 189, 248)),
+                                ("EMA26", calculate_ema_series_aligned(closes_all, 26), (245, 158, 11)),
+                            ],
+                            hlines=[("HEDEF", hedef, (8, 153, 129)), ("SL", sl, (242, 54, 69))],
+                        )
+                        if tg_photo(C, png, msg):
                             son_macd_sinyalleri[symbol] = time.time()
                     time.sleep(0.05)
             time.sleep(MACD_ARALIGI)
@@ -1502,7 +1704,7 @@ def macd_loop():
 
 
 # =====================================================
-# MOTOR 11: 200 GÜNLÜK SMA KIRILIMI (DÜZELTİLMİŞ)
+# MOTOR 11: 200 GÜNLÜK SMA KIRILIMI (DÜZELTİLMİŞ + GÖRSEL)
 # =====================================================
 def sma200_loop():
     log("SMA200", "200 Günlük SMA Kırılım Botu Başladı.")
@@ -1521,17 +1723,16 @@ def sma200_loop():
                 hedefler.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
                 for coin in hedefler[:MAX_TARAMA]:
                     sym = coin["symbol"]
-                    klines, ksrc = get_klines(sym, "1d", 210, "FUTURES")
+                    klines, ksrc = get_klines(sym, "1d", 260, "FUTURES")
                     if not klines or len(klines) < 203:
                         continue
 
-                    # 1) Tazelik kontrolü: Günlük mum kapanalı en fazla 2 saat geçmiş olmalı
                     if not _bar_fresh(klines[-2], 86_400_000, 2 * 3600_000):
                         continue
 
                     closes_all = [float(k[4]) for k in klines]
                     live_price = closes_all[-1]
-                    closes = closes_all[:-1]  # Sadece kapanmış mumlar
+                    closes = closes_all[:-1]
                     if len(closes) < 201:
                         continue
 
@@ -1543,7 +1744,6 @@ def sma200_loop():
                     if sma_curr <= 0 or sma_live <= 0:
                         continue
 
-                    # 2) Kapanışta kırılım + Anlık canlı fiyatın hâlâ kırılım yönünde olması şartı
                     long_cross = (c_prev <= sma_prev) and (c_curr > sma_curr) and (live_price > max(sma_curr, sma_live))
                     short_cross = (c_prev >= sma_prev) and (c_curr < sma_curr) and (live_price < min(sma_curr, sma_live))
                     if not (long_cross or short_cross):
@@ -1559,24 +1759,28 @@ def sma200_loop():
 
                     if yon == "LONG":
                         baslik = f"🚀 <b>200 GÜNLÜK SMA KIRILIMI (LONG): {sym}</b>"
-                        aciklama = "Günlük kapanış 200 günlük basit hareketli ortalamanın üzerine çıktı ve canlı fiyat üstünde kalıcı."
+                        aciklama = "Günlük kapanış 200 SMA üzerine çıktı ve canlı fiyat üstünde kalıcı."
                     else:
                         baslik = f"🔻 <b>200 GÜNLÜK SMA KIRILIMI (SHORT): {sym}</b>"
-                        aciklama = "Günlük kapanış 200 günlük basit hareketli ortalamanın altına indi ve canlı fiyat altında kalıcı."
+                        aciklama = "Günlük kapanış 200 SMA altına indi ve canlı fiyat altında kalıcı."
 
                     msg = (
                         f"{baslik}\n"
                         f"<i>{ksrc} - 1 Günlük Grafik</i>\n\n"
-                        f"💰 <b>Günlük Kapanış:</b> {akilli_fiyat(c_curr)}\n"
+                        f"💰 <b>Kapanış:</b> {akilli_fiyat(c_curr)} ({fark_pct:+.2f}%)\n"
                         f"⚡ <b>Anlık Fiyat:</b> {akilli_fiyat(live_price)} ({live_fark_pct:+.2f}%)\n"
                         f"📉 <b>Önceki Kapanış:</b> {akilli_fiyat(c_prev)}\n"
-                        f"📊 <b>Önceki 200 SMA:</b> {akilli_fiyat(sma_prev)}\n"
-                        f"📊 <b>Güncel 200 SMA:</b> {akilli_fiyat(sma_curr)}\n"
-                        f"📈 <b>Kapanış Farkı:</b> {fark_pct:+.2f}%\n\n"
-                        f"💡 <b>Açıklama:</b> {aciklama}\n"
-                        f"ℹ️ <i>Sinyal yalnızca yeni kapanmış günlük mum + canlı fiyat teyidiyle oluşturulmuştur.</i>"
+                        f"📊 <b>Önceki 200 SMA:</b> {akilli_fiyat(sma_prev)} | <b>Güncel:</b> {akilli_fiyat(sma_curr)}\n"
+                        f"💡 <b>Açıklama:</b> {aciklama}"
                     )
-                    if tg(C, msg):
+                    sma200_series = calculate_sma_series_aligned(closes_all, 200)
+                    png = render_chart_png(
+                        sym, klines, "D1",
+                        subtitle=f"200 GUNLUK SMA KIRILIMI ({yon})",
+                        overlays=[("SMA200", sma200_series, (245, 158, 11))],
+                        hlines=[("200 SMA", sma_live, (245, 158, 11))],
+                    )
+                    if tg_photo(C, png, msg):
                         son_sma200_sinyalleri[key] = True
                         log("SMA200", f"{sym} {yon} (kapanış={c_curr}, canlı={live_price})")
                     time.sleep(0.05)
@@ -1587,7 +1791,7 @@ def sma200_loop():
 
 
 # =====================================================
-# MOTOR 12: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
+# MOTOR 12: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL - GÖRSEL)
 # =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Kırılım Motoru Başladı.")
@@ -1637,27 +1841,31 @@ def ath_atl_loop():
                     if prev_close >= atl and current_price < atl and live_price <= atl * 1.01:
                         sinyal = True; yon = "SHORT"; emoji = "💀"
                         stop = atl * 1.05; hedef = current_price * 0.80
-                        aciklama = "Fiyat geçmişteki en düşük seviyeyi (Tarihi Dip) hacimle aşağı kırdı."
+                        aciklama = "Fiyat tarihi dibi hacimle aşağı kırdı."
                     elif prev_close <= ath and current_price > ath and live_price >= ath * 0.99:
                         sinyal = True; yon = "LONG"; emoji = "🚀"
                         stop = ath * 0.95; hedef = current_price * 1.20
-                        aciklama = "Fiyat geçmişteki en yüksek seviyeyi (Tarihi Zirve) hacimle yukarı kırdı."
+                        aciklama = "Fiyat tarihi zirveyi hacimle yukarı kırdı."
 
                     if sinyal:
                         hedef_pct = ((hedef - current_price) / current_price) * 100.0
                         stop_pct = ((stop - current_price) / current_price) * 100.0
+                        seviye = ath if yon == "LONG" else atl
                         msg = (
                             f"{emoji} <b>TARİHİ SEVİYE KIRILIMI ({yon}): {symbol}</b>\n"
                             f"<i>{ksrc} - 1 Günlük Grafik</i>\n\n"
-                            f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(current_price)}\n"
-                            f"⚡ <b>Anlık Fiyat:</b> {akilli_fiyat(live_price)}\n"
+                            f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(current_price)} | ⚡ <b>Canlı:</b> {akilli_fiyat(live_price)}\n"
                             f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
-                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                            f"📊 <b>Kırılan Seviye:</b> {akilli_fiyat(ath if yon == 'LONG' else atl)}\n"
-                            f"📈 <b>Hacim:</b> {current_vol/avg_vol:.1f}x\n\n"
+                            f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n"
+                            f"📊 <b>Kırılan Seviye:</b> {akilli_fiyat(seviye)} | 📈 <b>Hacim:</b> {current_vol/avg_vol:.1f}x\n\n"
                             f"💡 <b>Açıklama:</b> {aciklama}"
                         )
-                        if tg(C, msg):
+                        png = render_chart_png(
+                            symbol, klines, "D1",
+                            subtitle=f"TARIHI SEVIYE KIRILIMI ({yon})",
+                            hlines=[("SEVIYE", seviye, (245, 158, 11)), ("HEDEF", hedef, (8, 153, 129)), ("STOP", stop, (242, 54, 69))],
+                        )
+                        if tg_photo(C, png, msg):
                             son_ath_atl_sinyalleri[symbol] = time.time()
                             log("ATH_ATL", f"🔥 {symbol} ({yon})")
                     time.sleep(0.05)
@@ -1668,7 +1876,7 @@ def ath_atl_loop():
 
 
 # =====================================================
-# MOTOR 13: GRAFİK FORMASYONLARI (4h / 1d)
+# MOTOR 13: GRAFİK FORMASYONLARI (4h / 1d - GÖRSEL)
 # =====================================================
 def chart_patterns_loop():
     log("PATTERN", "Grafik Formasyon Avcısı Başladı (4h/1d).")
@@ -1767,15 +1975,17 @@ def chart_patterns_loop():
                             msg = (
                                 f"{emoji} <b>GRAFİK FORMASYONU ({yon}): {symbol}</b>\n"
                                 f"<i>{ksrc} | {tf.upper()} Grafik - {formasyon_adi}</i>\n\n"
-                                f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(curr_close)}\n"
-                                f"⚡ <b>Anlık Fiyat:</b> {akilli_fiyat(live_price)}\n"
+                                f"💰 <b>Giriş (Kapanış):</b> {akilli_fiyat(curr_close)} | ⚡ <b>Canlı:</b> {akilli_fiyat(live_price)}\n"
                                 f"🎯 <b>Hedef:</b> {akilli_fiyat(hedef)} (<b>{hedef_pct:+.1f}%</b>)\n"
-                                f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n\n"
-                                f"📊 <b>Boyun Çizgisi:</b> {akilli_fiyat(neckline)}\n"
-                                f"📈 <b>Hacim Teyidi:</b> {curr_vol/avg_vol:.1f}x\n\n"
-                                f"💡 <b>Açıklama:</b> Fiyat formasyonu tamamlayıp boyun çizgisini hacimle kırdı."
+                                f"🛑 <b>Stop-Loss:</b> {akilli_fiyat(stop)} ({stop_pct:+.1f}%)\n"
+                                f"📊 <b>Boyun Çizgisi:</b> {akilli_fiyat(neckline)} | <b>Hacim:</b> {curr_vol/avg_vol:.1f}x"
                             )
-                            if tg(C, msg):
+                            png = render_chart_png(
+                                symbol, klines, tf.upper(),
+                                subtitle=f"{formasyon_adi} ({yon})",
+                                hlines=[("BOYUN", neckline, (245, 158, 11)), ("HEDEF", hedef, (8, 153, 129)), ("STOP", stop, (242, 54, 69))],
+                            )
+                            if tg_photo(C, png, msg):
                                 son_chart_pattern_sinyalleri[symbol] = time.time()
                                 log("PATTERN", f"🔥 {symbol} ({yon} - {formasyon_adi})")
                                 break
@@ -1837,14 +2047,16 @@ def anlik_ath_atl_loop():
                             f"24h {pct_24h:+.2f}% Vol {format_vol(vol_24h)}\n"
                             f"<i>{ksrc} | Önceki Dip: ${akilli_fiyat(hist_atl)}</i>"
                         )
+                        hlines = [("ATL", hist_atl, (242, 54, 69))]
                     else:
                         caption = (
                             f"#{symbol} ${akilli_fiyat(live_price)} all time high 🚀🔥🎉\n"
                             f"24h {pct_24h:+.2f}% Vol {format_vol(vol_24h)}\n"
                             f"<i>{ksrc} | Önceki Zirve: ${akilli_fiyat(hist_ath)}</i>"
                         )
+                        hlines = [("ATH", hist_ath, (8, 153, 129))]
 
-                    png = render_chart_png(symbol, klines, "D1")
+                    png = render_chart_png(symbol, klines, "D1", subtitle=f"ALL TIME {'LOW' if yon == 'ATL' else 'HIGH'}", hlines=hlines)
                     if tg_photo(C, png, caption):
                         son_anlik_ath_atl_sinyalleri[f"{symbol}_{yon}"] = time.time()
                         log("ANLIK_ATH_ATL", f"🔥 {symbol} {yon} @ {live_price}")
@@ -1856,7 +2068,7 @@ def anlik_ath_atl_loop():
 
 
 # =====================================================
-# MOTOR 15: SON 1 SAATİN HAREKETLİLERİ (TOP MOVERS)
+# MOTOR 15: SON 1 SAATİN HAREKETLİLERİ (TOP MOVERS - GÖRSEL)
 # =====================================================
 def top_movers_loop():
     log("TOP_MOVERS", "Son 1 Saatin Hareketlileri Motoru Başladı.")
@@ -1893,16 +2105,26 @@ def top_movers_loop():
                     sonuclar.sort(key=lambda x: x["chg"], reverse=True)
                     up = sonuclar[:3]
                     down = list(reversed(sonuclar[-3:]))
+                    max_m = max(abs(x["chg"]) for x in (up + down)) or 1.0
 
+                    card_rows = []
                     msg = f"⏱️ <b>Son 1 Saatin Hareketlileri</b> ({src})\n\n🟢 <b>En Çok Yükselenler:</b>\n"
                     for i, x in enumerate(up, 1):
                         msg += f"{i}. <b>{x['symbol']}</b> {x['chg']:+.2f}% | {akilli_fiyat(x['price'])}\n"
+                        card_rows.append((f"+ {x['symbol']}", f"{x['chg']:+.2f}% | {akilli_fiyat(x['price'])}", abs(x["chg"]) / max_m, (8, 153, 129)))
                     msg += "\n🔴 <b>En Çok Düşenler:</b>\n"
                     for i, x in enumerate(down, 1):
                         msg += f"{i}. <b>{x['symbol']}</b> {x['chg']:+.2f}% | {akilli_fiyat(x['price'])}\n"
+                        card_rows.append((f"- {x['symbol']}", f"{x['chg']:+.2f}% | {akilli_fiyat(x['price'])}", abs(x["chg"]) / max_m, (242, 54, 69)))
 
-                    if tg(C, msg):
-                        log("TOP_MOVERS", "Saatlik hareketliler raporu gönderildi.")
+                    png = render_card_png(
+                        "SON 1 SAATIN HAREKETLILERI",
+                        f"{src} - TAMAMLANAN 1 SAATLIK MUM PERFORMANSI",
+                        card_rows,
+                        footer=f"TSI {simdi().strftime('%H:%M')} | TOP 3 YUKSELEN & TOP 3 DUSEN",
+                    )
+                    if tg_photo(C, png, msg):
+                        log("TOP_MOVERS", "Görsel saatlik hareketliler raporu gönderildi.")
             time.sleep(TOP_MOVERS_ARALIGI)
         except Exception as e:
             log("TOP_MOVERS HATA", e)
@@ -1920,7 +2142,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         dom_str = datetime.fromtimestamp(_last_dominans_ts, TR_Saati).strftime("%H:%M:%S") if _last_dominans_ts else "Henüz yok"
         lines = [
             f"Ultimate Futures Bot Aktif! ({simdi().strftime('%Y-%m-%d %H:%M:%S')} TSI)",
-            f"Motor Sayisi: 15 | MAX_TARAMA: {MAX_TARAMA}",
+            f"Motor Sayisi: 15 (Tam Gorsel Mod) | MAX_TARAMA: {MAX_TARAMA}",
             f"Son TOP_GAINERS: {tg_str} | Son DOMINANS: {dom_str}",
             "Kaynak Durumlari: " + (", ".join(f"{k}={v}" for k, v in errs.items()) or "Baslatiliyor"),
         ]
@@ -1957,7 +2179,7 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
-    log("SİSTEM", "15 Motorlu Zırhlı Sinyal Botu Başlatılıyor...")
+    log("SİSTEM", "15 Motorlu Tam Görsel Sinyal Botu Başlatılıyor...")
     if not T:
         log("UYARI", "BOT_TOKEN ortam değişkeni boş! Telegram mesajı gönderilemez.")
 
