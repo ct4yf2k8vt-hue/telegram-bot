@@ -2,6 +2,8 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import json
+import re
+import collections
 import time
 import socket
 import os
@@ -107,34 +109,83 @@ def tg(chat_id, message):
         return False
 
 son_uyari = {"t": 0}
+ban = {"until": 0}
+istek_kuyrugu = collections.deque()
+kuyruk_kilit = threading.Lock()
+ticker_kilit = threading.Lock()
+ticker_cache = {"t": 0, "data": None}
+BUTCE = 1000  # dakikada en fazla bu kadar Binance ağırlığı (limit 2400)
 
 IPUCLARI = {
     "HTTP 451": "Binance bu sunucunun bölgesini engelliyor. Render'da servisi Frankfurt veya Singapore bölgesinde aç.",
     "HTTP 403": "Binance erişimi reddetti (IP/bölge engeli olabilir).",
-    "HTTP 429": "İstek limiti aşıldı, bot kısa süre bekliyor.",
-    "HTTP 418": "IP geçici olarak banlandı, bir süre sonra düzelir.",
+    "HTTP 429": "İstek limiti aşıldı.",
+    "HTTP 418": "IP geçici olarak banlandı.",
 }
 
-def api_uyari(neden, url):
+def api_uyari(neden, url, ek=""):
     if time.time() - son_uyari["t"] < 1800: return
     son_uyari["t"] = time.time()
-    tg(C, f"⚠️ <b>Binance bağlantı sorunu</b>\nNeden: {neden}\nAdres: ...{url.split('?')[0][-40:]}\n{IPUCLARI.get(neden, '')}")
+    tg(C, f"⚠️ <b>Binance bağlantı sorunu</b>\nNeden: {neden}\nAdres: ...{url.split('?')[0][-40:]}\n{IPUCLARI.get(neden, '')} {ek}")
 
-def gj(url):
-    headers = {'User-Agent': 'Mozilla/5.0'}
+def ban_ayarla(e):
+    ra = e.headers.get("Retry-After") if e.headers else None
+    sure = int(ra) if ra and ra.isdigit() else (300 if e.code == 418 else 60)
+    ban["until"] = max(ban["until"], time.time() + sure + 5)
+    return sure
+
+def agirlik(url):
+    if "ticker/24hr" in url and "symbol=" not in url: return 40
+    if "/klines" in url:
+        m = re.search(r"limit=(\d+)", url)
+        l = int(m.group(1)) if m else 500
+        return 1 if l < 100 else 2 if l < 500 else 5 if l <= 1000 else 10
+    return 1
+
+def butce_bekle(w):
+    while True:
+        with kuyruk_kilit:
+            now = time.time()
+            while istek_kuyrugu and now - istek_kuyrugu[0][0] > 60: istek_kuyrugu.popleft()
+            if sum(x[1] for x in istek_kuyrugu) + w <= BUTCE:
+                istek_kuyrugu.append((now, w))
+                return
+        time.sleep(1)
+
+def _istek(url):
+    if time.time() < ban["until"]:
+        time.sleep(1)
+        return None
+    butce_bekle(agirlik(url))
     try:
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=15) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         log("API", f"HTTP {e.code} -> {url.split('?')[0][-45:]}")
-        if e.code not in (400, 404): api_uyari(f"HTTP {e.code}", url)
-        if e.code in (418, 429): time.sleep(10)
+        ek = ""
+        if e.code in (418, 429):
+            sure = ban_ayarla(e)
+            ek = f"Bot {sure // 60 + 1} dk boyunca Binance'e istek atmayacak."
+        if e.code not in (400, 404): api_uyari(f"HTTP {e.code}", url, ek)
         return None
     except Exception as e:
         log("API", f"{type(e).__name__} -> {url.split('?')[0][-45:]}")
         api_uyari(type(e).__name__, url)
         return None
+
+def gj(url):
+    # Ticker verisi 60 sn boyunca ortak kullanılır (tüm motorlar tek istek paylaşır)
+    if url.endswith("/fapi/v1/ticker/24hr"):
+        with ticker_kilit:
+            if ticker_cache["data"] is not None and time.time() - ticker_cache["t"] < 55:
+                return ticker_cache["data"]
+            data = _istek(url)
+            if data is not None:
+                ticker_cache["data"] = data
+                ticker_cache["t"] = time.time()
+            return data
+    return _istek(url)
 
 def baglanti_testi():
     try:
@@ -144,7 +195,10 @@ def baglanti_testi():
         n = len(hacim_filtre(data, MIN_HACIM_PUMP))
         return True, f"✅ Binance Futures: bağlı ({len(data)} çift, {n} tanesi taranıyor)"
     except urllib.error.HTTPError as e:
-        return False, f"❌ Binance Futures: HTTP {e.code}\n{IPUCLARI.get(f'HTTP {e.code}', '')}"
+        ek = ""
+        if e.code in (418, 429):
+            ek = f" Yaklaşık {ban_ayarla(e) // 60 + 1} dk sonra tekrar denenecek."
+        return False, f"❌ Binance Futures: HTTP {e.code}\n{IPUCLARI.get(f'HTTP {e.code}', '')}{ek}"
     except Exception as e:
         return False, f"❌ Binance Futures: {type(e).__name__}"
 
@@ -327,7 +381,7 @@ def chartist_loop():
                 for tf in ['8h', '12h', '1d', '3d']:
                     cooldown_key = f"CH_{tf}_{symbol}"
                     if cooldown_key in son_sinyaller and time.time() - son_sinyaller[cooldown_key] < 86400: continue
-                    klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=500")
+                    klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=260")
                     if not isinstance(klines, list) or len(klines) < 205: continue
                     closes = [float(k[4]) for k in klines[:-1]]
                     curr, prev = closes[-1], closes[-2]
