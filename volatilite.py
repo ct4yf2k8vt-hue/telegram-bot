@@ -19,7 +19,6 @@ T = os.environ.get("BOT_TOKEN", "").strip()
 C = os.environ.get("CHAT_ID", "1623907197").strip()
 
 TR_Saati = timezone(timedelta(hours=3))
-BASE = "https://api.binance.com"
 FAPI = "https://fapi.binance.com"
 
 # MOTOR ÇALIŞMA SÜRELERİ
@@ -218,31 +217,26 @@ def find_pivots(highs, lows, window=3):
 # MOTOR 1: TOP GAINERS RAPORU (+ piyasa yönü)
 # =====================================================
 def top_gainers_loop():
-    log("TOP_GAINERS", "Günlük En İyi Hareketler Rapor Botu Başladı.")
+    log("TOP_GAINERS", "Günlük En İyi Hareketler Rapor Botu Başladı (Futures).")
     time.sleep(10)
     while True:
         try:
-            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(300); continue
 
-            trend_text, avg_chg, ups, downs = get_market_trend(tickers)
             temiz = [t for t in tickers if t['symbol'] not in YASAKLI_HISSELER and t['symbol'].endswith('USDT') and float(t.get('quoteVolume', 0)) > 5_000_000]
             temiz.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
             top_5 = temiz[:5]
 
             if top_5:
-                msg = "🔥 <b>Günün En İyi Hareketleri (24 Saat)</b>\n"
-                msg += "<i>Maksimum yükseliş yönü, hacim teyitli</i>\n\n"
-                msg += f"🌍 <b>Piyasa Yönü:</b> {trend_text}\n"
-                msg += f"📊 Ortalama: %{avg_chg:.2f} | Yükselen: {ups} | Düşen: {downs}\n\n"
+                msg = "🔥 <b>Günün En İyi Hareketleri (Binance Futures)</b>\n"
+                msg += "<i>24 saatlik yükseliş ve USDT hacmine göre</i>\n\n"
                 medals = ["🥇", "🥈", "🥉", "🏅", "⭐️"]
                 for i, t in enumerate(top_5):
                     symbol = t['symbol'].replace("USDT", "")
                     change = float(t['priceChangePercent'])
                     price = float(t['lastPrice'])
-                    change_str = f"+{change:.0f}%" if change > 0 else f"{change:.0f}%"
-                    msg += f"{medals[i]} <b>{symbol}</b> {change_str} | Fiyat: {akilli_fiyat(price)}\n"
-                msg += "\n👉 <i>En çok kazandıran coinler listelendi.</i>"
+                    msg += f"{medals[i]} {symbol} {change:+.2f}% | {akilli_fiyat(price)}\n"
                 tg(C, msg)
             time.sleep(TOP_GAINERS_ARALIGI)
         except Exception as e:
@@ -299,13 +293,13 @@ def chartist_loop():
     time.sleep(30)
     while True:
         try:
-            tickers = gj(f"{BASE}/api/v3/ticker/24hr")
+            tickers = gj(f"{FAPI}/fapi/v1/ticker/24hr")
             if not isinstance(tickers, list): time.sleep(60); continue
             for symbol in hacim_filtre(tickers, MIN_HACIM_CHARTIST):
                 for tf in ['8h', '12h', '1d', '3d']:
                     cooldown_key = f"CH_{tf}_{symbol}"
                     if cooldown_key in son_sinyaller and time.time() - son_sinyaller[cooldown_key] < 86400: continue
-                    klines = gj(f"{BASE}/api/v3/klines?symbol={symbol}&interval={tf}&limit=500")
+                    klines = gj(f"{FAPI}/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=500")
                     if not isinstance(klines, list) or len(klines) < 205: continue
                     closes = [float(k[4]) for k in klines[:-1]]
                     curr, prev = closes[-1], closes[-2]
@@ -314,7 +308,7 @@ def chartist_loop():
                         vol = [float(k[7]) for k in klines[:-1]]
                         if vol[-1] > sum(vol[-21:-1]) / 20:
                             sl = ema200[-1] * 0.97
-                            msg = (f"📈 <b>UZUN VADELİ SPOT (LONG): {symbol}</b>\n"
+                            msg = (f"📈 <b>UZUN VADELİ (LONG): {symbol}</b>\n"
                                    f"<i>{tf.upper()} EMA200 Kırılımı</i>\n\n"
                                    f"💰 <b>Giriş:</b> {akilli_fiyat(curr)}\n"
                                    f"🛑 <b>SL:</b> {akilli_fiyat(sl)}\n"
