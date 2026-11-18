@@ -30,6 +30,10 @@ BASE = "https://api.binance.com"
 DATA_API = "https://data-api.binance.vision"
 BYBIT = "https://api.bybit.com"
 GATE = "https://api.gateio.ws/api/v4"
+OKX = "https://www.okx.com/api/v5"
+BITGET = "https://api.bitget.com/api/v2"
+MEXC = "https://api.mexc.com/api/v3"
+KUCOIN = "https://api.kucoin.com/api/v1"
 COINGECKO = "https://api.coingecko.com/api/v3"
 
 MAX_TARAMA = 60
@@ -50,6 +54,7 @@ ATH_ATL_ARALIGI = 3600         # 1 Saat
 CHART_PATTERN_ARALIGI = 1800   # 30 Dakika
 ANLIK_ATH_ATL_ARALIGI = 180    # 3 Dakika
 TOP_MOVERS_ARALIGI = 3600      # 1 Saat
+ORDERFLOW_FIBO_ARALIGI = 900   # 15 Dakika
 
 # MİNİMUM HACİM FİLTRELERİ (USDT)
 MIN_HACIM_TOP_GAINERS = 5_000_000
@@ -66,6 +71,7 @@ MIN_HACIM_ATH_ATL = 5_000_000
 MIN_HACIM_PATTERN = 15_000_000
 MIN_HACIM_ANLIK_ATH_ATL = 3_000_000
 MIN_HACIM_TOP_MOVERS = 5_000_000
+MIN_HACIM_ORDERFLOW_FIBO = 5_000_000
 
 # YASAKLI VARLIKLAR (HİSSE SENETLERİ, ETF'LER VE EMTİALAR)
 YASAKLI_HISSELER = {
@@ -89,6 +95,7 @@ son_sma200_sinyalleri = {}
 son_ath_atl_sinyalleri = {}
 son_chart_pattern_sinyalleri = {}
 son_anlik_ath_atl_sinyalleri = {}
+son_orderflow_sinyalleri = {}
 
 # DURUM VE ÖNBELLEK DEĞİŞKENLERİ
 _lock = threading.RLock()
@@ -132,10 +139,22 @@ def format_vol(v):
     if v >= 1_000_000_000:
         return f"{v/1_000_000_000:.2f}B"
     if v >= 1_000_000:
-        return f"{v/1_000_000:.0f}M"
+        return f"{v/1_000_000:.1f}M"
     if v >= 1_000:
         return f"{v/1_000:.0f}K"
     return f"{v:.0f}"
+
+
+def _bucket_decimals(p):
+    if p >= 1000:
+        return 1
+    if p >= 10:
+        return 3
+    if p >= 1:
+        return 4
+    if p >= 0.01:
+        return 5
+    return 7
 
 
 def _bar_open_ms(kline_row):
@@ -167,7 +186,7 @@ def _mark_source_ok(src):
         _source_last_error[src] = "OK"
 
 
-def gj(url, src="NET", timeout=15):
+def gj(url, src="NET", timeout=15, quiet=False):
     if _source_blocked(src):
         return None
     headers = {"User-Agent": "Mozilla/5.0 (compatible; VolatilitySignalBot/1.0)"}
@@ -179,6 +198,8 @@ def gj(url, src="NET", timeout=15):
             return json.loads(raw)
     except urllib.error.HTTPError as e:
         code = e.code
+        if quiet and code in (400, 404):
+            return None
         retry_after = 0
         try:
             ra = e.headers.get("Retry-After")
@@ -195,11 +216,13 @@ def gj(url, src="NET", timeout=15):
         else:
             cd = 60
         _mark_source_error(src, f"HTTP {code} (bekleme {cd}s)", cd)
-        log("NET", f"{src} HTTP {code} -> {cd}s bekleme ({url.split('?')[0]})")
+        if not quiet:
+            log("NET", f"{src} HTTP {code} -> {cd}s bekleme ({url.split('?')[0]})")
         return None
     except Exception as e:
-        _mark_source_error(src, str(e)[:80], 45)
-        log("NET", f"{src} bağlantı hatası: {e}")
+        if not quiet:
+            _mark_source_error(src, str(e)[:80], 45)
+            log("NET", f"{src} bağlantı hatası: {e}")
         return None
 
 
@@ -490,8 +513,88 @@ def get_klines(symbol, interval, limit, market="FUTURES"):
     return None, "NONE"
 
 
+def get_multi_orderbook_flow(symbol, live_price):
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    ex_bids, ex_asks = [], []
+    bid_buckets, ask_buckets = {}, {}
+    active_ex = 0
+    low_lim = live_price * 0.94
+    high_lim = live_price * 1.06
+    dec = _bucket_decimals(live_price)
+
+    def add_levels(bids, asks):
+        nonlocal active_ex
+        if not bids or not asks:
+            return
+        active_ex += 1
+        for p_raw, q_raw in bids:
+            p, q = float(p_raw), float(q_raw)
+            if low_lim <= p <= live_price * 1.005:
+                usd = p * q
+                ex_bids.append(usd)
+                bp = round(p, dec)
+                bid_buckets[bp] = bid_buckets.get(bp, 0.0) + usd
+        for p_raw, q_raw in asks:
+            p, q = float(p_raw), float(q_raw)
+            if live_price * 0.995 <= p <= high_lim:
+                usd = p * q
+                ex_asks.append(usd)
+                ap = round(p, dec)
+                ask_buckets[ap] = ask_buckets.get(ap, 0.0) + usd
+
+    b = gj(f"{BYBIT}/v5/market/orderbook?category=linear&symbol={symbol}&limit=50", "BYBIT", 8, quiet=True)
+    if isinstance(b, dict) and b.get("retCode") == 0:
+        res = b.get("result", {})
+        add_levels(res.get("b", []), res.get("a", []))
+
+    bg = gj(f"{BITGET}/mix/market/merge-depth?productType=USDT-FUTURES&symbol={symbol}&limit=50", "BITGET", 8, quiet=True)
+    if isinstance(bg, dict) and bg.get("code") == "00000":
+        res = bg.get("data", {})
+        add_levels(res.get("bids", []), res.get("asks", []))
+
+    o = gj(f"{OKX}/market/books?instId={base}-USDT&sz=50", "OKX", 8, quiet=True)
+    if isinstance(o, dict) and o.get("code") == "0" and o.get("data"):
+        res = o["data"][0]
+        add_levels([(x[0], x[1]) for x in res.get("bids", [])], [(x[0], x[1]) for x in res.get("asks", [])])
+
+    gt = gj(f"{GATE}/spot/order_book?currency_pair={base}_USDT&limit=50", "GATE", 8, quiet=True)
+    if isinstance(gt, dict) and gt.get("bids"):
+        add_levels(gt.get("bids", []), gt.get("asks", []))
+
+    mx = gj(f"{MEXC}/depth?symbol={symbol}&limit=50", "MEXC", 8, quiet=True)
+    if isinstance(mx, dict) and mx.get("bids"):
+        add_levels(mx.get("bids", []), mx.get("asks", []))
+
+    kc = gj(f"{KUCOIN}/market/orderbook/level2_20?symbol={base}-USDT", "KUCOIN", 8, quiet=True)
+    if isinstance(kc, dict) and kc.get("code") == "200000":
+        res = kc.get("data", {})
+        add_levels(res.get("bids", []), res.get("asks", []))
+
+    bn = gj(f"{DATA_API}/api/v3/depth?symbol={symbol}&limit=50", "DATA_API", 8, quiet=True)
+    if isinstance(bn, dict) and bn.get("bids"):
+        add_levels(bn.get("bids", []), bn.get("asks", []))
+
+    if active_ex < 2:
+        return None
+
+    tot_bid = sum(ex_bids)
+    tot_ask = sum(ex_asks)
+    top_bid = max(bid_buckets.items(), key=lambda x: x[1]) if bid_buckets else (live_price * 0.98, 0.0)
+    top_ask = max(ask_buckets.items(), key=lambda x: x[1]) if ask_buckets else (live_price * 1.02, 0.0)
+
+    return {
+        "exchanges": active_ex,
+        "total_bid": tot_bid,
+        "total_ask": tot_ask,
+        "bid_wall_price": top_bid[0],
+        "bid_wall_usd": top_bid[1],
+        "ask_wall_price": top_ask[0],
+        "ask_wall_usd": top_ask[1],
+    }
+
+
 # =====================================================
-# TEKNİK ANALİZ YARDIMCILARI
+# TEKNİK ANALİZ VE HACİM PROFİLİ (VAH / VAL)
 # =====================================================
 
 def calculate_ema(prices, period):
@@ -521,6 +624,52 @@ def calculate_sma_series_aligned(prices, period):
         running += prices[i] - prices[i - period]
         out[i] = running / period
     return out
+
+
+def calculate_volume_profile(klines, bins=40):
+    if not klines or len(klines) < 20:
+        return None
+    lows = [float(k[3]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    p_min, p_max = min(lows), max(highs)
+    if p_max <= p_min:
+        return None
+
+    step = (p_max - p_min) / bins
+    hist = [0.0] * bins
+    for k in klines:
+        lo, hi, qv = float(k[3]), float(k[2]), float(k[7])
+        b0 = max(0, min(bins - 1, int((lo - p_min) / step)))
+        b1 = max(0, min(bins - 1, int((hi - p_min) / step)))
+        share = qv / max(1, b1 - b0 + 1)
+        for bi in range(b0, b1 + 1):
+            hist[bi] += share
+
+    total_v = sum(hist)
+    if total_v <= 0:
+        return None
+    poc_idx = max(range(bins), key=lambda i: hist[i])
+    va_vol = hist[poc_idx]
+    lo_idx = poc_idx
+    hi_idx = poc_idx
+    target = total_v * 0.70
+
+    while va_vol < target and (lo_idx > 0 or hi_idx < bins - 1):
+        left_v = hist[lo_idx - 1] if lo_idx > 0 else -1.0
+        right_v = hist[hi_idx + 1] if hi_idx < bins - 1 else -1.0
+        if left_v >= right_v and lo_idx > 0:
+            lo_idx -= 1
+            va_vol += hist[lo_idx]
+        elif hi_idx < bins - 1:
+            hi_idx += 1
+            va_vol += hist[hi_idx]
+        else:
+            break
+
+    val = p_min + lo_idx * step
+    vah = p_min + (hi_idx + 1) * step
+    poc = p_min + (poc_idx + 0.5) * step
+    return {"poc": poc, "vah": vah, "val": val}
 
 
 def calculate_rsi(prices, period=14):
@@ -799,7 +948,7 @@ def render_chart_png(symbol, klines, title_suffix="D1", subtitle="", overlays=No
         cyan = (56, 189, 248)
         muted = (145, 152, 168)
 
-        left, right = 18, W - 94
+        left, right = 18, W - 98
         for gy in (42, 102, 162, 222, 282, 296, 372, 386, 421, 456):
             cv.line(left, gy, right, gy, grid)
         for gx in range(left, right + 1, max(1, (right - left) // 5)):
@@ -847,7 +996,7 @@ def render_chart_png(symbol, klines, title_suffix="D1", subtitle="", overlays=No
                     yy = py_price(hp)
                     cv.line(left, yy, right, yy, col, dashed=True)
                     cv.rect(right + 2, yy - 5, W - 4, yy + 7, col)
-                    cv.text(right + 5, yy - 2, lbl[:10], (15, 18, 25), scale=1)
+                    cv.text(right + 5, yy - 2, lbl[:11], (15, 18, 25), scale=1)
 
         for i in range(n):
             cx = int(left + (i + 0.5) * slot_w)
@@ -933,7 +1082,7 @@ def render_card_png(title, subtitle, rows, footer=""):
 
 
 # =====================================================
-# MOTOR 1: GÜNÜN EN İYİ HAREKETLERİ (TOP GAINERS - GÖRSEL)
+# MOTOR 1: GÜNÜN EN İYİ HAREKETLERİ (TOP GAINERS)
 # =====================================================
 def top_gainers_loop():
     global _last_top_gainers_ts
@@ -986,7 +1135,7 @@ def top_gainers_loop():
 
 
 # =====================================================
-# MOTOR 2: GÜNÜN KAZANANI (PUMP WINNER - GÖRSEL)
+# MOTOR 2: GÜNÜN KAZANANI (PUMP WINNER)
 # =====================================================
 def pump_winner_loop():
     log("PUMP_WINNER", "Günün Kazananı Rapor Botu Başladı.")
@@ -1047,7 +1196,7 @@ def pump_winner_loop():
 
 
 # =====================================================
-# MOTOR 3: PİYASA YÖNÜ & DOMİNANS RAPORU (GÖRSEL)
+# MOTOR 3: PİYASA YÖNÜ & DOMİNANS RAPORU
 # =====================================================
 def dominans_loop():
     global _last_dominans_ts
@@ -1120,7 +1269,7 @@ def dominans_loop():
 
 
 # =====================================================
-# MOTOR 4: CHARTIST (SPOT EMA200 KIRILIMI - GÖRSEL)
+# MOTOR 4: CHARTIST (SPOT EMA200 KIRILIMI)
 # =====================================================
 def chartist_loop():
     log("CHARTIST", "Zırhlı Spot EMA200 Motoru Başladı.")
@@ -1185,7 +1334,7 @@ def chartist_loop():
 
 
 # =====================================================
-# MOTOR 5: ANLIK PUMP AVCISI (5m + TRAP RADAR - GÖRSEL)
+# MOTOR 5: ANLIK PUMP AVCISI (5m + TRAP RADAR)
 # =====================================================
 def pump_loop():
     log("PUMP", "Anlık Pump Avcısı Başladı (5m).")
@@ -1244,7 +1393,7 @@ def pump_loop():
 
 
 # =====================================================
-# MOTOR 6: ANORMAL VOLATİLİTE VE DUMP AVCISI (15m - GÖRSEL)
+# MOTOR 6: ANORMAL VOLATİLİTE VE DUMP AVCISI (15m)
 # =====================================================
 def volatilite_loop():
     log("VOLATILITE", "Anormal Volatilite ve Dump Avcısı Başladı (15m).")
@@ -1305,7 +1454,7 @@ def volatilite_loop():
 
 
 # =====================================================
-# MOTOR 7: TEYİTLİ FORMASYON (5m FORMASYON - GÖRSEL)
+# MOTOR 7: TEYİTLİ FORMASYON (5m FORMASYON - 15m TREND)
 # =====================================================
 def formasyon_loop():
     log("FORMASYON", "Teyitli Formasyon ve Likidite Avcısı Başladı.")
@@ -1441,7 +1590,7 @@ def formasyon_loop():
 
 
 # =====================================================
-# MOTOR 8: ICHIMOKU BULUTU (1h - GÖRSEL)
+# MOTOR 8: ICHIMOKU BULUTU (1h)
 # =====================================================
 def ichimoku_loop():
     log("ICHIMOKU", "Zırhlı Ichimoku Bulut Motoru Başladı.")
@@ -1559,7 +1708,7 @@ def ichimoku_loop():
 
 
 # =====================================================
-# MOTOR 9: EMA RIBBON (1d - GÖRSEL)
+# MOTOR 9: EMA RIBBON (1d)
 # =====================================================
 def ema_ribbon_loop():
     log("EMA_RIBBON", "EMA Dizilim Motoru Başladı.")
@@ -1634,7 +1783,7 @@ def ema_ribbon_loop():
 
 
 # =====================================================
-# MOTOR 10: MACD GOLDEN CROSS (1d - GÖRSEL)
+# MOTOR 10: MACD GOLDEN CROSS (1d)
 # =====================================================
 def macd_loop():
     log("MACD", "MACD Motoru Başladı.")
@@ -1704,7 +1853,7 @@ def macd_loop():
 
 
 # =====================================================
-# MOTOR 11: 200 GÜNLÜK SMA KIRILIMI (DÜZELTİLMİŞ + GÖRSEL)
+# MOTOR 11: 200 GÜNLÜK SMA KIRILIMI (DÜZELTİLMİŞ)
 # =====================================================
 def sma200_loop():
     log("SMA200", "200 Günlük SMA Kırılım Botu Başladı.")
@@ -1791,7 +1940,7 @@ def sma200_loop():
 
 
 # =====================================================
-# MOTOR 12: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL - GÖRSEL)
+# MOTOR 12: TARİHİ ZİRVE / DİP KIRILIMI (ATH / ATL)
 # =====================================================
 def ath_atl_loop():
     log("ATH_ATL", "Tarihi Zirve/Dip Kırılım Motoru Başladı.")
@@ -1876,7 +2025,7 @@ def ath_atl_loop():
 
 
 # =====================================================
-# MOTOR 13: GRAFİK FORMASYONLARI (4h / 1d - GÖRSEL)
+# MOTOR 13: GRAFİK FORMASYONLARI (4h / 1d)
 # =====================================================
 def chart_patterns_loop():
     log("PATTERN", "Grafik Formasyon Avcısı Başladı (4h/1d).")
@@ -2068,7 +2217,7 @@ def anlik_ath_atl_loop():
 
 
 # =====================================================
-# MOTOR 15: SON 1 SAATİN HAREKETLİLERİ (TOP MOVERS - GÖRSEL)
+# MOTOR 15: SON 1 SAATİN HAREKETLİLERİ (TOP MOVERS)
 # =====================================================
 def top_movers_loop():
     log("TOP_MOVERS", "Son 1 Saatin Hareketlileri Motoru Başladı.")
@@ -2132,6 +2281,148 @@ def top_movers_loop():
 
 
 # =====================================================
+# MOTOR 16: ÇOKLU BORSA EMİR AKIŞI + FİBONACCİ + VAH/VAL
+# =====================================================
+def orderflow_fibo_loop():
+    log("ORDERFLOW_FIBO", "7 Borsa Emir Akışı + Fibonacci + VAH/VAL Motoru Başladı.")
+    time.sleep(180)
+    while True:
+        try:
+            tickers, _ = get_futures_tickers()
+            if tickers:
+                adaylar = [
+                    t for t in tickers
+                    if t["symbol"].endswith("USDT")
+                    and t["symbol"] not in YASAKLI_HISSELER
+                    and float(t.get("quoteVolume", 0)) >= MIN_HACIM_ORDERFLOW_FIBO
+                ]
+                adaylar.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+
+                for coin in adaylar[:MAX_TARAMA]:
+                    sym = coin["symbol"]
+                    if sym in son_orderflow_sinyalleri and time.time() - son_orderflow_sinyalleri[sym] < 21600:
+                        continue
+
+                    klines_4h, ksrc = get_klines(sym, "4h", 120, "FUTURES")
+                    klines_1d, _ = get_klines(sym, "1d", 40, "FUTURES")
+                    if not klines_4h or len(klines_4h) < 70:
+                        continue
+
+                    highs = [float(k[2]) for k in klines_4h]
+                    lows = [float(k[3]) for k in klines_4h]
+                    closes = [float(k[4]) for k in klines_4h]
+                    live_price = float(coin["lastPrice"]) or closes[-1]
+                    if live_price <= 0:
+                        continue
+
+                    w_highs = highs[-60:]
+                    w_lows = lows[-60:]
+                    sh = max(w_highs)
+                    sl = min(w_lows)
+                    sh_idx = len(w_highs) - 1 - w_highs[::-1].index(sh)
+                    sl_idx = len(w_lows) - 1 - w_lows[::-1].index(sl)
+                    rng = sh - sl
+                    if sl <= 0 or (rng / sl) < 0.05:
+                        continue
+
+                    vp = calculate_volume_profile(klines_4h[-100:])
+                    if not vp:
+                        continue
+                    val_p, vah_p = vp["val"], vp["vah"]
+
+                    ema21_4h = calculate_ema(closes, 21)
+                    trend_4h_up = bool(ema21_4h and live_price > ema21_4h[-1])
+                    trend_1d_up = trend_4h_up
+                    if klines_1d and len(klines_1d) >= 22:
+                        c1d = [float(k[4]) for k in klines_1d]
+                        e21_1d = calculate_ema(c1d, 21)
+                        if e21_1d:
+                            trend_1d_up = c1d[-1] > e21_1d[-1]
+
+                    yon = None
+                    trig = tp1 = tp2 = tp3 = stop_tight = stop_cons = 0.0
+
+                    if sh_idx < sl_idx:
+                        fib_618 = sh - 0.618 * rng
+                        fib_500 = sh - 0.500 * rng
+                        fib_382 = sh - 0.382 * rng
+                        if abs(live_price - fib_618) / fib_618 <= 0.015:
+                            yon = "LONG"
+                            trig, tp1, tp2, tp3 = fib_618, fib_500, fib_382, sh
+                            struct_low = min(lows[-8:])
+                            stop_tight = min(struct_low, live_price * 0.985)
+                            stop_cons = val_p if val_p < stop_tight * 0.995 else live_price * 0.94
+
+                    elif sl_idx < sh_idx:
+                        fib_618 = sl + 0.618 * rng
+                        fib_500 = sl + 0.500 * rng
+                        fib_382 = sl + 0.382 * rng
+                        if abs(live_price - fib_618) / fib_618 <= 0.015:
+                            yon = "SHORT"
+                            trig, tp1, tp2, tp3 = fib_618, fib_500, fib_382, sl
+                            struct_high = max(highs[-8:])
+                            stop_tight = max(struct_high, live_price * 1.015)
+                            stop_cons = vah_p if vah_p > stop_tight * 1.005 else live_price * 1.06
+
+                    if not yon:
+                        continue
+                    if (yon == "LONG" and tp1 <= live_price) or (yon == "SHORT" and tp1 >= live_price):
+                        continue
+
+                    ob = get_multi_orderbook_flow(sym, live_price)
+                    if not ob:
+                        continue
+
+                    if yon == "LONG" and ob["total_bid"] < ob["total_ask"] * 1.10:
+                        continue
+                    if yon == "SHORT" and ob["total_ask"] < ob["total_bid"] * 1.10:
+                        continue
+
+                    tp1_pct = ((tp1 - live_price) / live_price) * 100.0
+                    tp2_pct = ((tp2 - live_price) / live_price) * 100.0
+                    tp3_pct = ((tp3 - live_price) / live_price) * 100.0
+                    st1_pct = ((stop_tight - live_price) / live_price) * 100.0
+                    st2_pct = ((stop_cons - live_price) / live_price) * 100.0
+                    if abs(st1_pct) > 6.0 or abs(tp1_pct) < 0.8:
+                        continue
+
+                    trend_text = "yükselişte 🟢" if (trend_4h_up and trend_1d_up) else ("karşı-trendde 📉" if yon == "LONG" and not trend_1d_up else "zayıf/karışık ⚖️")
+                    yon_emoji = "⚡" if yon == "LONG" else "🔻"
+
+                    msg = (
+                        f"#{sym} {yon_emoji} <b>{yon} | ÇOKLU BORSA AKIŞI + FİBO</b>\n"
+                        f"💰 <b>Fiyat:</b> {akilli_fiyat(live_price)}\n"
+                        f"🎯 <b>Hedefler:</b> {akilli_fiyat(tp1)} (<b>{tp1_pct:+.1f}%</b>) → {akilli_fiyat(tp2)} (<b>{tp2_pct:+.1f}%</b>) → {akilli_fiyat(tp3)} (<b>{tp3_pct:+.1f}%</b>)\n"
+                        f"🛑 <b>İptal / Stop:</b> {akilli_fiyat(stop_tight)} (<b>{st1_pct:+.1f}%</b>) | VAL/VAH: {akilli_fiyat(stop_cons)} (<b>{st2_pct:+.1f}%</b>)\n\n"
+                        f"📊 <b>Trend & Akış:</b> 4h/1d {trend_text}, <b>{ob['exchanges']} borsa</b> akışı <b>{yon}</b> seçti. Ana tetik <b>Fib 0.618</b> ({akilli_fiyat(trig)}).\n"
+                        f"🧱 <b>Ask Duvarı:</b> ${format_vol(ob['ask_wall_usd'])} ({akilli_fiyat(ob['ask_wall_price'])})\n"
+                        f"🛡️ <b>Bid Duvarı:</b> ${format_vol(ob['bid_wall_usd'])} ({akilli_fiyat(ob['bid_wall_price'])})"
+                    )
+
+                    vp_lbl = "STOP VAL" if yon == "LONG" else "STOP VAH"
+                    png = render_chart_png(
+                        sym, klines_4h, "H4",
+                        subtitle=f"{ob['exchanges']} BORSA AKISI {yon} | FIB 0.618",
+                        hlines=[
+                            ("TP3 SWING", tp3, (8, 153, 129)),
+                            ("TP2 F382", tp2, (8, 153, 129)),
+                            ("TP1 F50", tp1, (8, 153, 129)),
+                            ("TETIK 618", trig, (56, 189, 248)),
+                            ("STOP SIKI", stop_tight, (242, 54, 69)),
+                            (vp_lbl, stop_cons, (245, 158, 11)),
+                        ],
+                    )
+                    if tg_photo(C, png, msg):
+                        son_orderflow_sinyalleri[sym] = time.time()
+                        log("ORDERFLOW_FIBO", f"🔥 {sym} {yon} ({ob['exchanges']} borsa, Fib={akilli_fiyat(trig)})")
+                    time.sleep(0.05)
+            time.sleep(ORDERFLOW_FIBO_ARALIGI)
+        except Exception as e:
+            log("ORDERFLOW_FIBO HATA", e)
+            time.sleep(60)
+
+
+# =====================================================
 # RENDER WEB SUNUCUSU VE CANLI DURUM PANELİ
 # =====================================================
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -2142,7 +2433,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         dom_str = datetime.fromtimestamp(_last_dominans_ts, TR_Saati).strftime("%H:%M:%S") if _last_dominans_ts else "Henüz yok"
         lines = [
             f"Ultimate Futures Bot Aktif! ({simdi().strftime('%Y-%m-%d %H:%M:%S')} TSI)",
-            f"Motor Sayisi: 15 (Tam Gorsel Mod) | MAX_TARAMA: {MAX_TARAMA}",
+            f"Motor Sayisi: 16 (Tam Gorsel Mod + 7 Borsa Orderflow) | MAX_TARAMA: {MAX_TARAMA}",
             f"Son TOP_GAINERS: {tg_str} | Son DOMINANS: {dom_str}",
             "Kaynak Durumlari: " + (", ".join(f"{k}={v}" for k, v in errs.items()) or "Baslatiliyor"),
         ]
@@ -2179,7 +2470,7 @@ def run_web_server():
 # BAŞLAT
 # =====================================================
 if __name__ == "__main__":
-    log("SİSTEM", "15 Motorlu Tam Görsel Sinyal Botu Başlatılıyor...")
+    log("SİSTEM", "16 Motorlu Tam Görsel + Emir Akışı Botu Başlatılıyor...")
     if not T:
         log("UYARI", "BOT_TOKEN ortam değişkeni boş! Telegram mesajı gönderilemez.")
 
@@ -2199,6 +2490,7 @@ if __name__ == "__main__":
         ("PATTERN", chart_patterns_loop),
         ("ANLIK_ATH_ATL", anlik_ath_atl_loop),
         ("TOP_MOVERS", top_movers_loop),
+        ("ORDERFLOW_FIBO", orderflow_fibo_loop),
     ]
 
     for name, fn in motors:
