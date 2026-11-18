@@ -106,6 +106,20 @@ def tg(chat_id, message):
         log("TG", f"Hata: {type(e).__name__}: {e}")
         return False
 
+son_uyari = {"t": 0}
+
+IPUCLARI = {
+    "HTTP 451": "Binance bu sunucunun bölgesini engelliyor. Render'da servisi Frankfurt veya Singapore bölgesinde aç.",
+    "HTTP 403": "Binance erişimi reddetti (IP/bölge engeli olabilir).",
+    "HTTP 429": "İstek limiti aşıldı, bot kısa süre bekliyor.",
+    "HTTP 418": "IP geçici olarak banlandı, bir süre sonra düzelir.",
+}
+
+def api_uyari(neden, url):
+    if time.time() - son_uyari["t"] < 1800: return
+    son_uyari["t"] = time.time()
+    tg(C, f"⚠️ <b>Binance bağlantı sorunu</b>\nNeden: {neden}\nAdres: ...{url.split('?')[0][-40:]}\n{IPUCLARI.get(neden, '')}")
+
 def gj(url):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -114,11 +128,25 @@ def gj(url):
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         log("API", f"HTTP {e.code} -> {url.split('?')[0][-45:]}")
+        if e.code not in (400, 404): api_uyari(f"HTTP {e.code}", url)
         if e.code in (418, 429): time.sleep(10)
         return None
     except Exception as e:
         log("API", f"{type(e).__name__} -> {url.split('?')[0][-45:]}")
+        api_uyari(type(e).__name__, url)
         return None
+
+def baglanti_testi():
+    try:
+        req = urllib.request.Request(f"{FAPI}/fapi/v1/ticker/24hr", headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        n = len(hacim_filtre(data, MIN_HACIM_PUMP))
+        return True, f"✅ Binance Futures: bağlı ({len(data)} çift, {n} tanesi taranıyor)"
+    except urllib.error.HTTPError as e:
+        return False, f"❌ Binance Futures: HTTP {e.code}\n{IPUCLARI.get(f'HTTP {e.code}', '')}"
+    except Exception as e:
+        return False, f"❌ Binance Futures: {type(e).__name__}"
 
 def hacim_filtre(tickers, min_hacim):
     """USDT çiftleri, yasaklı varlıklar hariç, minimum hacim üstü."""
@@ -1065,7 +1093,9 @@ if __name__ == "__main__":
     for m in motorlar:
         threading.Thread(target=m, daemon=True).start()
 
-    if tg(C, f"✅ <b>Bot başladı</b> ({simdi().strftime('%d.%m %H:%M')})\n{len(motorlar)} motor aktif."):
+    ok, binance_durum = baglanti_testi()
+    bilgi = "İlk rapor birkaç saniye içinde gelecek." if ok else "Bot çalışıyor ama Binance verisi alınamıyor, sinyal gelmez."
+    if tg(C, f"🤖 <b>Bot başladı</b> ({simdi().strftime('%d.%m %H:%M')})\n✅ Telegram: bağlı\n{binance_durum}\n\n{bilgi}"):
         log("SİSTEM", "Telegram bağlantısı OK.")
     else:
         log("SİSTEM", "⚠️ Telegram mesajı gönderilemedi! BOT_TOKEN / CHAT_ID kontrol et.")
