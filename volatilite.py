@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SPOT ANLIK PUMP DEDEKTORU (0-7 Dk Canli Pencere + Canli Mum Grafikli PNG)
-Sifir harici kutuphane - Yalnizca Python 3 standart kutuphanesi (Render uyumlu)
+CRYPTO SPOT BOTU (2 AKTIF MOTOR - SIFIR HARICI KUTUPHANE)
+1) SPOT ANLIK PUMP DEDEKTORU (0-7 Dk Canli Pencere + 1m Mum Grafikli PNG)
+2) TUM ZAMANLARIN EN DUSUGU - ATL (Binance W1 Grafikli: Fiyat + Hacim $M + RSI)
 """
 
 import os
@@ -25,20 +26,23 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 TR_TZ = timezone(timedelta(hours=3))
 
-# Tarama ve pencere ayarlari
+# Motor 1: 0-7 Dk Spot Pump Ayarlari
 SCAN_INTERVAL_SEC = 20          # Kac saniyede bir canli fiyat cekilsin
 PUMP_WINDOW_SEC = 420           # 7 dakika = 420 saniye
-COOLDOWN_SEC = 1800             # Ayni parite icin tekrar bildirim bekleme suresi (30 dk)
-
-# Esik degerleri
-MIN_PUMP_PCT_USDT = 4.5         # USDT paritelerinde 0-7 dk icinde min %4.5 sicrama
+PUMP_COOLDOWN_SEC = 1800        # Ayni parite pump bekleme suresi (30 dk)
+MIN_PUMP_PCT_USDT = 4.5         # USDT paritelerinde min %4.5 sicrama
 MIN_PUMP_PCT_ALTQ = 4.0         # BTC / BNB paritelerinde min %4.0 sicrama
 
 MIN_VOL_24H = {
-    "USDT": 500_000.0,          # 24s hacim en az 500k USDT
-    "BTC": 8.0,                 # 24s hacim en az 8 BTC
-    "BNB": 400.0,               # 24s hacim en az 400 BNB
+    "USDT": 500_000.0,
+    "BTC": 8.0,
+    "BNB": 400.0,
 }
+
+# Motor 2: Tum Zamanlarin En Dusugu (ATL - W1) Ayarlari
+ATL_SCAN_INTERVAL_SEC = 300     # 5 dakikada bir ATL taramasi
+ATL_MIN_VOL_24H_USDT = 500_000.0
+ATL_COOLDOWN_SEC = 43200        # Ayni coin icin 12 saat bekleme (veya %2 daha duserse)
 
 # Sabit coinler ve kaldiracli/hisse/istenmeyen token filtreleri
 HARIC_SEMBOLLER = {
@@ -60,14 +64,17 @@ BINANCE_SPOT_MIRRORS = [
 
 # Bellek durumlari
 _SPOT_WINDOW = {}       # symbol -> list of (ts, price)
-_COOLDOWN = {}          # symbol -> last_alert_ts
+_PUMP_COOLDOWN = {}     # symbol -> last_alert_ts
+_ATL_HISTORY = {}       # symbol -> (last_ts, last_reported_atl_price)
 _STATE_LOCK = threading.Lock()
 _STATS = {
     "started_at": time.time(),
-    "scans": 0,
-    "signals": 0,
-    "last_scan_ok": 0.0,
-    "last_symbol": "-",
+    "pump_scans": 0,
+    "pump_signals": 0,
+    "atl_scans": 0,
+    "atl_signals": 0,
+    "last_pump_symbol": "-",
+    "last_atl_symbol": "-",
 }
 
 
@@ -92,11 +99,39 @@ def fmt_price(p):
     return f"{p:.10f}"
 
 
+def fmt_price_short(p):
+    """ATL mesaj basligi icin sade fiyat gosterimi ($0.177 gibi)."""
+    if p <= 0:
+        return "0"
+    if p >= 1000:
+        return f"{p:,.0f}"
+    if p >= 10:
+        return f"{p:.2f}"
+    if p >= 0.1:
+        return f"{p:.3f}"
+    if p >= 0.001:
+        return f"{p:.5f}"
+    return f"{p:.7f}"
+
+
+def fmt_vol_short(v):
+    """Hacmi 8M, 12.4M, 850K formatinda kisaltir."""
+    if v >= 1_000_000_000:
+        val = v / 1_000_000_000.0
+        return f"{val:.1f}B" if val < 10 else f"{val:.0f}B"
+    if v >= 1_000_000:
+        val = v / 1_000_000.0
+        return f"{val:.1f}M" if val < 10 and abs(val - round(val)) > 0.05 else f"{val:.0f}M"
+    if v >= 1_000:
+        return f"{v / 1_000.0:.0f}K"
+    return f"{v:.0f}"
+
+
 def http_get_json(url, timeout=8):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotPumpBot/1.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotPumpATLBot/2.0)",
             "Accept": "application/json",
         },
     )
@@ -119,7 +154,7 @@ def fetch_spot_tickers():
 
 
 def fetch_spot_klines(symbol, interval="1m", limit=60, preferred_base=None):
-    """Canli grafik icin spot mum verisini ceker (1m son 60 dk)."""
+    """Spot mum verisini ceker (quoteVolume dahil)."""
     mirrors = list(BINANCE_SPOT_MIRRORS)
     if preferred_base and preferred_base in mirrors:
         mirrors.remove(preferred_base)
@@ -129,7 +164,7 @@ def fetch_spot_klines(symbol, interval="1m", limit=60, preferred_base=None):
         try:
             url = f"{base}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
             raw = http_get_json(url, timeout=8)
-            if isinstance(raw, list) and len(raw) >= 10:
+            if isinstance(raw, list) and len(raw) >= 2:
                 candles = []
                 for k in raw:
                     candles.append({
@@ -139,6 +174,7 @@ def fetch_spot_klines(symbol, interval="1m", limit=60, preferred_base=None):
                         "l": float(k[3]),
                         "c": float(k[4]),
                         "v": float(k[5]),
+                        "qv": float(k[7]) if len(k) > 7 else float(k[5]) * float(k[4]),
                     })
                 return candles
         except Exception:
@@ -168,6 +204,36 @@ def is_valid_symbol(symbol):
     return True
 
 
+def calc_rsi_series(closes, period=14):
+    """Her mum icin RSI dizisi uretir."""
+    n = len(closes)
+    if n < 2:
+        return [50.0] * n
+    rsis = [50.0] * n
+    gains = []
+    losses = []
+    for i in range(1, n):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
+    p = min(period, len(gains))
+    avg_gain = sum(gains[:p]) / p
+    avg_loss = sum(losses[:p]) / p
+
+    for i in range(1, n):
+        idx = i - 1
+        if idx >= p:
+            avg_gain = (avg_gain * (p - 1) + gains[idx]) / p
+            avg_loss = (avg_loss * (p - 1) + losses[idx]) / p
+        if avg_loss == 0:
+            rsis[i] = 100.0 if avg_gain > 0 else 50.0
+        else:
+            rs = avg_gain / avg_loss
+            rsis[i] = 100.0 - (100.0 / (1.0 + rs))
+    return rsis
+
+
 # ==============================================================================
 # 3. TELEGRAM GONDERIM (HTML & CANLI PNG FOTO)
 # ==============================================================================
@@ -193,7 +259,7 @@ def tg_send_text(chat_id, text):
         return False
 
 
-def tg_send_photo(chat_id, png_bytes, caption):
+def tg_send_photo(chat_id, png_bytes, caption, filename="chart.png"):
     if not BOT_TOKEN:
         print(f"[TG PHOTO YOK - BOT_TOKEN BOS] bytes={len(png_bytes)}\n{caption}")
         return False
@@ -214,7 +280,7 @@ def tg_send_photo(chat_id, png_bytes, caption):
 
     parts.append(f"--{boundary}\r\n".encode("utf-8"))
     parts.append(
-        b'Content-Disposition: form-data; name="photo"; filename="spot_pump.png"\r\n'
+        f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode("utf-8")
     )
     parts.append(b"Content-Type: image/png\r\n\r\n")
     parts.append(png_bytes)
@@ -237,7 +303,7 @@ def tg_send_photo(chat_id, png_bytes, caption):
 
 
 # ==============================================================================
-# 4. SAF PYTHON CANLI MUM GRAFIGI PNG MOTORU (5x7 BITMAP FONT + CANDLESTICK)
+# 4. SAF PYTHON CANLI GRAFIK PNG MOTORU (5x7 BITMAP FONT + CANDLESTICK)
 # ==============================================================================
 _FONT5X7 = {
     "A": [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
@@ -283,6 +349,7 @@ _FONT5X7 = {
     ":": [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00],
     "/": [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10],
     "%": [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03],
+    "$": [0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04],
     "(": [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
     ")": [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
     ">": [0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10],
@@ -339,6 +406,10 @@ class _Canvas:
                 err += dx
                 y0 += sy
 
+    def thick_line(self, x0, y0, x1, y1, col):
+        self.line(x0, y0, x1, y1, col)
+        self.line(x0, y0 + 1, x1, y1 + 1, col)
+
     def dashed_h(self, x0, x1, y, col, dash=6, gap=4):
         x = x0
         while x <= x1:
@@ -370,6 +441,26 @@ class _Canvas:
                             self.rect(px0, py0, px0 + scale - 1, py0 + scale - 1, col)
             cx += 6 * scale
 
+    def text_v(self, x, y, s, col=(180, 186, 196)):
+        """Dikey eksen basligi (harfleri yukaridan asagi dizer)."""
+        s = (
+            s.upper()
+            .replace("İ", "I")
+            .replace("Ğ", "G")
+            .replace("Ü", "U")
+            .replace("Ş", "S")
+            .replace("Ö", "O")
+            .replace("Ç", "C")
+        )
+        cy = y
+        for ch in s:
+            glyph = _FONT5X7.get(ch, _FONT5X7[" "])
+            for row_i, bits in enumerate(glyph):
+                for col_i in range(5):
+                    if bits & (1 << (4 - col_i)):
+                        self.px(x + col_i, cy + row_i, col)
+            cy += 9
+
     def to_png(self):
         raw = bytearray()
         stride = self.w * 3
@@ -397,15 +488,13 @@ class _Canvas:
 
 
 def render_pump_chart_png(symbol, candles, start_price, cur_price, pct, elapsed_sec, vol_24h, quote):
-    """Canli 1m mum grafigi + hacim barlari + 7 dk baslangic & anlik pump cizgileri."""
+    """Motor 1: Canli 1m mum grafigi + hacim barlari + 7 dk baslangic & anlik pump cizgileri."""
     W, H = 960, 540
     c = _Canvas(W, H, bg=(10, 14, 23))
 
-    # Ust baslik seridi
     c.rect(0, 0, W - 1, 64, (17, 24, 39))
     c.line(0, 64, W - 1, 64, (36, 48, 72))
 
-    # Yesil canli rozet
     c.rect(18, 15, 110, 47, (16, 120, 72))
     c.text(28, 25, "CANLI", (255, 255, 255), scale=2)
 
@@ -420,7 +509,6 @@ def render_pump_chart_png(symbol, candles, start_price, cur_price, pct, elapsed_
     )
     c.text(W - 140, 26, tr_now_str(), (148, 163, 184), scale=1)
 
-    # Grafik alanlari
     plot_l, plot_r = 24, 795
     plot_t, plot_b = 84, 385
     vol_t, vol_b = 402, 492
@@ -452,7 +540,6 @@ def render_pump_chart_png(symbol, candles, start_price, cur_price, pct, elapsed_
         ratio = (hi - price) / total_span
         return int(plot_t + 8 + ratio * (plot_b - plot_t - 16))
 
-    # Yatay grid
     for i in range(5):
         gy = int(plot_t + 8 + i * (plot_b - plot_t - 16) / 4.0)
         gp = hi - (i / 4.0) * total_span
@@ -465,12 +552,10 @@ def render_pump_chart_png(symbol, candles, start_price, cur_price, pct, elapsed_
     body_w = max(3, min(14, int(step * 0.66)))
     max_vol = max((k["v"] for k in candles), default=1.0) or 1.0
 
-    # Son pump penceresi arka plan vurgusu
     pump_bars = max(1, min(n, elapsed_min + 1))
     pump_x_start = int(plot_l + 10 + (n - pump_bars) * step)
     c.rect(pump_x_start, plot_t + 1, plot_r - 1, plot_b - 1, (16, 33, 30))
 
-    # Mumlar & Hacim barlari
     for i, k in enumerate(candles):
         cx = int(plot_l + 10 + (i + 0.5) * step)
         bull = k["c"] >= k["o"]
@@ -495,7 +580,6 @@ def render_pump_chart_png(symbol, candles, start_price, cur_price, pct, elapsed_
         vcol = (22, 163, 74) if bull else (185, 28, 28)
         c.rect(bx1, vol_b - 2 - vh, bx2, vol_b - 2, vcol)
 
-    # 7 dk Baslangic ve Anlik Fiyat cizgileri (etiket cakismasi engelli)
     y_start = y_of(start_price)
     y_cur = y_of(cur_price)
     c.dashed_h(plot_l + 2, plot_r - 2, y_start, (251, 191, 36))
@@ -512,7 +596,6 @@ def render_pump_chart_png(symbol, candles, start_price, cur_price, pct, elapsed_
     c.rect(plot_r + 6, lbl_cur_y - 9, W - 8, lbl_cur_y + 9, (6, 95, 70))
     c.text(plot_r + 12, lbl_cur_y - 4, f"SON: {fmt_price(cur_price)}", (236, 253, 245), scale=1)
 
-    # Alt bilgi seridi
     c.text(plot_l, vol_t - 12, "1M MUM HACMI (SON 60 DK)", (148, 163, 184), scale=1)
     c.text(
         plot_l,
@@ -525,8 +608,151 @@ def render_pump_chart_png(symbol, candles, start_price, cur_price, pct, elapsed_
     return c.to_png()
 
 
+def render_atl_w1_chart_png(symbol, w1_candles, cur_price):
+    """
+    Motor 2: Gorseldeki (HYPERUSDT W1 Binance) duzeniyle birebir
+    Fiyat (W1 Mum) + Hacim $M + RSI panelli PNG grafigi.
+    """
+    W, H = 900, 740
+    bg = (22, 25, 30)
+    panel_bg = (26, 29, 35)
+    grid_col = (44, 48, 56)
+    border_col = (70, 76, 86)
+    green_col = (8, 153, 129)
+    red_col = (242, 54, 69)
+    txt_col = (209, 213, 219)
+    muted_col = (148, 154, 166)
+
+    c = _Canvas(W, H, bg=bg)
+
+    show = w1_candles[-40:] if len(w1_candles) > 40 else list(w1_candles)
+    if not show:
+        show = [{"t": time.time(), "o": cur_price, "h": cur_price, "l": cur_price, "c": cur_price, "v": 1.0, "qv": 1_000_000.0}]
+
+    title = f"{symbol} W1 BINANCE"
+    tx = max(20, (W - len(title) * 12) // 2)
+    c.text(tx, 16, title, (235, 238, 244), scale=2)
+
+    pl, pr = 92, W - 26
+    p_top, p_bot = 46, 480         # Ana Fiyat Paneli
+    v_top, v_bot = 508, 608        # Hacim $M Paneli
+    r_top, r_bot = 626, 718        # RSI Paneli
+
+    for top, bot in ((p_top, p_bot), (v_top, v_bot), (r_top, r_bot)):
+        c.rect(pl, top, pr, bot, panel_bg)
+        c.rect_outline(pl, top, pr, bot, border_col)
+
+    c.text_v(16, (p_top + p_bot) // 2 - 22, "FIYAT", muted_col)
+    c.text_v(16, (v_top + v_bot) // 2 - 30, "HACIM$M", muted_col)
+    c.text_v(16, (r_top + r_bot) // 2 - 12, "RSI", muted_col)
+
+    hi = max(max(k["h"] for k in show), cur_price)
+    lo = min(min(k["l"] for k in show), cur_price)
+    span = max(hi - lo, cur_price * 0.02, 1e-12)
+    hi += span * 0.08
+    lo = max(0.0, lo - span * 0.08)
+    total_span = max(hi - lo, 1e-12)
+
+    def y_price(p):
+        return int(p_top + 6 + ((hi - p) / total_span) * (p_bot - p_top - 12))
+
+    for i in range(9):
+        gy = int(p_top + 8 + i * (p_bot - p_top - 16) / 8.0)
+        gp = hi - (i / 8.0) * total_span
+        c.line(pl + 1, gy, pr - 1, gy, grid_col)
+        lbl = fmt_price_short(gp)
+        lx = max(32, pl - 8 - len(lbl) * 6)
+        c.text(lx, gy - 3, lbl, muted_col, scale=1)
+
+    n = len(show)
+    usable_w = pr - pl - 30
+    step = usable_w / max(n, 1)
+    body_w = max(6, min(int(step * 0.72), 160))
+
+    date_step = max(1, n // 5)
+    for i, k in enumerate(show):
+        cx = int(pl + 15 + (i + 0.5) * step)
+        if i % date_step == 0 or i == n - 1:
+            c.line(cx, p_top + 1, cx, p_bot - 1, grid_col)
+            c.line(cx, v_top + 1, cx, v_bot - 1, grid_col)
+            c.line(cx, r_top + 1, cx, r_bot - 1, grid_col)
+            dt_str = datetime.fromtimestamp(k["t"], tz=TR_TZ).strftime("%d.%m.%Y")
+            dx = max(pl, min(pr - 60, cx - 28))
+            c.text(dx, p_bot + 10, dt_str, txt_col, scale=1)
+
+        bull = k["c"] >= k["o"]
+        col = green_col if bull else red_col
+        yh = y_price(k["h"])
+        yl = y_price(k["l"])
+        yo = y_price(k["o"])
+        yc = y_price(k["c"])
+
+        c.line(cx, yh, cx, yl, col)
+        c.line(cx + 1, yh, cx + 1, yl, col)
+
+        bx1 = cx - body_w // 2
+        bx2 = cx + body_w // 2
+        top_b, bot_b = min(yo, yc), max(yo, yc)
+        if bot_b - top_b < 2:
+            bot_b = top_b + 2
+        c.rect(bx1, top_b, bx2, bot_b, col)
+
+    y_atl = y_price(cur_price)
+    c.dashed_h(pl + 2, pr - 2, y_atl, (251, 146, 60))
+
+    # Hacim $M Paneli
+    vols_m = [max(0.0, k.get("qv", 0.0) / 1_000_000.0) for k in show]
+    max_vm = max(vols_m) if vols_m else 1.0
+    if max_vm <= 0:
+        max_vm = 1.0
+
+    for frac, val in ((0.15, max_vm * 0.85), (0.85, 0.0)):
+        vy = int(v_top + frac * (v_bot - v_top))
+        c.line(pl + 1, vy, pr - 1, vy, grid_col)
+        vlbl = f"{val:.0f}" if val >= 10 else f"{val:.1f}"
+        c.text(max(32, pl - 8 - len(vlbl) * 6), vy - 3, vlbl, muted_col, scale=1)
+
+    for i, k in enumerate(show):
+        cx = int(pl + 15 + (i + 0.5) * step)
+        bx1 = cx - body_w // 2
+        bx2 = cx + body_w // 2
+        col = green_col if k["c"] >= k["o"] else red_col
+        vh = int((vols_m[i] / (max_vm * 1.15)) * (v_bot - v_top - 10))
+        if vh < 3:
+            vh = 3
+        c.rect(bx1, v_bot - 3 - vh, bx2, v_bot - 3, col)
+
+    # RSI Paneli
+    closes_all = [k["c"] for k in w1_candles]
+    rsis_all = calc_rsi_series(closes_all, period=14)
+    rsis_show = rsis_all[-len(show):]
+
+    def y_rsi(val):
+        clamped = max(0.0, min(100.0, val))
+        return int(r_bot - 6 - (clamped / 100.0) * (r_bot - r_top - 12))
+
+    for r_ref in (70, 50, 30):
+        ry = y_rsi(r_ref)
+        c.line(pl + 1, ry, pr - 1, ry, grid_col)
+        rlbl = str(r_ref)
+        c.text(max(32, pl - 8 - len(rlbl) * 6), ry - 3, rlbl, muted_col, scale=1)
+
+    if len(rsis_show) >= 2:
+        pts = []
+        for i, rv in enumerate(rsis_show):
+            cx = int(pl + 15 + (i + 0.5) * step)
+            pts.append((cx, y_rsi(rv)))
+        for i in range(1, len(pts)):
+            c.thick_line(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1], green_col)
+    else:
+        ry = y_rsi(rsis_show[0] if rsis_show else 50.0)
+        c.thick_line(pl + 15, ry, pr - 15, ry, green_col)
+
+    return c.to_png()
+
+
 # ==============================================================================
-# 5. SADE MESAJ FORMATLAYICI
+# 5. MESAJ FORMATLAYICILARI
 # ==============================================================================
 def format_pump_message(symbol, pct, start_price, cur_price, vol_24h, quote, elapsed_sec):
     dk = max(1, int(round(elapsed_sec / 60.0)))
@@ -538,14 +764,19 @@ def format_pump_message(symbol, pct, start_price, cur_price, vol_24h, quote, ela
     )
 
 
+def format_atl_message(symbol, cur_price, change_24h_pct, vol_24h_usdt):
+    p_str = fmt_price_short(cur_price)
+    v_str = fmt_vol_short(vol_24h_usdt)
+    return (
+        f"<b>#{symbol}</b> ${p_str} tüm zamanların en düşüğü 👎📛😭\n"
+        f"24s {change_24h_pct:+.2f}% Hacim {v_str}"
+    )
+
+
 # ==============================================================================
-# 6. ANA 0-7 DK SPOT PUMP TARAYICI MOTORU
+# 6. MOTOR 1: 0-7 DK SPOT PUMP TARAYICI
 # ==============================================================================
 def process_spot_snapshot(tickers, now_ts):
-    """
-    Tum USDT/BTC/BNB Spot paritelerinin 0-7 dakika icindeki minimum fiyattan
-    anlik fiyata sicramasini tarar.
-    """
     alerts = []
     with _STATE_LOCK:
         for t in tickers:
@@ -584,9 +815,9 @@ def process_spot_snapshot(tickers, now_ts):
             threshold = MIN_PUMP_PCT_USDT if quote == "USDT" else MIN_PUMP_PCT_ALTQ
 
             if pct >= threshold:
-                last_cd = _COOLDOWN.get(sym, 0.0)
-                if now_ts - last_cd >= COOLDOWN_SEC:
-                    _COOLDOWN[sym] = now_ts
+                last_cd = _PUMP_COOLDOWN.get(sym, 0.0)
+                if now_ts - last_cd >= PUMP_COOLDOWN_SEC:
+                    _PUMP_COOLDOWN[sym] = now_ts
                     alerts.append({
                         "symbol": sym,
                         "quote": quote,
@@ -600,7 +831,7 @@ def process_spot_snapshot(tickers, now_ts):
 
 
 def spot_pump_worker():
-    print("[SPOT PUMP] Tarama motoru baslatildi (0-7 dk pencere).")
+    print("[MOTOR 1 - SPOT PUMP] Baslatildi (0-7 dk pencere).")
     while True:
         try:
             now_ts = time.time()
@@ -608,8 +839,7 @@ def spot_pump_worker():
             alerts = process_spot_snapshot(tickers, now_ts)
 
             with _STATE_LOCK:
-                _STATS["scans"] += 1
-                _STATS["last_scan_ok"] = now_ts
+                _STATS["pump_scans"] += 1
 
             for al in alerts:
                 sym = al["symbol"]
@@ -635,10 +865,10 @@ def spot_pump_worker():
                     quote=al["quote"],
                     elapsed_sec=al["elapsed_sec"],
                 )
-                tg_send_photo(CHAT_ID, png_bytes, msg)
+                tg_send_photo(CHAT_ID, png_bytes, msg, filename=f"{sym}_pump.png")
                 with _STATE_LOCK:
-                    _STATS["signals"] += 1
-                    _STATS["last_symbol"] = sym
+                    _STATS["pump_signals"] += 1
+                    _STATS["last_pump_symbol"] = sym
                 time.sleep(0.5)
 
         except Exception as e:
@@ -648,7 +878,82 @@ def spot_pump_worker():
 
 
 # ==============================================================================
-# 7. BASIT TELEGRAM KOMUT DINLEYICI (/durum, /start)
+# 7. MOTOR 2: TUM ZAMANLARIN EN DUSUGU (ATL - BINANCE W1) TARAYICI
+# ==============================================================================
+def check_symbol_atl(symbol, cur_price, low_24h, change_24h_pct, vol_24h_usdt, w1_candles, now_ts):
+    if not w1_candles or len(w1_candles) < 2 or cur_price <= 0:
+        return None
+
+    prev_atl = min(k["l"] for k in w1_candles[:-1])
+    if prev_atl <= 0:
+        return None
+
+    if not (cur_price <= prev_atl * 1.003 and low_24h <= prev_atl):
+        return None
+
+    with _STATE_LOCK:
+        last_ts, last_p = _ATL_HISTORY.get(symbol, (0.0, 0.0))
+        if now_ts - last_ts < ATL_COOLDOWN_SEC and (last_p == 0 or cur_price > last_p * 0.98):
+            return None
+        _ATL_HISTORY[symbol] = (now_ts, cur_price)
+
+    return {
+        "symbol": symbol,
+        "cur_price": cur_price,
+        "prev_atl": prev_atl,
+        "change_24h_pct": change_24h_pct,
+        "vol_24h_usdt": vol_24h_usdt,
+        "w1_candles": w1_candles,
+    }
+
+
+def atl_scanner_worker():
+    print("[MOTOR 2 - ATL W1] Tum zamanlarin en dusugu tarayicisi baslatildi.")
+    time.sleep(8)
+    while True:
+        try:
+            tickers, mirror_used = fetch_spot_tickers()
+            candidates = []
+            for t in tickers:
+                sym = t.get("symbol", "")
+                if not sym.endswith("USDT") or not is_valid_symbol(sym):
+                    continue
+                try:
+                    cur_p = float(t.get("lastPrice", 0))
+                    low_24h = float(t.get("lowPrice", 0))
+                    vol_24h = float(t.get("quoteVolume", 0))
+                    chg_24h = float(t.get("priceChangePercent", 0))
+                except Exception:
+                    continue
+                if cur_p <= 0 or vol_24h < ATL_MIN_VOL_24H_USDT:
+                    continue
+                if chg_24h < 0 and low_24h > 0 and cur_p <= low_24h * 1.03:
+                    candidates.append((sym, cur_p, low_24h, chg_24h, vol_24h))
+
+            for sym, cur_p, low_24h, chg_24h, vol_24h in candidates:
+                w1 = fetch_spot_klines(sym, interval="1w", limit=1000, preferred_base=mirror_used)
+                hit = check_symbol_atl(sym, cur_p, low_24h, chg_24h, vol_24h, w1, time.time())
+                if hit:
+                    png_bytes = render_atl_w1_chart_png(sym, hit["w1_candles"], cur_p)
+                    msg = format_atl_message(sym, cur_p, chg_24h, vol_24h)
+                    tg_send_photo(CHAT_ID, png_bytes, msg, filename=f"{sym}_atl_w1.png")
+                    with _STATE_LOCK:
+                        _STATS["atl_signals"] += 1
+                        _STATS["last_atl_symbol"] = sym
+                    time.sleep(0.6)
+                time.sleep(0.15)
+
+            with _STATE_LOCK:
+                _STATS["atl_scans"] += 1
+
+        except Exception as e:
+            print(f"[ATL W1 HATA] {e}")
+
+        time.sleep(ATL_SCAN_INTERVAL_SEC)
+
+
+# ==============================================================================
+# 8. BASIT TELEGRAM KOMUT DINLEYICI (/durum, /start)
 # ==============================================================================
 def telegram_command_worker():
     if not BOT_TOKEN:
@@ -668,18 +973,20 @@ def telegram_command_worker():
                     continue
                 if txt in ("/start", "/durum", "durum"):
                     with _STATE_LOCK:
-                        scans = _STATS["scans"]
-                        sigs = _STATS["signals"]
+                        p_scans = _STATS["pump_scans"]
+                        p_sigs = _STATS["pump_signals"]
+                        a_scans = _STATS["atl_scans"]
+                        a_sigs = _STATS["atl_signals"]
                         tracked = len(_SPOT_WINDOW)
-                        last_sym = _STATS["last_symbol"]
+                        last_p = _STATS["last_pump_symbol"]
+                        last_a = _STATS["last_atl_symbol"]
                         uptime_m = int((time.time() - _STATS["started_at"]) / 60)
                     reply = (
-                        f"⚡ <b>SPOT ANLIK PUMP DEDEKTORU AKTIF</b>\n\n"
+                        f"🤖 <b>SPOT PUMP & ATL BOTU AKTIF</b>\n\n"
                         f"• Calisma Suresi: <b>{uptime_m} dk</b>\n"
-                        f"• Toplam Tarama: <b>{scans}</b>\n"
                         f"• Izlenen Parite: <b>{tracked}</b> (USDT/BTC/BNB)\n"
-                        f"• Uretilen Sinyal: <b>{sigs}</b>\n"
-                        f"• Son Sinyal: <b>{last_sym}</b>"
+                        f"• ⚡ 0-7 Dk Pump: <b>{p_sigs}</b> sinyal ({p_scans} tarama) | Son: <b>{last_p}</b>\n"
+                        f"• 👎 W1 Tum Zamanlar Dip (ATL): <b>{a_sigs}</b> sinyal ({a_scans} tarama) | Son: <b>{last_a}</b>"
                     )
                     tg_send_text(cid, reply)
         except Exception:
@@ -687,18 +994,19 @@ def telegram_command_worker():
 
 
 # ==============================================================================
-# 8. RENDER HTTP HEALTH SUNUCUSU
+# 9. RENDER HTTP HEALTH SUNUCUSU
 # ==============================================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         with _STATE_LOCK:
             payload = json.dumps({
                 "status": "ok",
-                "bot": "spot-pump-detector",
-                "scans": _STATS["scans"],
-                "signals": _STATS["signals"],
+                "bot": "spot-pump-and-atl-bot",
+                "pump_scans": _STATS["pump_scans"],
+                "pump_signals": _STATS["pump_signals"],
+                "atl_scans": _STATS["atl_scans"],
+                "atl_signals": _STATS["atl_signals"],
                 "tracked_pairs": len(_SPOT_WINDOW),
-                "last_symbol": _STATS["last_symbol"],
             }).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -711,22 +1019,25 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"[BASLATILIYOR] Spot Anlik Pump Dedektoru | Port={PORT} | Saat={tr_now_str()}")
+    print(f"[BASLATILIYOR] Spot Pump + W1 ATL Botu | Port={PORT} | Saat={tr_now_str()}")
 
     if BOT_TOKEN:
         tg_send_text(
             CHAT_ID,
-            "⚡ <b>SPOT ANLIK PUMP DEDEKTORU BASLATILDI</b>\n"
-            "• Tarama: 0-7 dk canli pencere (USDT / BTC / BNB)\n"
-            "• Gorsel: Canli 1m mum grafigi + hacim\n"
+            "🤖 <b>SPOT PUMP & W1 ATL BOTU BASLATILDI</b>\n"
+            "• ⚡ <b>0-7 Dk Spot Pump</b> (1m canli mum grafikli)\n"
+            "• 👎 <b>Tüm Zamanların En Düşüğü (ATL)</b> (Binance W1 Fiyat + Hacim $M + RSI grafikli)\n"
             "• Durum icin <code>/durum</code> yazabilirsiniz.",
         )
 
     t1 = threading.Thread(target=spot_pump_worker, daemon=True)
     t1.start()
 
-    t2 = threading.Thread(target=telegram_command_worker, daemon=True)
+    t2 = threading.Thread(target=atl_scanner_worker, daemon=True)
     t2.start()
+
+    t3 = threading.Thread(target=telegram_command_worker, daemon=True)
+    t3.start()
 
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     print(f"[HTTP] 0.0.0.0:{PORT} dinleniyor...")
