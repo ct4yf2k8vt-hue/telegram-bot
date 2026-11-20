@@ -7,7 +7,8 @@ Motorlar:
   2) W1 ATL (Kesin dip altı kilidi, geri sekmede açılmaz, 1H PNG)
   3) 4h Akış / Emir Defteri Duvarı & 24s POC (1D + 3D trend onaylı, LONG<->SHORT kilitli, 4S PNG)
   4) 1G MA200 Canlı Kırılım (Klasik SMA200, sessiz başlangıç tohumlama, ±%0.4 eşik, 1G PNG)
-  5) 30G Zirve / Dip — StormGain Tarzı MONTH MAX & MONTH MIN (Çift yönlü, ±%0.5 kırılım kilidi, Futures OI/Balina/Kalabalık destekli, 1G PNG)
+  5) StormGain PRO: 30G (MONTH) & 365G (YEAR) Max/Min — $15M+ Likidite, 60g+ Geçmiş, 48s Cooldown,
+     Taze Kırılım (%0.1-%2.8), Hacim Patlaması (RVOL>=1.45x), 4S RSI & MACD + Taker Baskısı Onaylı, 1G PNG
   6) Günün Zaferi (21:00 TR) & TOP 24 Saat (23:00 TR)
   7) Binance Resmi Duyuru & Haber Takibi (48/49/161 Türkçe özet)
 """
@@ -63,6 +64,7 @@ locks = {
     "flow": {},          # sym -> {"dir": "LONG"|"SHORT", "ts": float}
     "ma200": {},         # sym -> {"dir": "ABOVE"|"BELOW", "ts": float}
     "month": {},         # sym -> {"dir": "MAX"|"MIN"|"NEUTRAL", "level": float, "ts": float}
+    "year": {},          # sym -> {"dir": "MAX"|"MIN"|"NEUTRAL", "level": float, "ts": float}
 }
 
 last_daily_21 = ""
@@ -76,7 +78,7 @@ def load_state():
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data.get("locks"), dict):
-                for k in ("pump", "atl", "flow", "ma200", "month"):
+                for k in ("pump", "atl", "flow", "ma200", "month", "year"):
                     if isinstance(data["locks"].get(k), dict):
                         locks[k] = data["locks"][k]
     except Exception:
@@ -94,7 +96,7 @@ def save_state():
 
 
 # ==============================================================================
-# YARDIMCI FONKSIYONLAR
+# YARDIMCI FONKSIYONLAR & INDIKATORLER
 # ==============================================================================
 def tr_now():
     return datetime.datetime.utcnow() + datetime.timedelta(hours=3)
@@ -143,6 +145,50 @@ def compute_sma_series(closes, period=200):
     return out
 
 
+def compute_rsi_last(closes, period=14):
+    if len(closes) < period + 2:
+        return 50.0
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i - 1]
+        if d > 0:
+            gains += d
+        else:
+            losses += -d
+    avg_g = gains / period
+    avg_l = losses / period
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        avg_g = (avg_g * (period - 1) + max(d, 0.0)) / period
+        avg_l = (avg_l * (period - 1) + max(-d, 0.0)) / period
+    if avg_l == 0:
+        return 100.0 if avg_g > 0 else 50.0
+    return 100.0 - 100.0 / (1.0 + avg_g / avg_l)
+
+
+def compute_ema_series(vals, period):
+    if not vals:
+        return []
+    k = 2.0 / (period + 1.0)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(v * k + out[-1] * (1.0 - k))
+    return out
+
+
+def compute_macd_last(closes):
+    if len(closes) < 35:
+        return 0.0, 0.0, 0.0, 0.0
+    e12 = compute_ema_series(closes, 12)
+    e26 = compute_ema_series(closes, 26)
+    macd_line = [a - b for a, b in zip(e12, e26)]
+    sig_line = compute_ema_series(macd_line, 9)
+    hist = macd_line[-1] - sig_line[-1]
+    prev_hist = macd_line[-2] - sig_line[-2]
+    return macd_line[-1], sig_line[-1], hist, prev_hist
+
+
 # ==============================================================================
 # HTTP / BINANCE / FUTURES / TELEGRAM ISTEMCISI
 # ==============================================================================
@@ -150,7 +196,7 @@ def http_get_json(url, timeout=8.0):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/3.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/4.0)",
             "Accept": "application/json",
         },
     )
@@ -183,6 +229,7 @@ def fetch_klines(symbol, interval, limit=240):
             "c": float(k[4]),
             "v": float(k[5]),
             "qv": float(k[7]),
+            "tbqv": float(k[10]) if len(k) > 10 else 0.0,
         })
     return bars
 
@@ -678,7 +725,7 @@ def check_pump_ticker(sym, price, vol24h, now_ts):
 
 
 # ==============================================================================
-# MOTOR 2, 3, 4 (MA200) & MOTOR 5 (MONTH MAX / MONTH MIN)
+# MOTOR 2, 3, 4 (MA200) & MOTOR 5 (STORMGAIN PRO: 30G MONTH + 365G YEAR)
 # ==============================================================================
 def scan_structural_pair(tk):
     sym = tk["symbol"]
@@ -692,9 +739,9 @@ def scan_structural_pair(tk):
         return
     now_ts = time.time()
 
-    # --- 1) 1G MA200 (Klasik SMA200) + 2) 30G Zirve/Dip (MONTH MAX & MONTH MIN) ---
+    # --- 1) 1G MA200 (Klasik SMA200) + 2) StormGain PRO (30G Month & 365G Year) ---
     try:
-        c1d = fetch_klines(sym, "1d", limit=235)
+        c1d = fetch_klines(sym, "1d", limit=370)
         if len(c1d) >= 203:
             closes = [b["c"] for b in c1d]
             closes[-1] = cur
@@ -737,66 +784,123 @@ def scan_structural_pair(tk):
                         )
                         tg_send_photo(png, caption)
 
-        # --- StormGain Tarzi 30G Zirve / Dip (MONTH MAX & MONTH MIN) ---
-        if len(c1d) >= 32:
+        # --- StormGain PRO: 365G (YEAR) & 30G (MONTH) + Momentum/Hacim/Taker Onayi ---
+        if vol24h >= 15_000_000 and len(c1d) >= 60:
+            cooldown_sec = 48 * 3600
             prior30 = c1d[-31:-1]
             month_max = max(b["h"] for b in prior30)
             month_min = min(b["l"] for b in prior30)
-            if month_max > month_min > 0:
-                hit_dir = "MAX" if cur >= month_max else ("MIN" if cur <= month_min else "NEUTRAL")
-                fire_month = None
-                with state_lock:
-                    prev_m = locks["month"].get(sym)
-                    if not prev_m:
-                        locks["month"][sym] = {"dir": hit_dir, "level": cur, "ts": now_ts}
-                        save_state()
-                    else:
-                        if hit_dir == "MAX" and (prev_m["dir"] != "MAX" or cur > prev_m["level"] * 1.005):
-                            fire_month = "MAX"
-                        elif hit_dir == "MIN" and (prev_m["dir"] != "MIN" or cur < prev_m["level"] * 0.995):
-                            fire_month = "MIN"
-                        if fire_month:
-                            locks["month"][sym] = {"dir": fire_month, "level": cur, "ts": now_ts}
-                            save_state()
 
-                if fire_month:
-                    is_max = fire_month == "MAX"
-                    with state_lock:
-                        signals_today.append({
-                            "sym": sym,
-                            "engine": "MONTH",
-                            "dir": "LONG" if is_max else "SHORT",
-                            "entry": cur,
-                            "peak": cur,
-                            "ts": now_ts,
-                        })
-                    fut_line = fetch_futures_context_line(sym)
-                    vol_c = f"{vol24h/1e6:.1f}M" if vol24h >= 1e6 else f"{round(vol24h/1e3)}K"
-                    icon = "🟢" if is_max else "🔴"
-                    m_lbl = "month max" if is_max else "month min"
-                    lines = [
-                        f"{icon} <b>#{sym}</b>, {m_lbl} değere ulaştı: <b>${fmt_price(cur)}</b>",
-                        "",
-                        f"📌 Son 30 günün {'en yüksek' if is_max else 'en düşük'} seviyesi (${fmt_price(month_max if is_max else month_min)}) {'yukarı' if is_max else 'aşağı'} kırıldı.",
-                        f"💧 24s Değişim: {chg24h:+.2f}% · Hacim: {vol_c} USDT",
-                    ]
-                    if fut_line:
-                        lines.append(f"🐋 Vadeli Bağlam: {fut_line}")
-                    lines.append(
-                        f"🔒 Kilit aktif: ${fmt_price(cur * (1.005 if is_max else 0.995))} {'üstüne çıkmadıkça' if is_max else 'altına düşmedikçe'} veya 30G {'dibe' if is_max else 'zirveye'} dönmedikçe tekrar gelmez."
+            year_max = 0.0
+            year_min = 0.0
+            if len(c1d) >= 366:
+                prior365 = c1d[-366:-1]
+                year_max = max(b["h"] for b in prior365)
+                year_min = min(b["l"] for b in prior365)
+
+            with state_lock:
+                if year_max > year_min and sym not in locks["year"]:
+                    init_yd = "MAX" if cur >= year_max else ("MIN" if cur <= year_min else "NEUTRAL")
+                    locks["year"][sym] = {"dir": init_yd, "level": cur, "ts": now_ts}
+                    save_state()
+                if month_max > month_min and sym not in locks["month"]:
+                    init_md = "MAX" if cur >= month_max else ("MIN" if cur <= month_min else "NEUTRAL")
+                    locks["month"][sym] = {"dir": init_md, "level": cur, "ts": now_ts}
+                    save_state()
+
+                cand = None  # (scope, dir, ref_level, hi, lo)
+                if year_max > year_min:
+                    py = locks["year"][sym]
+                    if year_max * 1.001 <= cur <= year_max * 1.028:
+                        if py["dir"] != "MAX" or (now_ts - py["ts"] >= cooldown_sec and cur > py["level"] * 1.02):
+                            cand = ("YEAR", "MAX", year_max, year_max, year_min)
+                    elif year_min * 0.972 <= cur <= year_min * 0.999:
+                        if py["dir"] != "MIN" or (now_ts - py["ts"] >= cooldown_sec and cur < py["level"] * 0.98):
+                            cand = ("YEAR", "MIN", year_min, year_max, year_min)
+
+                if not cand and month_max > month_min:
+                    pm = locks["month"][sym]
+                    if month_max * 1.001 <= cur <= month_max * 1.028:
+                        if pm["dir"] != "MAX" or (now_ts - pm["ts"] >= cooldown_sec and cur > pm["level"] * 1.02):
+                            cand = ("MONTH", "MAX", month_max, month_max, month_min)
+                    elif month_min * 0.972 <= cur <= month_min * 0.999:
+                        if pm["dir"] != "MIN" or (now_ts - pm["ts"] >= cooldown_sec and cur < pm["level"] * 0.98):
+                            cand = ("MONTH", "MIN", month_min, month_max, month_min)
+
+            if cand:
+                scope, fdir, ref_lvl, band_hi, band_lo = cand
+                c4h = fetch_klines(sym, "4h", limit=50)
+                c1h = fetch_klines(sym, "1h", limit=28)
+                if len(c4h) >= 36 and len(c1h) >= 24:
+                    closes4h = [b["c"] for b in c4h]
+                    closes4h[-1] = cur
+                    rsi4h = compute_rsi_last(closes4h, 14)
+                    macd_v, sig_v, hist_v, prev_hist = compute_macd_last(closes4h)
+
+                    base20 = c1h[-22:-2]
+                    avg1h = sum(b["qv"] for b in base20) / max(1, len(base20))
+                    rec1h = max(c1h[-1]["qv"], c1h[-2]["qv"])
+                    rvol = (rec1h / avg1h) if avg1h > 0 else 1.0
+
+                    rec_bars = c1h[-2:]
+                    tot_q = sum(b["qv"] for b in rec_bars)
+                    tot_tb = sum(b["tbqv"] for b in rec_bars)
+                    taker_buy_pct = (tot_tb / tot_q * 100.0) if tot_q > 0 else 50.0
+
+                    is_max = fdir == "MAX"
+                    ok = (
+                        (1.0 <= chg24h <= 18.0 and 50.0 <= rsi4h <= 74.0 and (macd_v > sig_v or hist_v > prev_hist) and rvol >= 1.45 and taker_buy_pct >= 52.0)
+                        if is_max
+                        else (-18.0 <= chg24h <= -1.0 and 26.0 <= rsi4h <= 50.0 and (macd_v < sig_v or hist_v < prev_hist) and rvol >= 1.45 and taker_buy_pct <= 48.0)
                     )
-                    png = render_candlestick_png(
-                        c1d[-45:],
-                        title=f"{sym} | 1G 30G ZIRVE/DIP",
-                        cur_price=cur,
-                        levels=[
-                            ("30MAX", month_max, (16, 185, 129)),
-                            ("30MIN", month_min, (244, 63, 94)),
-                            ("ANLIK", cur, (56, 189, 248)),
-                        ],
-                        interval="1d",
-                    )
-                    tg_send_photo(png, "\n".join(lines))
+                    if ok:
+                        with state_lock:
+                            if scope == "YEAR":
+                                locks["year"][sym] = {"dir": fdir, "level": cur, "ts": now_ts}
+                                if month_max > month_min:
+                                    locks["month"][sym] = {"dir": fdir, "level": cur, "ts": now_ts}
+                            else:
+                                locks["month"][sym] = {"dir": fdir, "level": cur, "ts": now_ts}
+                            save_state()
+                            signals_today.append({
+                                "sym": sym,
+                                "engine": scope,
+                                "dir": "LONG" if is_max else "SHORT",
+                                "entry": cur,
+                                "peak": cur,
+                                "ts": now_ts,
+                            })
+
+                        fut_line = fetch_futures_context_line(sym)
+                        vol_c = f"{vol24h/1e6:.1f}M"
+                        is_year = scope == "YEAR"
+                        lbl = ("year max" if is_max else "year min") if is_year else ("month max" if is_max else "month min")
+                        icon = "🟢" if is_max else "🔴"
+                        taker_txt = f"Taker Alici: %{round(taker_buy_pct)}" if is_max else f"Taker Satici: %{round(100 - taker_buy_pct)}"
+                        lines = [
+                            f"{icon} <b>#{sym}</b>, {lbl} değere ulaştı: <b>${fmt_price(cur)}</b>",
+                            "",
+                            f"📌 Son {'365' if is_year else '30'} günün {'en yüksek' if is_max else 'en düşük'} seviyesi (${fmt_price(ref_lvl)}) hacimli kırıldı.",
+                            f"⚡ RVOL: {rvol:.1f}x · 4S RSI: {rsi4h:.1f} · MACD {'Pozitif' if is_max else 'Negatif'} · {taker_txt}",
+                            f"💧 24s: {chg24h:+.2f}% · Hacim: {vol_c} USDT",
+                        ]
+                        if fut_line:
+                            lines.append(f"🐋 Vadeli Bağlam: {fut_line}")
+                        lines.append("🔒 48 saatlik kilit aktif: Aynı yönde artarda spam sinyal gönderilmez.")
+                        hi_lbl = "365MAX" if is_year else "30MAX"
+                        lo_lbl = "365MIN" if is_year else "30MIN"
+                        png = render_candlestick_png(
+                            c1d[-55:],
+                            title=f"{sym} | 1G {'365G' if is_year else '30G'} KIRILIM",
+                            cur_price=cur,
+                            levels=[
+                                (hi_lbl, band_hi, (16, 185, 129)),
+                                (lo_lbl, band_lo, (244, 63, 94)),
+                                ("ANLIK", cur, (56, 189, 248)),
+                            ],
+                            interval="1d",
+                        )
+                        tg_send_photo(png, "\n".join(lines))
     except Exception:
         pass
 
