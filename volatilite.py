@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Render Spot Crypto Bot (8 Motor - Tam Turkce & Tekilleştirilmiş Pump)
---------------------------------------------------------------------
-1) 0-7 dk Spot Anlik Pump Dedektoru (Sade, ayni coinden sadece 1 defa sinyal)
-2) W1 Tum Zamanlarin En Dusugu (ATL) (Fiyat + Hacim$M + RSI)
-3) 4h Akis / Emir Defteri Duvari & POC Analizi (Spot Duvar + Fib/POC/Borsa Senkron)
+Render Spot Crypto Bot (8 Motor - Tum Motorlarda Kalici Yon Kilidi)
+------------------------------------------------------------------
+1) 0-7 dk Spot Anlik Pump Dedektoru (Sade, coin bazli 1 defa kilit)
+2) W1 Tum Zamanlarin En Dusugu (ATL) (Fiyat +%15 donmedikce tekrar atmaz)
+3) 4h Akis / Emir Defteri Duvari & POC (LONG<->SHORT yon degismedikce tekrar atmaz)
 4) Gunun Zaferi Karti (21:00 TR & /zafer)
 5) Son 24 Saatin TOP 5 Hareketi Karti (23:00 TR & /top24)
-6) 1D MA200 (SMA200) Kirilim & Dusus (Ters kirilima kadar ayni coinden tekrar sinyal atmaz)
-7) PABS Tarzi Spot Alim Bolgesi Sinyali (#seq, Alim Bolgesi bandi, Stop, TP1-TP4)
+6) 1D MA200 (SMA200) Kirilim & Dusus (ABOVE<->BELOW yon kilidi)
+7) PABS Tarzi Spot Alim Bolgesi (Eski tepe kirilip yeni dongu acilmadikca tekrar atmaz)
 8) Binance Resmi Duyuru & Haber Takibi (Listeleme, Token Merge/Swap, Cekim, Delist)
 
 Harici paket (pip install) gerektirmez — saf Python 3 standart kutuphanesi.
@@ -46,7 +46,10 @@ BINANCE_MIRRORS = [
 
 SIGNALS_STATE_FILE = "/tmp/spot_bot_signals_v5.json"
 PUMP_SEEN_FILE = "/tmp/spot_pump_seen_v5.json"
+ATL_LOCK_FILE = "/tmp/spot_atl_lock_v5.json"
+FLOW_LOCK_FILE = "/tmp/spot_flow_lock_v5.json"
 MA200_STATE_FILE = "/tmp/spot_ma200_state_v5.json"
+PABS_LOCK_FILE = "/tmp/spot_pabs_lock_v5.json"
 PABS_SEQ_FILE = "/tmp/pabs_seq_v5.json"
 BINANCE_NEWS_SEEN_FILE = "/tmp/binance_news_seen_v5.json"
 
@@ -64,14 +67,13 @@ PUMP_REPEAT_HOURS = int(os.getenv("PUMP_REPEAT_HOURS", "0"))
 ATL_SCAN_SEC = 300
 ATL_MIN_VOL_USDT = 500_000.0
 ATL_MIN_WEEKS = 12
-ATL_COOLDOWN_SEC = 43200
+ATL_UNLOCK_RECOVERY_PCT = 15.0
 
 # Motor 3: 4h Emir Defteri Duvari & POC
 FLOW_SCAN_SEC = 180
 FLOW_TOP_LIMIT = 45
 FLOW_MIN_VOL_USDT = 2_000_000.0
 FLOW_MIN_WALL_USD = 120_000.0
-FLOW_COOLDOWN_SEC = 7200
 
 # Motor 6: 1D MA200 (SMA200 - Kilitli)
 MA200_SCAN_SEC = 300
@@ -82,7 +84,6 @@ MA200_BUFFER_PCT = 0.25
 PABS_SCAN_SEC = 240
 PABS_TOP_LIMIT = 45
 PABS_MIN_VOL_USDT = 2_000_000.0
-PABS_COOLDOWN_SEC = 14400
 
 # Motor 8: Binance Duyuru Takibi
 NEWS_SCAN_SEC = 90
@@ -94,13 +95,13 @@ BINANCE_CATALOGS = [
 
 _STATE_LOCK = threading.Lock()
 _PRICE_HISTORY = {}
-_PUMP_SENT = {}                # {base_coin: first_sent_ts} -> coin bazli kilit
+_PUMP_SENT = {}                # {base_coin: ts}
 _ATL_CACHE = {}
-_ATL_COOLDOWN = {}
-_FLOW_COOLDOWN = {}
-_PABS_COOLDOWN = {}
+_ATL_LOCK = {}                 # {symbol: {"atl": float, "ts": float}}
+_FLOW_LOCK = {}                # {symbol: "LONG" | "SHORT"}
+_MA200_STATE = {}              # {symbol: "ABOVE" | "BELOW"}
+_PABS_LOCK = {}                # {symbol: {"dir": "LONG", "unlock_above": float}}
 _SIGNALS_LOG = []
-_MA200_STATE = {}
 _PABS_SEQ = 48670
 _NEWS_SEEN = set()
 _NEWS_SEEDED = False
@@ -108,7 +109,7 @@ _LAST_REPORT_DAYS = {"win": "", "top24": ""}
 
 
 # ==============================================================================
-# YARDIMCI FORMATLAMA & DURUM YONETIMI
+# YARDIMCI FORMATLAMA & KALICI KILIT YONETIMI
 # ==============================================================================
 def fmt_price(p):
     if p is None or p <= 0:
@@ -177,7 +178,7 @@ def save_json_file(path, data):
 
 
 def load_all_states():
-    global _SIGNALS_LOG, _PUMP_SENT, _MA200_STATE, _PABS_SEQ, _NEWS_SEEN, _NEWS_SEEDED
+    global _SIGNALS_LOG, _PUMP_SENT, _ATL_LOCK, _FLOW_LOCK, _MA200_STATE, _PABS_LOCK, _PABS_SEQ, _NEWS_SEEN, _NEWS_SEEDED
     with _STATE_LOCK:
         _SIGNALS_LOG = load_json_file(SIGNALS_STATE_FILE, [])
         if not isinstance(_SIGNALS_LOG, list):
@@ -185,9 +186,18 @@ def load_all_states():
         _PUMP_SENT = load_json_file(PUMP_SEEN_FILE, {})
         if not isinstance(_PUMP_SENT, dict):
             _PUMP_SENT = {}
+        _ATL_LOCK = load_json_file(ATL_LOCK_FILE, {})
+        if not isinstance(_ATL_LOCK, dict):
+            _ATL_LOCK = {}
+        _FLOW_LOCK = load_json_file(FLOW_LOCK_FILE, {})
+        if not isinstance(_FLOW_LOCK, dict):
+            _FLOW_LOCK = {}
         _MA200_STATE = load_json_file(MA200_STATE_FILE, {})
         if not isinstance(_MA200_STATE, dict):
             _MA200_STATE = {}
+        _PABS_LOCK = load_json_file(PABS_LOCK_FILE, {})
+        if not isinstance(_PABS_LOCK, dict):
+            _PABS_LOCK = {}
         seq_data = load_json_file(PABS_SEQ_FILE, {"seq": 48670})
         _PABS_SEQ = int(seq_data.get("seq", 48670)) if isinstance(seq_data, dict) else 48670
         seen_data = load_json_file(BINANCE_NEWS_SEEN_FILE, [])
@@ -967,7 +977,7 @@ def tg_send_photo(png_bytes, caption):
 
 
 # ==============================================================================
-# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (SADE & TEK SEFERLIK COIN KILIDI)
+# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (COIN BAZLI TEK SINYAL KILIDI)
 # ==============================================================================
 def format_pump_message(symbol, quote, pct, minutes_used, start_price, cur_price, vol_24h):
     vol_str = f"{vol_24h:,.0f}" if quote == "USDT" else f"{vol_24h:,.2f}"
@@ -1050,7 +1060,7 @@ def pump_worker():
 
 
 # ==============================================================================
-# MOTOR 2: W1 ATL
+# MOTOR 2: W1 ATL (+%15 DONUS KILIDI)
 # ==============================================================================
 def format_atl_message(symbol, cur_price, chg_24h, vol_24h):
     return (
@@ -1060,11 +1070,12 @@ def format_atl_message(symbol, cur_price, chg_24h, vol_24h):
 
 
 def atl_worker():
-    print("[MOTOR 2] W1 ATL baslatildi.")
+    print("[MOTOR 2] W1 ATL (Kilitli) baslatildi.")
     while True:
         try:
             tickers = fetch_spot_tickers()
             now_ts = time.time()
+            lock_changed = False
             for t in tickers:
                 sym = t.get("symbol", "")
                 if not sym.endswith("USDT") or any(b in sym for b in ("USDC", "FDUSD", "TUSD", "USDP", "UPUSDT", "DOWNUSDT")):
@@ -1076,6 +1087,17 @@ def atl_worker():
                     continue
                 if cur <= 0 or low_24h <= 0 or vol < ATL_MIN_VOL_USDT:
                     continue
+
+                # Fiyat +%15 toparlanmadan ayni coine tekrar ATL atma
+                with _STATE_LOCK:
+                    rec = _ATL_LOCK.get(sym)
+                    if rec:
+                        if cur >= float(rec.get("atl", 0)) * (1.0 + ATL_UNLOCK_RECOVERY_PCT / 100.0):
+                            _ATL_LOCK.pop(sym, None)
+                            lock_changed = True
+                        else:
+                            continue
+
                 try:
                     cached = _ATL_CACHE.get(sym)
                     if cached and now_ts - cached["ts"] < 3600:
@@ -1087,21 +1109,27 @@ def atl_worker():
                         prev_atl = min(c["low"] for c in candles_w1[:-1])
                         _ATL_CACHE[sym] = {"prev_atl": prev_atl, "candles": candles_w1, "ts": now_ts}
                         time.sleep(0.08)
+
                     if cur <= prev_atl * 1.003 and low_24h <= prev_atl:
-                        cd = _ATL_COOLDOWN.get(sym)
-                        if cd and not ((now_ts - cd["ts"]) >= ATL_COOLDOWN_SEC or cur <= cd["atl"] * 0.98):
-                            continue
-                        _ATL_COOLDOWN[sym] = {"ts": now_ts, "atl": cur}
+                        with _STATE_LOCK:
+                            if sym in _ATL_LOCK:
+                                continue
+                            _ATL_LOCK[sym] = {"atl": cur, "ts": now_ts}
+                            lock_changed = True
                         tg_send_photo(render_atl_w1_chart_png(sym, candles_w1, cur), format_atl_message(sym, cur, chg, vol))
                 except Exception:
                     continue
+
+            if lock_changed:
+                with _STATE_LOCK:
+                    save_json_file(ATL_LOCK_FILE, _ATL_LOCK)
         except Exception as e:
             print(f"[MOTOR 2 HATA] {e}")
         time.sleep(ATL_SCAN_SEC)
 
 
 # ==============================================================================
-# MOTOR 3: 4H AKIS / EMIR DEFTERI DUVARI & POC
+# MOTOR 3: 4H AKIS / EMIR DEFTERI DUVARI & POC (YON KILITLI LONG <-> SHORT)
 # ==============================================================================
 def analyze_flow_structure(symbol, cur_price, vol_24h, depth, candles_15m, candles_4h, candles_1d):
     if len(candles_15m) < 40 or len(candles_4h) < 30 or len(candles_1d) < 5:
@@ -1206,7 +1234,7 @@ def format_flow_message(symbol, flow, exchanges):
     hold_word = "altında" if flow["bias"] == "SHORT" else "üstünde"
     wall_dir = "yukarı sıçramasını tutuyor" if flow["bias"] == "SHORT" else "aşağı sarkmasını tutuyor"
     return (
-        f"<b>#{symbol}</b>\n\n"
+        f"<b>#{symbol}</b> ({flow['bias']})\n\n"
         f"<b>Fiyat:</b> <code>{fmt_price(flow['cur_price'])}</code>\n"
         f"<b>Hedefler:</b> <code>{fmt_price(flow['tp1'])}</code> ({flow['tp1_pct']:+.1f}%) → "
         f"<code>{fmt_price(flow['tp2'])}</code> ({flow['tp2_pct']:+.1f}%) → "
@@ -1217,12 +1245,13 @@ def format_flow_message(symbol, flow, exchanges):
         f"Şu an fiyatı {wall_dir}. {poc_txt}\n\n"
         f"Fiyat zaten bu seviyenin {hold_word}, spot dengesizlik zayıf ({imbalance_txt}). "
         f"Çoklu borsa akışı senkronize ({', '.join(exchanges)}), ayrışma yok. {daily_txt}\n\n"
-        f"<b>Anahtar tetik:</b> <code>{fmt_price(flow['trigger'])}</code> {hold_word} kapanış/kalıcılık."
+        f"<b>Anahtar tetik:</b> <code>{fmt_price(flow['trigger'])}</code> {hold_word} kapanış/kalıcılık.\n"
+        f"🔒 <i>Yön kilidi aktif: Ters yöne dönmeden aynı coinden tekrar sinyal gelmez.</i>"
     )
 
 
 def flow_structure_worker():
-    print("[MOTOR 3] 4h Akis & Emir Defteri Duvari tarayicisi baslatildi.")
+    print("[MOTOR 3] 4h Akis & Emir Defteri Duvari (Yon Kilitli) baslatildi.")
     while True:
         try:
             liq = []
@@ -1237,21 +1266,25 @@ def flow_structure_worker():
                 if cur > 0 and vol >= FLOW_MIN_VOL_USDT:
                     liq.append((vol, sym, cur))
             liq.sort(reverse=True)
-            now_ts = time.time()
             for vol, sym, cur in liq[:FLOW_TOP_LIMIT]:
-                if now_ts - _FLOW_COOLDOWN.get(sym, 0) < FLOW_COOLDOWN_SEC:
-                    continue
                 try:
                     c4h = fetch_spot_klines(sym, "4h", limit=60)
                     flow = analyze_flow_structure(
                         sym, cur, vol, fetch_spot_depth(sym, limit=100),
                         fetch_spot_klines(sym, "15m", limit=100), c4h, fetch_spot_klines(sym, "1d", limit=10)
                     )
-                    if flow:
-                        exchanges, _ = fetch_multi_exchange_sync(sym, cur)
-                        _FLOW_COOLDOWN[sym] = now_ts
-                        tg_send_photo(render_flow_structure_png(sym, c4h, flow), format_flow_message(sym, flow, exchanges))
-                        record_signal_for_reports(sym, flow["bias"], cur, "4h Akış Duvarı")
+                    if not flow:
+                        continue
+                    with _STATE_LOCK:
+                        # YON DEGISMEDIYSE KESINLIKLE TEKRAR SINYAL ATMA
+                        if _FLOW_LOCK.get(sym) == flow["bias"]:
+                            continue
+                        _FLOW_LOCK[sym] = flow["bias"]
+                        save_json_file(FLOW_LOCK_FILE, _FLOW_LOCK)
+
+                    exchanges, _ = fetch_multi_exchange_sync(sym, cur)
+                    tg_send_photo(render_flow_structure_png(sym, c4h, flow), format_flow_message(sym, flow, exchanges))
+                    record_signal_for_reports(sym, flow["bias"], cur, "4h Akış Duvarı")
                     time.sleep(0.15)
                 except Exception:
                     continue
@@ -1449,7 +1482,7 @@ def ma200_worker():
 
 
 # ==============================================================================
-# MOTOR 7: PABS TARZI SPOT ALIM BOLGESI
+# MOTOR 7: PABS TARZI SPOT ALIM BOLGESI (DONGU KILITLI)
 # ==============================================================================
 def analyze_pabs_spot_signal(symbol, cur_price, vol_24h, candles_1h):
     if len(candles_1h) < 80:
@@ -1485,6 +1518,7 @@ def analyze_pabs_spot_signal(symbol, cur_price, vol_24h, candles_1h):
         "buy_low": buy_low, "buy_high": buy_high, "stop_loss": stop_loss, "risk_pct": risk_pct,
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4,
         "avg_profit_pct": avg_profit_pct, "drawdown_pct": drawdown_pct,
+        "unlock_above": recent_high * 1.005,
     }
 
 
@@ -1514,7 +1548,7 @@ def next_pabs_seq():
 
 
 def pabs_spot_worker():
-    print("[MOTOR 7] PABS Spot Alim Bolgesi tarayicisi baslatildi.")
+    print("[MOTOR 7] PABS Spot Alim Bolgesi (Dongu Kilitli) baslatildi.")
     while True:
         try:
             liq = []
@@ -1529,15 +1563,25 @@ def pabs_spot_worker():
                 if cur > 0 and vol >= PABS_MIN_VOL_USDT:
                     liq.append((vol, sym, cur))
             liq.sort(reverse=True)
-            now_ts = time.time()
+            lock_changed = False
             for vol, sym, cur in liq[:PABS_TOP_LIMIT]:
-                if now_ts - _PABS_COOLDOWN.get(sym, 0) < PABS_COOLDOWN_SEC:
-                    continue
+                with _STATE_LOCK:
+                    rec = _PABS_LOCK.get(sym)
+                    if rec:
+                        if cur > float(rec.get("unlock_above", 0)):
+                            _PABS_LOCK.pop(sym, None)
+                            lock_changed = True
+                        else:
+                            continue
                 try:
                     c1h = fetch_spot_klines(sym, "1h", limit=120)
                     pabs = analyze_pabs_spot_signal(sym, cur, vol, c1h)
                     if pabs:
-                        _PABS_COOLDOWN[sym] = now_ts
+                        with _STATE_LOCK:
+                            if sym in _PABS_LOCK:
+                                continue
+                            _PABS_LOCK[sym] = {"dir": "LONG", "unlock_above": pabs["unlock_above"]}
+                            lock_changed = True
                         seq_no = next_pabs_seq()
                         png = render_pabs_chart_png(sym, c1h, pabs["buy_low"], pabs["buy_high"], pabs["stop_loss"], pabs["tp1"])
                         tg_send_photo(png, format_pabs_message(seq_no, pabs))
@@ -1545,6 +1589,9 @@ def pabs_spot_worker():
                     time.sleep(0.10)
                 except Exception:
                     continue
+            if lock_changed:
+                with _STATE_LOCK:
+                    save_json_file(PABS_LOCK_FILE, _PABS_LOCK)
         except Exception as e:
             print(f"[MOTOR 7 HATA] {e}")
         time.sleep(PABS_SCAN_SEC)
@@ -1656,30 +1703,42 @@ def telegram_command_worker():
                     with _STATE_LOCK:
                         sig_cnt = len(_SIGNALS_LOG)
                         pump_cnt = len(_PUMP_SENT)
+                        atl_cnt = len(_ATL_LOCK)
+                        flow_cnt = len(_FLOW_LOCK)
                         ma_cnt = len(_MA200_STATE)
-                        above_cnt = sum(1 for v in _MA200_STATE.values() if v == "ABOVE")
-                        below_cnt = sum(1 for v in _MA200_STATE.values() if v == "BELOW")
+                        pabs_cnt = len(_PABS_LOCK)
                         seq_no = _PABS_SEQ
-                    pump_rule = "Sadece 1 defa (Kalıcı Kilit)" if PUMP_REPEAT_HOURS <= 0 else f"{PUMP_REPEAT_HOURS} saatte 1 defa"
+                    pump_rule = "Tek seferlik" if PUMP_REPEAT_HOURS <= 0 else f"{PUMP_REPEAT_HOURS}s kilit"
                     tg_send_text(
-                        "🤖 <b>8 Motorlu Kripto Spot Tarayıcı Aktif</b>\n\n"
-                        f"⚡ 1) 0–7 dk Spot Pump ({pump_rule} · {pump_cnt} coin kilitli)\n"
-                        "📉 2) W1 Tüm Zamanların En Düşüğü (ATL)\n"
-                        "🧱 3) 4h Akış / Emir Defteri Duvarı & POC\n"
+                        "🤖 <b>8 Motorlu Kripto Spot Tarayıcı (Tam Yön Kilitli)</b>\n\n"
+                        f"⚡ 1) 0–7 dk Spot Pump ({pump_rule} · {pump_cnt} kilitli)\n"
+                        f"📉 2) W1 ATL (+%15 dönüş kilidi · {atl_cnt} kilitli)\n"
+                        f"🧱 3) 4h Akış Duvarı (LONG↔SHORT kilitli · {flow_cnt} coin)\n"
                         "🏆 4) Günün Zaferi Kartı (21:00 TR & /zafer)\n"
                         "🔥 5) TOP 24 Saat Kartı (23:00 TR & /top24)\n"
-                        f"📏 6) 1G MA200 Kilitli Kırılım ({ma_cnt} coin: {above_cnt} üst / {below_cnt} alt)\n"
-                        f"🎯 7) PABS Spot Alım Bölgesi (Sıra #{seq_no})\n"
+                        f"📏 6) 1G MA200 Kilitli Kırılım ({ma_cnt} coin)\n"
+                        f"🎯 7) PABS Alım Bölgesi (Döngü kilitli · {pabs_cnt} coin · Sıra #{seq_no})\n"
                         "📰 8) Binance Resmi Duyuru & Haber Takibi\n\n"
                         f"📊 Son 48s takip edilen sinyal: <b>{sig_cnt}</b>\n"
-                        "🔄 Pump kilidini temizlemek için: /pumpsifirla"
+                        "🧹 Pump sıfırla: /pumpsifirla | Tüm kilitleri sıfırla: /kilitsifirla"
                     )
                 elif txt == "/pumpsifirla":
                     with _STATE_LOCK:
                         cleared = len(_PUMP_SENT)
                         _PUMP_SENT.clear()
                         save_json_file(PUMP_SEEN_FILE, _PUMP_SENT)
-                    tg_send_text(f"🧹 Spot Pump tek-sinyal kilidi sıfırlandı ({cleared} coin temizlendi).")
+                    tg_send_text(f"🧹 Spot Pump kilidi sıfırlandı ({cleared} coin temizlendi).")
+                elif txt == "/kilitsifirla":
+                    with _STATE_LOCK:
+                        _PUMP_SENT.clear()
+                        _ATL_LOCK.clear()
+                        _FLOW_LOCK.clear()
+                        _PABS_LOCK.clear()
+                        save_json_file(PUMP_SEEN_FILE, _PUMP_SENT)
+                        save_json_file(ATL_LOCK_FILE, _ATL_LOCK)
+                        save_json_file(FLOW_LOCK_FILE, _FLOW_LOCK)
+                        save_json_file(PABS_LOCK_FILE, _PABS_LOCK)
+                    tg_send_text("🧹 Pump, ATL, 4h Akış ve PABS yön kilitleri sıfırlandı (MA200 yön durumu korundu).")
                 elif txt == "/zafer":
                     send_win_of_day_report(manual=True)
                 elif txt == "/top24":
