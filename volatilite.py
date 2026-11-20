@@ -1,41 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Render 7/24 Binance Spot Sinyal & Canlı Grafik Botu (Sıfır Harici Bağımlılık)
+Spot Akis Terminali - Bagimsiz Render Telegram Botu (Sifir Harici Kutuphane)
 Motorlar:
-  1) 0-7 dk Spot Anlık Pump (USDT/BTC/BNB, tekil coin kilidi, eşzamanlı 1m+ticker doğrulamalı, 1DK PNG)
-  2) W1 ATL (Kesin dip altı kilidi, geri sekmede açılmaz, 1H PNG)
-  3) 4h Akış / Emir Defteri Duvarı & 24s POC (1D + 3D trend onaylı, LONG<->SHORT kilitli, 4S PNG)
-  4) 1G MA200 Canlı Kırılım (Klasik SMA200, sessiz başlangıç tohumlama, ±%0.4 eşik, 1G PNG)
-  5) StormGain PRO: 30G (MONTH) & 365G (YEAR) Max/Min — $15M+ Likidite, 60g+ Geçmiş, 48s Cooldown,
-     Taze Kırılım (%0.1-%2.8), Hacim Patlaması (RVOL>=1.45x), 4S RSI & MACD + Taker Baskısı Onaylı, 1G PNG
-  6) Günün Zaferi (21:00 TR) & TOP 24 Saat (23:00 TR)
-  7) Binance Resmi Duyuru & Haber Takibi (48/49/161 Türkçe özet)
+  1) 0-7 dk Spot Anlik Pump (Tekil Coin Kilidi + Canli 1m Kline Dogrulama)
+  2) W1 ATL (Tum Zamanlarin En Dusugu - Siki Taban Kilidi)
+  3) 4h Akis / Emir Defteri Duvari >=$120K & 24s POC (1D + 3D Trend Onayi)
+  4) & 5) Gunun Zaferi (21:00 TR) & TOP 24 Saat (23:00 TR) Canli Pik Raporlari
+  6) 1G MA200 Kirilimi (Klasik SMA200 - Sessiz Tohumlama + Canli Kirilim)
+  7) StormGain PRO (365G YEAR & 30G MONTH Max/Min + RVOL + 4h MACD/RSI + Taker Baskisi + 48s Kilit)
+  8) Parabolik Tukenme / Pump Tepesi Donusu (EXHAUST - 15dk RSI/Fitil/Taker + Siki Stop + 24s Kilit)
+  9) Binance Resmi Duyurular & Haberler (48, 49, 161)
 """
 
-import datetime
-import http.server
-import json
-import math
 import os
-import re
-import socketserver
+import sys
+import json
+import time
+import math
+import zlib
 import struct
 import threading
-import time
-import urllib.error
-import urllib.parse
 import urllib.request
-import zlib
+import urllib.parse
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ==============================================================================
-# YAPILANDIRMA
-# ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
 PORT = int(os.environ.get("PORT", "10000"))
 PUMP_REPEAT_HOURS = float(os.environ.get("PUMP_REPEAT_HOURS", "0"))
-STATE_FILE = "/tmp/render_spot_bot_state.json"
+STATE_FILE = "/tmp/spot_bot_state.json"
 
 BINANCE_MIRRORS = [
     "https://api.binance.com",
@@ -45,65 +40,271 @@ BINANCE_MIRRORS = [
     "https://data-api.binance.vision",
 ]
 
-EXCLUDED_BASES = ("USDC", "FDUSD", "TUSD", "USDP", "EUR", "BUSD")
-EXCLUDED_SUBS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
+TR_TZ = timezone(timedelta(hours=3))
 
-# ==============================================================================
-# DURUM (STATE) & KILITLER
-# ==============================================================================
 state_lock = threading.Lock()
-price_history = {}       # sym -> list[(ts, price)]
-signals_today = []       # gunluk raporlama & zirve takibi
-atl_cache = {}           # sym -> (prev_atl, ts)
-news_seen = set()
-news_seeded = False
+ticker_map = {}
+price_window_history = {}
+signals_today = []
+atl_weekly_cache = {}
+news_seen_ids = set()
+news_initial_seeded = False
+report_sent_days = {"victory": "", "top24": ""}
 
 locks = {
-    "pump": {},          # base -> ts
-    "atl": {},           # sym -> {"atl": float, "ts": float}
-    "flow": {},          # sym -> {"dir": "LONG"|"SHORT", "ts": float}
-    "ma200": {},         # sym -> {"dir": "ABOVE"|"BELOW", "ts": float}
-    "month": {},         # sym -> {"dir": "MAX"|"MIN"|"NEUTRAL", "level": float, "ts": float}
-    "year": {},          # sym -> {"dir": "MAX"|"MIN"|"NEUTRAL", "level": float, "ts": float}
+    "pump": {},
+    "atl": {},
+    "flow": {},
+    "ma200": {},
+    "month": {},
+    "year": {},
+    "exhaust": {},
 }
 
-last_daily_21 = ""
-last_daily_23 = ""
+# ==============================================================================
+# SIFIR BAGIMLILIKLI PNG MUM GRAFIGI MOTORU (5x7 BITMAP FONT + ZLIB)
+# ==============================================================================
+FONT_5X7 = {
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+    "D": ["11100", "10010", "10001", "10001", "10001", "10010", "11100"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+    "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+    "W": ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
+    "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+    "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+    "Z": ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+    ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+    ",": ["00000", "00000", "00000", "00000", "01100", "01100", "01000"],
+    ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
+    "%": ["11001", "11010", "00010", "00100", "01000", "01011", "10011"],
+    "/": ["00001", "00010", "00100", "00100", "01000", "10000", "00000"],
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+}
 
 
-def load_state():
-    global locks
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data.get("locks"), dict):
-                for k in ("pump", "atl", "flow", "ma200", "month", "year"):
-                    if isinstance(data["locks"].get(k), dict):
-                        locks[k] = data["locks"][k]
-    except Exception:
-        pass
+def _png_chunk(ctype: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack("!I", len(data))
+        + ctype
+        + data
+        + struct.pack("!I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+    )
 
 
-def save_state():
-    try:
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"locks": locks}, f)
-        os.replace(tmp, STATE_FILE)
-    except Exception:
-        pass
+def _draw_text(buf, w, h, x, y, text, color, scale=1):
+    cx = x
+    for ch in text.upper():
+        glyph = FONT_5X7.get(ch, FONT_5X7[" "])
+        for ry, row in enumerate(glyph):
+            for rx, bit in enumerate(row):
+                if bit == "1":
+                    for sy in range(scale):
+                        for sx in range(scale):
+                            px, py = cx + rx * scale + sx, y + ry * scale + sy
+                            if 0 <= px < w and 0 <= py < h:
+                                idx = (py * w + px) * 3
+                                buf[idx : idx + 3] = color
+        cx += 6 * scale
+
+
+def _fill_rect(buf, w, h, x0, y0, x1, y1, color):
+    x0, x1 = max(0, min(x0, x1)), min(w - 1, max(x0, x1))
+    y0, y1 = max(0, min(y0, y1)), min(h - 1, max(y0, y1))
+    for py in range(y0, y1 + 1):
+        row_off = py * w * 3
+        for px in range(x0, x1 + 1):
+            idx = row_off + px * 3
+            buf[idx : idx + 3] = color
+
+
+def _draw_line(buf, w, h, x0, y0, x1, y1, color, dashed=False):
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    step = 0
+    while True:
+        if not dashed or (step // 4) % 2 == 0:
+            if 0 <= x0 < w and 0 <= y0 < h:
+                idx = (y0 * w + x0) * 3
+                buf[idx : idx + 3] = color
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+        step += 1
+
+
+def render_candlestick_png(symbol, interval_label, candles, levels=None, ma_series=None, header_note=""):
+    w, h = 920, 500
+    bg = bytes((11, 15, 23))
+    grid_col = bytes((24, 32, 46))
+    text_col = bytes((226, 232, 240))
+    muted_col = bytes((148, 163, 184))
+    green_col = bytes((34, 197, 94))
+    red_col = bytes((239, 68, 68))
+    ma_col = bytes((56, 189, 248))
+
+    buf = bytearray(bg * (w * h))
+    pad_l, pad_r, pad_t, pad_b = 20, 140, 48, 30
+    cw = w - pad_l - pad_r
+    ch = h - pad_t - pad_b
+
+    bars = candles[-80:] if len(candles) > 80 else candles
+    if not bars:
+        return b""
+    ma_tail = ma_series[-len(bars) :] if ma_series and len(ma_series) >= len(bars) else None
+
+    lows = [b["low"] for b in bars]
+    highs = [b["high"] for b in bars]
+    if levels:
+        for _, val, _ in levels:
+            if val and val > 0:
+                lows.append(val)
+                highs.append(val)
+    if ma_tail:
+        for v in ma_tail:
+            if v is not None and v > 0:
+                lows.append(v)
+                highs.append(v)
+
+    p_min = min(lows)
+    p_max = max(highs)
+    if p_max <= p_min:
+        p_max = p_min * 1.01
+    pad = (p_max - p_min) * 0.08
+    p_min -= pad
+    p_max += pad
+
+    def py_of(price):
+        ratio = (price - p_min) / max(p_max - p_min, 1e-12)
+        return int(pad_t + ch - ratio * ch)
+
+    for i in range(5):
+        gy = int(pad_t + (ch * i) / 4)
+        _draw_line(buf, w, h, pad_l, gy, w - pad_r, gy, grid_col, dashed=True)
+        gp = p_max - ((p_max - p_min) * i) / 4
+        _draw_text(buf, w, h, w - pad_r + 8, gy - 3, fmt_price(gp), muted_col, 1)
+
+    title = f"{symbol}  {interval_label.upper()}  {header_note}".strip()
+    _draw_text(buf, w, h, pad_l, 16, title[:62], text_col, 2)
+
+    n = len(bars)
+    step = cw / max(n, 1)
+    body_w = max(2, int(step * 0.62))
+    for i, b in enumerate(bars):
+        cx = int(pad_l + (i + 0.5) * step)
+        col = green_col if b["close"] >= b["open"] else red_col
+        yh = py_of(b["high"])
+        yl = py_of(b["low"])
+        yo = py_of(b["open"])
+        yc = py_of(b["close"])
+        _draw_line(buf, w, h, cx, yh, cx, yl, col, dashed=False)
+        top_b, bot_b = min(yo, yc), max(yo, yc)
+        if bot_b == top_b:
+            bot_b += 1
+        _fill_rect(buf, w, h, cx - body_w // 2, top_b, cx + body_w // 2, bot_b, col)
+
+    if ma_tail:
+        prev_pt = None
+        for i, mv in enumerate(ma_tail):
+            if mv is None:
+                continue
+            cx = int(pad_l + (i + 0.5) * step)
+            cy = py_of(mv)
+            if prev_pt:
+                _draw_line(buf, w, h, prev_pt[0], prev_pt[1], cx, cy, ma_col, dashed=False)
+            prev_pt = (cx, cy)
+
+    if levels:
+        used_y = []
+        for tag, val, rgb in levels:
+            if not val or val <= 0:
+                continue
+            ly = max(pad_t + 6, min(pad_t + ch - 6, py_of(val)))
+            col = bytes(rgb)
+            _draw_line(buf, w, h, pad_l, ly, w - pad_r, ly, col, dashed=True)
+            ty = ly
+            for uy in used_y:
+                if abs(ty - uy) < 16:
+                    ty += 16
+            used_y.append(ty)
+            _fill_rect(buf, w, h, w - pad_r + 4, ty - 7, w - 6, ty + 7, col)
+            lbl = f"{tag} {fmt_price(val)}"
+            _draw_text(buf, w, h, w - pad_r + 8, ty - 3, lbl[:18], bytes((11, 15, 23)), 1)
+
+    raw_rows = bytearray()
+    stride = w * 3
+    for row in range(h):
+        raw_rows.append(0)
+        raw_rows.extend(buf[row * stride : (row + 1) * stride])
+
+    ihdr = struct.pack("!IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    idat = zlib.compress(bytes(raw_rows), 6)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 # ==============================================================================
-# YARDIMCI FONKSIYONLAR & INDIKATORLER
+# YARDIMCI HESAPLAMALAR VE KALICILIK
 # ==============================================================================
-def tr_now():
-    return datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+def extract_base_quote(sym: str):
+    for q in ("USDT", "BTC", "BNB"):
+        if sym.endswith(q):
+            return sym[: -len(q)], q
+    return None
 
 
-def fmt_price(p):
-    if not p or p <= 0 or math.isnan(p) or math.isinf(p):
+def is_excluded_pair(sym: str) -> bool:
+    return (
+        "UPUSDT" in sym
+        or "DOWNUSDT" in sym
+        or "BULLUSDT" in sym
+        or "BEARUSDT" in sym
+        or sym.startswith(("USDC", "FDUSD", "TUSD", "USDP", "EUR"))
+    )
+
+
+def fmt_price(p: float) -> str:
+    if not math.isfinite(p) or p <= 0:
         return "0"
     if p >= 1000:
         return f"{p:,.2f}"
@@ -118,21 +319,6 @@ def fmt_price(p):
     return f"{p:.8f}".rstrip("0").rstrip(".")
 
 
-def extract_base_quote(sym):
-    for q in ("USDT", "BTC", "BNB"):
-        if sym.endswith(q):
-            return sym[:-len(q)], q
-    return None, None
-
-
-def is_excluded(sym):
-    if any(sub in sym for sub in EXCLUDED_SUBS):
-        return True
-    if any(sym.startswith(b) for b in EXCLUDED_BASES):
-        return True
-    return False
-
-
 def compute_sma_series(closes, period=200):
     out = [None] * len(closes)
     if len(closes) < period:
@@ -145,58 +331,89 @@ def compute_sma_series(closes, period=200):
     return out
 
 
-def compute_rsi_last(closes, period=14):
+def compute_rsi_series(closes, period=14):
+    out = [50.0] * len(closes)
     if len(closes) < period + 2:
-        return 50.0
-    gains = 0.0
-    losses = 0.0
+        return out
+    gains, losses = 0.0, 0.0
     for i in range(1, period + 1):
-        d = closes[i] - closes[i - 1]
-        if d > 0:
-            gains += d
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains += diff
         else:
-            losses += -d
-    avg_g = gains / period
-    avg_l = losses / period
-    for i in range(period + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        avg_g = (avg_g * (period - 1) + max(d, 0.0)) / period
-        avg_l = (avg_l * (period - 1) + max(-d, 0.0)) / period
-    if avg_l == 0:
-        return 100.0 if avg_g > 0 else 50.0
-    return 100.0 - 100.0 / (1.0 + avg_g / avg_l)
+            losses += -diff
+    avg_g, avg_l = gains / period, losses / period
+    for i in range(period, len(closes)):
+        if i > period:
+            diff = closes[i] - closes[i - 1]
+            avg_g = (avg_g * (period - 1) + max(diff, 0.0)) / period
+            avg_l = (avg_l * (period - 1) + max(-diff, 0.0)) / period
+        if avg_l == 0:
+            out[i] = 100.0 if avg_g > 0 else 50.0
+        else:
+            out[i] = 100.0 - 100.0 / (1.0 + avg_g / avg_l)
+    return out
 
 
-def compute_ema_series(vals, period):
-    if not vals:
+def compute_ema_series(values, period):
+    if not values:
         return []
-    k = 2.0 / (period + 1.0)
-    out = [vals[0]]
-    for v in vals[1:]:
-        out.append(v * k + out[-1] * (1.0 - k))
+    k = 2.0 / (period + 1)
+    out = [values[0]]
+    for i in range(1, len(values)):
+        out.append(values[i] * k + out[i - 1] * (1.0 - k))
     return out
 
 
 def compute_macd_last(closes):
     if len(closes) < 35:
-        return 0.0, 0.0, 0.0, 0.0
-    e12 = compute_ema_series(closes, 12)
-    e26 = compute_ema_series(closes, 26)
-    macd_line = [a - b for a, b in zip(e12, e26)]
+        return {"macd": 0.0, "signal": 0.0, "hist": 0.0, "prev_hist": 0.0}
+    ema12 = compute_ema_series(closes, 12)
+    ema26 = compute_ema_series(closes, 26)
+    macd_line = [ema12[i] - ema26[i] for i in range(len(closes))]
     sig_line = compute_ema_series(macd_line, 9)
     hist = macd_line[-1] - sig_line[-1]
     prev_hist = macd_line[-2] - sig_line[-2]
-    return macd_line[-1], sig_line[-1], hist, prev_hist
+    return {"macd": macd_line[-1], "signal": sig_line[-1], "hist": hist, "prev_hist": prev_hist}
+
+
+def save_state():
+    try:
+        with state_lock:
+            payload = {"locks": locks, "signals_today": signals_today[-250:]}
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+def load_state():
+    global signals_today
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw.get("locks"), dict):
+            for k in ("pump", "atl", "flow", "ma200", "year", "exhaust"):
+                if isinstance(raw["locks"].get(k), dict):
+                    locks[k] = raw["locks"][k]
+        if isinstance(raw.get("signals_today"), list):
+            signals_today = raw["signals_today"][-250:]
+    except Exception:
+        pass
 
 
 # ==============================================================================
-# HTTP / BINANCE / FUTURES / TELEGRAM ISTEMCISI
+# HTTP / BINANCE / COKLU BORSA & TELEGRAM ILETISIM
 # ==============================================================================
-def http_get_json(url, timeout=8.0):
+def http_get_json(url: str, timeout=8.0):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/4.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.0)",
             "Accept": "application/json",
         },
     )
@@ -204,546 +421,249 @@ def http_get_json(url, timeout=8.0):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def fetch_binance_json(path_and_query, timeout=8.0):
+def fetch_binance_json(path_and_query: str, timeout=8.0):
     last_err = None
-    for mirror in BINANCE_MIRRORS:
+    for m in BINANCE_MIRRORS:
         try:
-            return http_get_json(mirror + path_and_query, timeout=timeout)
+            return http_get_json(m + path_and_query, timeout=timeout)
         except Exception as e:
             last_err = e
-    raise last_err or RuntimeError("Binance mirror unreachable")
+    raise last_err or RuntimeError("Binance mirrors unreachable")
 
 
-def fetch_klines(symbol, interval, limit=240):
+def fetch_spot_klines(symbol: str, interval: str, limit=240):
     raw = fetch_binance_json(
-        f"/api/v3/klines?symbol={urllib.parse.quote(symbol)}&interval={interval}&limit={limit}",
+        f"/api/v3/klines?symbol={urllib.parse.quote(symbol)}&interval={urllib.parse.quote(interval)}&limit={limit}",
         timeout=9.0,
     )
-    bars = []
+    out = []
+    if not isinstance(raw, list):
+        return out
     for k in raw:
-        bars.append({
-            "t": int(k[0]) // 1000,
-            "o": float(k[1]),
-            "h": float(k[2]),
-            "l": float(k[3]),
-            "c": float(k[4]),
-            "v": float(k[5]),
-            "qv": float(k[7]),
-            "tbqv": float(k[10]) if len(k) > 10 else 0.0,
-        })
-    return bars
+        out.append(
+            {
+                "open_time": int(float(k[0]) / 1000),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "quote_vol": float(k[7]),
+                "taker_buy_quote": float(k[10]),
+            }
+        )
+    return out
 
 
-def fetch_multi_exchange_sync(symbol, binance_price):
-    if not symbol.endswith("USDT"):
-        return ["Binance"]
-    base = symbol[:-4]
+def fetch_multi_exchange_sync(symbol: str, binance_price: float):
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
     exchanges = ["Binance"]
-
-    def chk_bybit():
-        d = http_get_json(f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}", 3.5)
-        p = float(d["result"]["list"][0]["lastPrice"])
-        if p > 0 and abs(p - binance_price) / binance_price < 0.02:
-            exchanges.append("Bybit")
-
-    def chk_okx():
-        d = http_get_json(f"https://www.okx.com/api/v5/market/ticker?instId={base}-USDT", 3.5)
-        p = float(d["data"][0]["last"])
-        if p > 0 and abs(p - binance_price) / binance_price < 0.02:
-            exchanges.append("OKX")
-
-    def chk_gate():
-        d = http_get_json(f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={base}_USDT", 3.5)
-        p = float(d[0]["last"])
-        if p > 0 and abs(p - binance_price) / binance_price < 0.02:
-            exchanges.append("Gate")
-
-    threads = [threading.Thread(target=fn, daemon=True) for fn in (chk_bybit, chk_okx, chk_gate)]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join(timeout=3.6)
+    checks = [
+        ("Bybit", f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}", lambda d: float(d["result"]["list"][0]["lastPrice"])),
+        ("OKX", f"https://www.okx.com/api/v5/market/ticker?instId={base}-USDT", lambda d: float(d["data"][0]["last"])),
+        ("Gate", f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={base}_USDT", lambda d: float(d[0]["last"])),
+    ]
+    for name, url, parser in checks:
+        try:
+            p = parser(http_get_json(url, timeout=3.5))
+            if p > 0 and abs(p - binance_price) / binance_price < 0.02:
+                exchanges.append(name)
+        except Exception:
+            pass
     return exchanges
 
 
-def fetch_futures_context_line(symbol):
+def fetch_futures_context_line(symbol: str):
     if not symbol.endswith("USDT"):
         return None
-    results = {}
-
-    def get_oi():
-        try:
-            d = http_get_json(
-                f"https://fapi.binance.com/fapi/v1/openInterest?symbol={urllib.parse.quote(symbol)}",
-                2.5,
-            )
-            val = float(d.get("openInterest", 0))
-            if val > 0:
-                results["oi"] = f"OI: {round(val):,}"
-        except Exception:
-            pass
-
-    def get_whale():
-        try:
-            d = http_get_json(
-                f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={urllib.parse.quote(symbol)}&period=1h&limit=1",
-                2.5,
-            )
-            if isinstance(d, list) and d:
-                l_pct = round(float(d[0].get("longAccount", 0)) * 100)
-                if l_pct > 0:
-                    results["whale"] = f"Balina: %{l_pct}L/%{100 - l_pct}S"
-        except Exception:
-            pass
-
-    def get_crowd():
-        try:
-            d = http_get_json(
-                f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={urllib.parse.quote(symbol)}&period=1h&limit=1",
-                2.5,
-            )
-            if isinstance(d, list) and d:
-                l_pct = round(float(d[0].get("longAccount", 0)) * 100)
-                if l_pct > 0:
-                    results["crowd"] = f"Kalabalik: %{l_pct}L/%{100 - l_pct}S"
-        except Exception:
-            pass
-
-    threads = [threading.Thread(target=fn, daemon=True) for fn in (get_oi, get_whale, get_crowd)]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join(timeout=2.7)
-
-    parts = [results[k] for k in ("oi", "whale", "crowd") if k in results]
+    parts = []
+    try:
+        oi_data = http_get_json(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={urllib.parse.quote(symbol)}", timeout=2.5)
+        oi_val = float(oi_data.get("openInterest") or 0)
+        if oi_val > 0:
+            parts.append(f"OI: {round(oi_val):,}")
+    except Exception:
+        pass
+    try:
+        top_data = http_get_json(f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={urllib.parse.quote(symbol)}&period=1h&limit=1", timeout=2.5)
+        if isinstance(top_data, list) and top_data:
+            l_pct = round(float(top_data[0].get("longAccount") or 0) * 100)
+            if l_pct > 0:
+                parts.append(f"Balina: %{l_pct}L/%{100 - l_pct}S")
+    except Exception:
+        pass
+    try:
+        gls_data = http_get_json(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={urllib.parse.quote(symbol)}&period=1h&limit=1", timeout=2.5)
+        if isinstance(gls_data, list) and gls_data:
+            l_pct = round(float(gls_data[0].get("longAccount") or 0) * 100)
+            if l_pct > 0:
+                parts.append(f"Kalabalık: %{l_pct}L/%{100 - l_pct}S")
+    except Exception:
+        pass
     return " · ".join(parts) if parts else None
 
 
-def tg_send_text(text):
+def tg_send_text(text: str, chat_id: str = None):
     if not BOT_TOKEN:
-        print("[TG TEXT]", text.replace("\n", " | "))
         return
+    target = chat_id or CHAT_ID
     try:
-        payload = json.dumps({
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "chat_id": target,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+        ).encode("utf-8")
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data=payload,
+            data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=10).read()
-    except Exception as e:
-        print("TG sendMessage hata:", e)
+        with urllib.request.urlopen(req, timeout=10) as _:
+            pass
+    except Exception:
+        pass
 
 
-def tg_send_photo(png_bytes, caption):
+def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None):
     if not BOT_TOKEN:
-        print(f"[TG PHOTO {len(png_bytes)}B]", caption.replace("\n", " | "))
         return
-    try:
-        boundary = "----SpotFlowBoundary7MA4YWxkTrZu0gW"
-        parts = []
-        for name, val in (("chat_id", CHAT_ID), ("caption", caption), ("parse_mode", "HTML")):
-            parts.append(
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
-                f"{val}\r\n".encode("utf-8")
-            )
+    if not png_bytes:
+        tg_send_text(caption, chat_id=chat_id)
+        return
+    target = chat_id or CHAT_ID
+    boundary = f"----SpotBotBoundary{int(time.time() * 1000)}"
+    parts = []
+    for name, val in [("chat_id", target), ("caption", caption[:1000]), ("parse_mode", "HTML")]:
         parts.append(
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="photo"; filename="chart.png"\r\n'
-            f"Content-Type: image/png\r\n\r\n".encode("utf-8")
-            + png_bytes
-            + f"\r\n--{boundary}--\r\n".encode("utf-8")
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n".encode("utf-8")
         )
-        body = b"".join(parts)
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"chart.png\"\r\nContent-Type: image/png\r\n\r\n".encode("utf-8")
+        + png_bytes
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    try:
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
             data=body,
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=15).read()
-    except Exception as e:
-        print("TG sendPhoto hata:", e)
-        tg_send_text(caption)
+        with urllib.request.urlopen(req, timeout=15) as _:
+            pass
+    except Exception:
+        tg_send_text(caption, chat_id=target)
 
 
 # ==============================================================================
-# SIFIR BAGIMLILIKLI 5x7 PIXEL FONT + PNG MUM GRAFIK MOTORU
+# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (TEKIL COIN KILIDI)
 # ==============================================================================
-FONT_5X7 = {
-    "0": [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
-    "1": [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
-    "2": [0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F],
-    "3": [0x1F, 0x02, 0x04, 0x06, 0x01, 0x11, 0x0E],
-    "4": [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
-    "5": [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
-    "6": [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
-    "7": [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-    "8": [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
-    "9": [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
-    "A": [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-    "B": [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
-    "C": [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
-    "D": [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
-    "E": [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
-    "F": [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
-    "G": [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
-    "H": [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-    "I": [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
-    "J": [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C],
-    "K": [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
-    "L": [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
-    "M": [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
-    "N": [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
-    "O": [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-    "P": [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
-    "Q": [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
-    "R": [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
-    "S": [0x0E, 0x11, 0x10, 0x0E, 0x01, 0x11, 0x0E],
-    "T": [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-    "U": [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-    "V": [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
-    "W": [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
-    "X": [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
-    "Y": [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
-    "Z": [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
-    ".": [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
-    ",": [0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x08],
-    ":": [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00],
-    "-": [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
-    "+": [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00],
-    "/": [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10],
-    "%": [0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13],
-    "$": [0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04],
-    "|": [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-    " ": [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-}
-
-
-def render_candlestick_png(
-    bars,
-    title,
-    cur_price=None,
-    levels=None,
-    ma_series=None,
-    interval="1h",
-    width=920,
-    height=500,
-):
-    levels = levels or []
-    bars = [dict(b) for b in bars[-72:]]
-    if not bars:
-        bars = [{"t": int(time.time()), "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0}]
-
-    if cur_price and cur_price > 0:
-        last = bars[-1]
-        last["c"] = cur_price
-        last["h"] = max(last["h"], cur_price)
-        last["l"] = min(last["l"], cur_price)
-
-    bg = (11, 15, 25)
-    grid_col = (26, 35, 53)
-    axis_col = (71, 85, 105)
-    up_col = (16, 185, 129)
-    dn_col = (244, 63, 94)
-    txt_col = (203, 213, 225)
-    muted_col = (120, 134, 156)
-
-    buf = bytearray(bg * (width * height))
-
-    def set_px(x, y, col):
-        if 0 <= x < width and 0 <= y < height:
-            i = (y * width + x) * 3
-            buf[i] = col[0]
-            buf[i + 1] = col[1]
-            buf[i + 2] = col[2]
-
-    def fill_rect(x0, y0, x1, y1, col):
-        x0 = max(0, int(x0))
-        y0 = max(0, int(y0))
-        x1 = min(width - 1, int(x1))
-        y1 = min(height - 1, int(y1))
-        for yy in range(y0, y1 + 1):
-            row_start = yy * width * 3
-            for xx in range(x0, x1 + 1):
-                idx = row_start + xx * 3
-                buf[idx] = col[0]
-                buf[idx + 1] = col[1]
-                buf[idx + 2] = col[2]
-
-    def draw_line(x0, y0, x1, y1, col, dashed=False):
-        dx = abs(x1 - x0)
-        dy = -abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx + dy
-        step = 0
-        while True:
-            if not dashed or (step % 8 < 5):
-                set_px(x0, y0, col)
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 >= dy:
-                err += dy
-                x0 += sx
-            if e2 <= dx:
-                err += dx
-                y0 += sy
-            step += 1
-
-    def draw_text(x, y, text, col, scale=1):
-        cx = int(x)
-        cy = int(y)
-        for ch in text.upper():
-            glyph = FONT_5X7.get(ch, FONT_5X7[" "])
-            for row_i, row_bits in enumerate(glyph):
-                for col_i in range(5):
-                    if row_bits & (1 << (4 - col_i)):
-                        if scale == 1:
-                            set_px(cx + col_i, cy + row_i, col)
-                        else:
-                            fill_rect(
-                                cx + col_i * scale,
-                                cy + row_i * scale,
-                                cx + (col_i + 1) * scale - 1,
-                                cy + (row_i + 1) * scale - 1,
-                                col,
-                            )
-            cx += 6 * scale
-
-    pad_l, pad_t, pad_r, pad_b = 18, 44, 150, 36
-    plot_w = width - pad_l - pad_r
-    plot_h = height - pad_t - pad_b
-
-    vals = [b["h"] for b in bars] + [b["l"] for b in bars]
-    for _, lv, _ in levels:
-        if lv and lv > 0:
-            vals.append(lv)
-    if ma_series:
-        for mv in ma_series[-len(bars):]:
-            if mv and mv > 0:
-                vals.append(mv)
-
-    hi = max(vals)
-    lo = min(vals)
-    if hi <= lo:
-        hi = lo * 1.02 + 1e-8
-    span = hi - lo
-    hi += span * 0.08
-    lo = max(0.0, lo - span * 0.08)
-    span = hi - lo
-
-    def py(val):
-        ratio = (hi - val) / span
-        return int(pad_t + max(0.0, min(1.0, ratio)) * plot_h)
-
-    fill_rect(0, 0, width - 1, 34, (15, 23, 42))
-    draw_line(0, 34, width - 1, 34, grid_col)
-    draw_text(16, 11, title[:62], txt_col, scale=2)
-
-    for i in range(6):
-        gy = int(pad_t + (plot_h * i) / 5)
-        draw_line(pad_l, gy, pad_l + plot_w, gy, grid_col, dashed=True)
-        pval = hi - (span * i) / 5
-        draw_text(pad_l + plot_w + 8, gy - 3, fmt_price(pval), muted_col, scale=1)
-
-    draw_line(pad_l + plot_w, pad_t, pad_l + plot_w, pad_t + plot_h, axis_col)
-    draw_line(pad_l, pad_t + plot_h, pad_l + plot_w, pad_t + plot_h, axis_col)
-
-    n = len(bars)
-    step_x = plot_w / max(n, 1)
-    body_w = max(3, int(step_x * 0.62))
-    for i, b in enumerate(bars):
-        cx = int(pad_l + (i + 0.5) * step_x)
-        yh = py(b["h"])
-        yl = py(b["l"])
-        yo = py(b["o"])
-        yc = py(b["c"])
-        col = up_col if b["c"] >= b["o"] else dn_col
-        draw_line(cx, yh, cx, yl, col)
-        top = min(yo, yc)
-        bot = max(yo, yc)
-        if bot - top < 2:
-            bot = top + 2
-        fill_rect(cx - body_w // 2, top, cx + body_w // 2, bot, col)
-
-    tick_idxs = sorted(set([0, n // 4, n // 2, (3 * n) // 4, n - 1]))
-    for idx in tick_idxs:
-        if 0 <= idx < n:
-            cx = int(pad_l + (idx + 0.5) * step_x)
-            dt = datetime.datetime.utcfromtimestamp(bars[idx]["t"]) + datetime.timedelta(hours=3)
-            lbl = dt.strftime("%d/%m") if interval in ("1d", "3d", "1w") else dt.strftime("%H:%M")
-            draw_line(cx, pad_t + plot_h, cx, pad_t + plot_h + 4, axis_col)
-            draw_text(max(pad_l, cx - 15), pad_t + plot_h + 10, lbl, muted_col, scale=1)
-
-    if ma_series:
-        tail_ma = ma_series[-n:]
-        prev_pt = None
-        for i, mv in enumerate(tail_ma):
-            if mv and mv > 0:
-                cx = int(pad_l + (i + 0.5) * step_x)
-                cy = py(mv)
-                if prev_pt:
-                    draw_line(prev_pt[0], prev_pt[1], cx, cy, (245, 158, 11))
-                    draw_line(prev_pt[0], prev_pt[1] + 1, cx, cy + 1, (245, 158, 11))
-                prev_pt = (cx, cy)
-
-    used_y = []
-    for label, lv, col in levels:
-        if not lv or lv <= 0:
-            continue
-        ly = py(lv)
-        draw_line(pad_l, ly, pad_l + plot_w, ly, col, dashed=True)
-        tag_y = ly
-        for uy in used_y:
-            if abs(tag_y - uy) < 15:
-                tag_y = uy + 15
-        tag_y = max(pad_t + 6, min(pad_t + plot_h - 8, tag_y))
-        used_y.append(tag_y)
-        tag_txt = f"{label} {fmt_price(lv)}"[:20]
-        fill_rect(pad_l + plot_w + 4, tag_y - 6, width - 6, tag_y + 6, col)
-        draw_text(pad_l + plot_w + 8, tag_y - 3, tag_txt, (11, 15, 25), scale=1)
-
-    raw_rows = bytearray()
-    stride = width * 3
-    for y in range(height):
-        raw_rows.append(0)
-        raw_rows.extend(buf[y * stride:(y + 1) * stride])
-
-    def png_chunk(ctype, data):
-        chunk = ctype + data
-        return struct.pack(">I", len(data)) + chunk + struct.pack(">I", zlib.crc32(chunk) & 0xFFFFFFFF)
-
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    idat = zlib.compress(bytes(raw_rows), 6)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + png_chunk(b"IHDR", ihdr)
-        + png_chunk(b"IDAT", idat)
-        + png_chunk(b"IEND", b"")
-    )
-
-
-# ==============================================================================
-# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (TEKIL COIN KILIDI + ESZAMANLI DOGRULAMA)
-# ==============================================================================
-def is_pump_locked(base, now_ts):
-    ts = locks["pump"].get(base)
-    if not ts:
+def is_pump_locked(base: str, now_ms: int) -> bool:
+    rec = locks["pump"].get(base)
+    if not rec:
         return False
     if PUMP_REPEAT_HOURS <= 0:
         return True
-    return (now_ts - ts) < (PUMP_REPEAT_HOURS * 3600)
+    return (now_ms - rec["lockedAt"]) < PUMP_REPEAT_HOURS * 3600 * 1000
 
 
-def check_pump_ticker(sym, price, vol24h, now_ts):
-    base, quote = extract_base_quote(sym)
-    if not base or is_excluded(sym):
-        return
-    min_vol = 150000 if quote == "USDT" else (3 if quote == "BTC" else 250)
+def _verify_and_emit_pump(tk, min_pt):
+    sym = tk["symbol"]
+    base = tk["base"]
+    quote = tk["quote"]
     th_pct = 4.5 if quote == "USDT" else 4.0
-    if price <= 0 or vol24h < min_vol:
-        return
-
-    with state_lock:
-        hist = price_history.setdefault(sym, [])
-        hist.append((now_ts, price))
-        cutoff = now_ts - 420
-        while hist and hist[0][0] < cutoff:
-            hist.pop(0)
-        if len(hist) < 2:
-            return
-        min_ts, min_p = min(hist, key=lambda x: x[1])
-        if min_p <= 0:
-            return
-        pct = ((price - min_p) / min_p) * 100.0
-        if pct < th_pct or is_pump_locked(base, now_ts):
-            return
-        locks["pump"][base] = now_ts
-        save_state()
-
-    def verify_and_send():
-        try:
-            fresh = fetch_binance_json(f"/api/v3/ticker/24hr?symbol={urllib.parse.quote(sym)}", 4.5)
-            c1m = fetch_klines(sym, "1m", limit=18)
-            live_cur = float(fresh.get("lastPrice") or price)
-            live_vol = float(fresh.get("quoteVolume") or vol24h)
-            recent_lows = [b["l"] for b in c1m[-7:]]
-            bar_min = min(recent_lows) if recent_lows else min_p
-            verified_min = min(min_p, bar_min if bar_min > 0 else min_p)
-            verified_pct = ((live_cur - verified_min) / verified_min) * 100.0
-            if verified_pct < th_pct:
-                with state_lock:
-                    locks["pump"].pop(base, None)
-                    save_state()
-                return
-
-            with state_lock:
-                price_history.pop(sym, None)
-                signals_today.append({
-                    "sym": sym,
-                    "engine": "PUMP",
-                    "dir": "LONG",
-                    "entry": live_cur,
-                    "peak": live_cur,
-                    "ts": time.time(),
-                })
-
-            mins = max(1, round((time.time() - min_ts) / 60))
-            vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
-            caption = (
-                f"⚡ SPOT ANLIK PUMP DEDEKTÖRÜ — {sym}\n\n"
-                f"📈 Değişim: +{verified_pct:.2f}% ({mins} dk içinde!)\n"
-                f"💰 Başlangıç: {fmt_price(verified_min)}  ➡️  Anlık: {fmt_price(live_cur)}\n"
-                f"💧 24s Parite Hacmi: {vol_str} ({quote})"
-            )
-            png = render_candlestick_png(
-                c1m,
-                title=f"{sym} | 1DK SPOT PUMP",
-                cur_price=live_cur,
-                levels=[
-                    ("BAS", verified_min, (245, 158, 11)),
-                    ("ANLIK", live_cur, (16, 185, 129)),
-                ],
-                interval="1m",
-            )
-            tg_send_photo(png, caption)
-        except Exception:
+    try:
+        fresh_tk = fetch_binance_json(f"/api/v3/ticker/24hr?symbol={urllib.parse.quote(sym)}", timeout=4.0)
+        c1m = fetch_spot_klines(sym, "1m", 10)
+        live_cur = float(fresh_tk.get("lastPrice") or tk["price"])
+        live_vol = float(fresh_tk.get("quoteVolume") or tk["volume24h"])
+        bar_min = min((b["low"] for b in c1m[-7:]), default=min_pt[1])
+        verified_min = min(min_pt[1], bar_min if bar_min > 0 else min_pt[1])
+        verified_pct = ((live_cur - verified_min) / verified_min) * 100.0
+        if verified_pct < th_pct:
             with state_lock:
                 locks["pump"].pop(base, None)
-                save_state()
+            return
+        with state_lock:
+            price_window_history.pop(sym, None)
+            now_ms = int(time.time() * 1000)
+            signals_today.append(
+                {
+                    "engine": "PUMP",
+                    "symbol": sym,
+                    "dir": "LONG",
+                    "entry": live_cur,
+                    "peak_pct": 0.0,
+                    "ts": now_ms,
+                }
+            )
+        mins = max(1, round((time.time() * 1000 - min_pt[0]) / 60000))
+        vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
+        caption = (
+            f"⚡ <b>SPOT ANLIK PUMP DEDEKTÖRÜ — {sym}</b>\n\n"
+            f"📈 Değişim: <b>+{verified_pct:.2f}%</b> ({mins} dk içinde!)\n"
+            f"💰 Başlangıç: <code>{fmt_price(verified_min)}</code>  ➡️  Anlık: <code>{fmt_price(live_cur)}</code>\n"
+            f"💧 24s Parite Hacmi: {vol_str} ({quote})"
+        )
+        png = render_candlestick_png(
+            sym,
+            "1DK",
+            c1m,
+            levels=[("BAS", verified_min, (250, 204, 21)), ("ANLIK", live_cur, (34, 197, 94))],
+            header_note=f"+{verified_pct:.2f}%",
+        )
+        tg_send_photo(caption, png)
+        save_state()
+    except Exception:
+        with state_lock:
+            locks["pump"].pop(base, None)
 
-    threading.Thread(target=verify_and_send, daemon=True).start()
+
+def evaluate_pump_for_ticker(tk, now_ms: int):
+    quote = tk["quote"]
+    min_vol = 150_000 if quote == "USDT" else (3 if quote == "BTC" else 250)
+    th_pct = 4.5 if quote == "USDT" else 4.0
+    if tk["price"] <= 0 or tk["volume24h"] < min_vol:
+        return
+    sym = tk["symbol"]
+    hist = price_window_history.setdefault(sym, [])
+    hist.append((now_ms, tk["price"]))
+    cutoff = now_ms - 420_000
+    while hist and hist[0][0] < cutoff:
+        hist.pop(0)
+    if len(hist) < 2:
+        return
+    min_pt = min(hist, key=lambda x: x[1])
+    if min_pt[1] <= 0:
+        return
+    pct = ((tk["price"] - min_pt[1]) / min_pt[1]) * 100.0
+    if pct < th_pct or is_pump_locked(tk["base"], now_ms):
+        return
+    locks["pump"][tk["base"]] = {"base": tk["base"], "symbol": sym, "lockedAt": now_ms}
+    threading.Thread(target=_verify_and_emit_pump, args=(dict(tk), min_pt), daemon=True).start()
 
 
 # ==============================================================================
-# MOTOR 2, 3, 4 (MA200) & MOTOR 5 (STORMGAIN PRO: 30G MONTH + 365G YEAR)
+# MOTOR 2, 3, 6, 7, EXHAUST: YAPISAL & YON KILITLI TARAMA
 # ==============================================================================
 def scan_structural_pair(tk):
+    if tk["quote"] != "USDT" or tk["volume24h"] < 1_500_000:
+        return
     sym = tk["symbol"]
-    if not sym.endswith("USDT") or is_excluded(sym):
-        return
-    cur = float(tk["lastPrice"])
-    vol24h = float(tk["quoteVolume"])
-    chg24h = float(tk["priceChangePercent"])
-    low24h = float(tk["lowPrice"])
-    if cur <= 0 or vol24h < 1_500_000:
-        return
-    now_ts = time.time()
+    cur = tk["price"]
+    now_ms = int(time.time() * 1000)
 
-    # --- 1) 1G MA200 (Klasik SMA200) + 2) StormGain PRO (30G Month & 365G Year) ---
+    # 1) MOTOR 6: 1G MA200 (Klasik SMA200 - Sessiz tohumlama + Anlik kirilim)
     try:
-        c1d = fetch_klines(sym, "1d", limit=370)
+        c1d = fetch_spot_klines(sym, "1d", 370)
         if len(c1d) >= 203:
-            closes = [b["c"] for b in c1d]
+            closes = [b["close"] for b in c1d]
             closes[-1] = cur
             sma200 = compute_sma_series(closes, 200)
             ma_live = sma200[-1]
@@ -752,379 +672,476 @@ def scan_structural_pair(tk):
                 if new_pos:
                     crossed = False
                     with state_lock:
-                        prev_ma = locks["ma200"].get(sym)
-                        if not prev_ma:
-                            locks["ma200"][sym] = {"dir": new_pos, "ts": now_ts}
-                            save_state()
-                        elif prev_ma["dir"] != new_pos:
-                            locks["ma200"][sym] = {"dir": new_pos, "ts": now_ts}
+                        prev_lock = locks["ma200"].get(sym)
+                        if not prev_lock:
+                            locks["ma200"][sym] = {"symbol": sym, "direction": new_pos, "ma200": ma_live, "updatedAt": now_ms}
+                        elif prev_lock["direction"] != new_pos:
+                            locks["ma200"][sym] = {"symbol": sym, "direction": new_pos, "ma200": ma_live, "updatedAt": now_ms}
                             crossed = True
-                            save_state()
                     if crossed:
+                        save_state()
                         diff_pct = ((cur - ma_live) / ma_live) * 100.0
-                        is_up = new_pos == "ABOVE"
-                        icon = "🟢" if is_up else "🔴"
-                        head = f"{icon} 1G MA200 {'YUKARI KIRILIMI' if is_up else 'AŞAĞI DÜŞÜŞ'} — #{sym}"
+                        with state_lock:
+                            signals_today.append({"engine": "MA200", "symbol": sym, "dir": new_pos, "entry": cur, "peak_pct": 0.0, "ts": now_ms})
+                        title = f"🟢 <b>1G MA200 YUKARI KIRILIMI — #{sym}</b>" if new_pos == "ABOVE" else f"🔴 <b>1G MA200 AŞAĞI DÜŞÜŞ — #{sym}</b>"
                         caption = (
-                            f"{head}\n\n"
-                            f"Anlık fiyat 200 Günlük MA ortalamasının {'üzerine' if is_up else 'altına'} canlı olarak kırıldı.\n"
-                            f"📊 Anlık Fiyat: ${fmt_price(cur)} · Canlı MA200: ${fmt_price(ma_live)} ({diff_pct:+.2f}%)\n"
-                            f"🔒 Ters kırılım gelene kadar tekrar sinyal gönderilmez."
+                            f"{title}\n"
+                            f"💰 Anlık Fiyat: <code>${fmt_price(cur)}</code> · Canlı MA200: <code>${fmt_price(ma_live)}</code> ({diff_pct:+.2f}%)\n"
+                            f"🔒 Kilit aktif: Ters kırılım gelene kadar tekrar sinyal üretilmez."
                         )
                         png = render_candlestick_png(
-                            c1d[-72:],
-                            title=f"{sym} | 1G SMA200",
-                            cur_price=cur,
-                            levels=[
-                                ("MA200", ma_live, (245, 158, 11)),
-                                ("ANLIK", cur, (16, 185, 129) if is_up else (244, 63, 94)),
-                            ],
-                            ma_series=sma200[-72:],
-                            interval="1d",
+                            sym,
+                            "1G MA200",
+                            c1d[-80:],
+                            levels=[("MA200", ma_live, (56, 189, 248)), ("ANLIK", cur, (34, 197, 94) if new_pos == "ABOVE" else (239, 68, 68))],
+                            ma_series=sma200[-80:],
+                            header_note=f"MA200 {diff_pct:+.2f}%",
                         )
-                        tg_send_photo(png, caption)
+                        tg_send_photo(caption, png)
 
-        # --- StormGain PRO: 365G (YEAR) & 30G (MONTH) + Momentum/Hacim/Taker Onayi ---
-        if vol24h >= 15_000_000 and len(c1d) >= 60:
-            cooldown_sec = 48 * 3600
+        # 1B) STORMGAIN PRO MOTORU: 365G (YEAR) & 30G (MONTH) + 5-FAKTOR MOMENTUM/HACIM ONAYI
+        if tk["volume24h"] >= 15_000_000 and len(c1d) >= 60:
+            cooldown_ms = 48 * 3600 * 1000
             prior30 = c1d[-31:-1]
-            month_max = max(b["h"] for b in prior30)
-            month_min = min(b["l"] for b in prior30)
+            month_max = max(b["high"] for b in prior30)
+            month_min = min(b["low"] for b in prior30)
 
-            year_max = 0.0
-            year_min = 0.0
+            year_max, year_min = 0.0, 0.0
             if len(c1d) >= 366:
                 prior365 = c1d[-366:-1]
-                year_max = max(b["h"] for b in prior365)
-                year_min = min(b["l"] for b in prior365)
+                year_max = max(b["high"] for b in prior365)
+                year_min = min(b["low"] for b in prior365)
 
             with state_lock:
+                seeded = False
                 if year_max > year_min and sym not in locks["year"]:
-                    init_yd = "MAX" if cur >= year_max else ("MIN" if cur <= year_min else "NEUTRAL")
-                    locks["year"][sym] = {"dir": init_yd, "level": cur, "ts": now_ts}
-                    save_state()
+                    init_y = "MAX" if cur >= year_max else ("MIN" if cur <= year_min else "NEUTRAL")
+                    locks["year"][sym] = {"symbol": sym, "direction": init_y, "level": cur, "yearMax": year_max, "yearMin": year_min, "updatedAt": now_ms}
+                    seeded = True
                 if month_max > month_min and sym not in locks["month"]:
-                    init_md = "MAX" if cur >= month_max else ("MIN" if cur <= month_min else "NEUTRAL")
-                    locks["month"][sym] = {"dir": init_md, "level": cur, "ts": now_ts}
-                    save_state()
+                    init_m = "MAX" if cur >= month_max else ("MIN" if cur <= month_min else "NEUTRAL")
+                    locks["month"][sym] = {"symbol": sym, "direction": init_m, "level": cur, "monthMax": month_max, "monthMin": month_min, "updatedAt": now_ms}
+                    seeded = True
+                prev_y = locks["year"].get(sym)
+                prev_m = locks["month"].get(sym)
+            if seeded:
+                save_state()
 
-                cand = None  # (scope, dir, ref_level, hi, lo)
-                if year_max > year_min:
-                    py = locks["year"][sym]
-                    if year_max * 1.001 <= cur <= year_max * 1.028:
-                        if py["dir"] != "MAX" or (now_ts - py["ts"] >= cooldown_sec and cur > py["level"] * 1.02):
-                            cand = ("YEAR", "MAX", year_max, year_max, year_min)
-                    elif year_min * 0.972 <= cur <= year_min * 0.999:
-                        if py["dir"] != "MIN" or (now_ts - py["ts"] >= cooldown_sec and cur < py["level"] * 0.98):
-                            cand = ("YEAR", "MIN", year_min, year_max, year_min)
+            candidate = None
+            if year_max > year_min:
+                if year_max * 1.001 <= cur <= year_max * 1.028:
+                    if not prev_y or prev_y["direction"] != "MAX" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur > prev_y["level"] * 1.02):
+                        candidate = ("YEAR", "MAX", year_max, year_max, year_min)
+                elif year_min * 0.972 <= cur <= year_min * 0.999:
+                    if not prev_y or prev_y["direction"] != "MIN" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur < prev_y["level"] * 0.98):
+                        candidate = ("YEAR", "MIN", year_min, year_max, year_min)
 
-                if not cand and month_max > month_min:
-                    pm = locks["month"][sym]
-                    if month_max * 1.001 <= cur <= month_max * 1.028:
-                        if pm["dir"] != "MAX" or (now_ts - pm["ts"] >= cooldown_sec and cur > pm["level"] * 1.02):
-                            cand = ("MONTH", "MAX", month_max, month_max, month_min)
-                    elif month_min * 0.972 <= cur <= month_min * 0.999:
-                        if pm["dir"] != "MIN" or (now_ts - pm["ts"] >= cooldown_sec and cur < pm["level"] * 0.98):
-                            cand = ("MONTH", "MIN", month_min, month_max, month_min)
+            if not candidate and month_max > month_min:
+                if month_max * 1.001 <= cur <= month_max * 1.028:
+                    if not prev_m or prev_m["direction"] != "MAX" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur > prev_m["level"] * 1.02):
+                        candidate = ("MONTH", "MAX", month_max, month_max, month_min)
+                elif month_min * 0.972 <= cur <= month_min * 0.999:
+                    if not prev_m or prev_m["direction"] != "MIN" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur < prev_m["level"] * 0.98):
+                        candidate = ("MONTH", "MIN", month_min, month_max, month_min)
 
-            if cand:
-                scope, fdir, ref_lvl, band_hi, band_lo = cand
-                c4h = fetch_klines(sym, "4h", limit=50)
-                c1h = fetch_klines(sym, "1h", limit=28)
+            if candidate:
+                scope, c_dir, ref_lvl, hi_lvl, lo_lvl = candidate
+                c4h = fetch_spot_klines(sym, "4h", 50)
+                c1h = fetch_spot_klines(sym, "1h", 28)
                 if len(c4h) >= 36 and len(c1h) >= 24:
-                    closes4h = [b["c"] for b in c4h]
+                    closes4h = [b["close"] for b in c4h]
                     closes4h[-1] = cur
-                    rsi4h = compute_rsi_last(closes4h, 14)
-                    macd_v, sig_v, hist_v, prev_hist = compute_macd_last(closes4h)
+                    rsi4h = compute_rsi_series(closes4h, 14)[-1]
+                    macd4h = compute_macd_last(closes4h)
 
                     base20 = c1h[-22:-2]
-                    avg1h = sum(b["qv"] for b in base20) / max(1, len(base20))
-                    rec1h = max(c1h[-1]["qv"], c1h[-2]["qv"])
-                    rvol = (rec1h / avg1h) if avg1h > 0 else 1.0
+                    avg1h = sum(b["quote_vol"] for b in base20) / max(len(base20), 1)
+                    recent1h = max(c1h[-1]["quote_vol"], c1h[-2]["quote_vol"])
+                    rvol = (recent1h / avg1h) if avg1h > 0 else 1.0
 
-                    rec_bars = c1h[-2:]
-                    tot_q = sum(b["qv"] for b in rec_bars)
-                    tot_tb = sum(b["tbqv"] for b in rec_bars)
+                    tot_q = sum(b["quote_vol"] for b in c1h[-2:])
+                    tot_tb = sum(b["taker_buy_quote"] for b in c1h[-2:])
                     taker_buy_pct = (tot_tb / tot_q * 100.0) if tot_q > 0 else 50.0
 
-                    is_max = fdir == "MAX"
-                    ok = (
-                        (1.0 <= chg24h <= 18.0 and 50.0 <= rsi4h <= 74.0 and (macd_v > sig_v or hist_v > prev_hist) and rvol >= 1.45 and taker_buy_pct >= 52.0)
-                        if is_max
-                        else (-18.0 <= chg24h <= -1.0 and 26.0 <= rsi4h <= 50.0 and (macd_v < sig_v or hist_v < prev_hist) and rvol >= 1.45 and taker_buy_pct <= 48.0)
+                    is_max = c_dir == "MAX"
+                    chg24 = tk["change24h"]
+                    momentum_ok = (
+                        1.0 <= chg24 <= 18.0
+                        and 50.0 <= rsi4h <= 74.0
+                        and (macd4h["macd"] > macd4h["signal"] or macd4h["hist"] > macd4h["prev_hist"])
+                        and rvol >= 1.45
+                        and taker_buy_pct >= 52.0
+                    ) if is_max else (
+                        -18.0 <= chg24 <= -1.0
+                        and 26.0 <= rsi4h <= 50.0
+                        and (macd4h["macd"] < macd4h["signal"] or macd4h["hist"] < macd4h["prev_hist"])
+                        and rvol >= 1.45
+                        and taker_buy_pct <= 48.0
                     )
-                    if ok:
+
+                    if momentum_ok:
                         with state_lock:
                             if scope == "YEAR":
-                                locks["year"][sym] = {"dir": fdir, "level": cur, "ts": now_ts}
+                                locks["year"][sym] = {"symbol": sym, "direction": c_dir, "level": cur, "yearMax": year_max, "yearMin": year_min, "updatedAt": now_ms}
                                 if month_max > month_min:
-                                    locks["month"][sym] = {"dir": fdir, "level": cur, "ts": now_ts}
+                                    locks["month"][sym] = {"symbol": sym, "direction": c_dir, "level": cur, "monthMax": month_max, "monthMin": month_min, "updatedAt": now_ms}
                             else:
-                                locks["month"][sym] = {"dir": fdir, "level": cur, "ts": now_ts}
-                            save_state()
-                            signals_today.append({
-                                "sym": sym,
-                                "engine": scope,
-                                "dir": "LONG" if is_max else "SHORT",
-                                "entry": cur,
-                                "peak": cur,
-                                "ts": now_ts,
-                            })
+                                locks["month"][sym] = {"symbol": sym, "direction": c_dir, "level": cur, "monthMax": month_max, "monthMin": month_min, "updatedAt": now_ms}
+                            signals_today.append({"engine": scope, "symbol": sym, "dir": "LONG" if is_max else "SHORT", "entry": cur, "peak_pct": 0.0, "ts": now_ms})
+                        save_state()
 
                         fut_line = fetch_futures_context_line(sym)
-                        vol_c = f"{vol24h/1e6:.1f}M"
                         is_year = scope == "YEAR"
-                        lbl = ("year max" if is_max else "year min") if is_year else ("month max" if is_max else "month min")
+                        tag = ("year max" if is_max else "year min") if is_year else ("month max" if is_max else "month min")
                         icon = "🟢" if is_max else "🔴"
-                        taker_txt = f"Taker Alici: %{round(taker_buy_pct)}" if is_max else f"Taker Satici: %{round(100 - taker_buy_pct)}"
-                        lines = [
-                            f"{icon} <b>#{sym}</b>, {lbl} değere ulaştı: <b>${fmt_price(cur)}</b>",
-                            "",
-                            f"📌 Son {'365' if is_year else '30'} günün {'en yüksek' if is_max else 'en düşük'} seviyesi (${fmt_price(ref_lvl)}) hacimli kırıldı.",
-                            f"⚡ RVOL: {rvol:.1f}x · 4S RSI: {rsi4h:.1f} · MACD {'Pozitif' if is_max else 'Negatif'} · {taker_txt}",
-                            f"💧 24s: {chg24h:+.2f}% · Hacim: {vol_c} USDT",
-                        ]
-                        if fut_line:
-                            lines.append(f"🐋 Vadeli Bağlam: {fut_line}")
-                        lines.append("🔒 48 saatlik kilit aktif: Aynı yönde artarda spam sinyal gönderilmez.")
-                        hi_lbl = "365MAX" if is_year else "30MAX"
-                        lo_lbl = "365MIN" if is_year else "30MIN"
-                        png = render_candlestick_png(
-                            c1d[-55:],
-                            title=f"{sym} | 1G {'365G' if is_year else '30G'} KIRILIM",
-                            cur_price=cur,
-                            levels=[
-                                (hi_lbl, band_hi, (16, 185, 129)),
-                                (lo_lbl, band_lo, (244, 63, 94)),
-                                ("ANLIK", cur, (56, 189, 248)),
-                            ],
-                            interval="1d",
+                        taker_txt = f"Taker Alıcı: %{round(taker_buy_pct)}" if is_max else f"Taker Satıcı: %{round(100 - taker_buy_pct)}"
+                        caption = (
+                            f"{icon} <b>#{sym}, {'1 yıllık' if is_year else '1 aylık'} ({tag}) değere ulaştı: ${fmt_price(cur)}</b>\n"
+                            f"⚡ RVOL: <b>{rvol:.1f}x</b> · 4S RSI: {rsi4h:.1f} · 4S MACD {'Pozitif' if is_max else 'Negatif'} · {taker_txt}\n"
+                            f"💰 24s: {chg24:+.2f}% · Hacim: ${tk['volume24h'] / 1_000_000:.1f}M\n"
+                            + (f"📊 {fut_line}\n" if fut_line else "")
+                            + "🔒 48 saatlik kilit aktif (aynı yönde artarda spam yapılmaz)."
                         )
-                        tg_send_photo(png, "\n".join(lines))
+                        lbl_hi = "365MAX" if is_year else "30MAX"
+                        lbl_lo = "365MIN" if is_year else "30MIN"
+                        png = render_candlestick_png(
+                            sym,
+                            "1G",
+                            c1d[-80:],
+                            levels=[(lbl_hi, hi_lvl, (34, 197, 94)), (lbl_lo, lo_lvl, (239, 68, 68)), ("ANLIK", cur, (56, 189, 248))],
+                            header_note=tag.upper(),
+                        )
+                        tg_send_photo(caption, png)
     except Exception:
         pass
 
-    # --- 3) 4h Akis / Emir Defteri Duvari & POC (1D + 3D Trend Onayli) ---
+    # 2) MOTOR 3: 4h Akis / Emir Defteri Duvari & POC (1D + 3D Trend Onayli)
     try:
-        if vol24h >= 2_500_000:
-            depth = fetch_binance_json(f"/api/v3/depth?symbol={sym}&limit=100", 7.0)
-            c15m = fetch_klines(sym, "15m", limit=96)
-            c4h = fetch_klines(sym, "4h", limit=56)
-            c1d_s = fetch_klines(sym, "1d", limit=12)
-            c3d_s = fetch_klines(sym, "3d", limit=12)
+        if tk["volume24h"] >= 2_500_000:
+            depth = fetch_binance_json(f"/api/v3/depth?symbol={urllib.parse.quote(sym)}&limit=100", timeout=7.0)
+            c15m = fetch_spot_klines(sym, "15m", 96)
+            c4h = fetch_spot_klines(sym, "4h", 56)
+            c1d_s = fetch_spot_klines(sym, "1d", 12)
+            c3d_s = fetch_spot_klines(sym, "3d", 12)
             if len(c15m) >= 40 and len(c4h) >= 28 and len(c1d_s) >= 7 and len(c3d_s) >= 5:
-                ma1d = sum(b["c"] for b in c1d_s[-7:]) / 7.0
-                ma3d = sum(b["c"] for b in c3d_s[-5:]) / 5.0
+                ma1d = sum(b["close"] for b in c1d_s[-7:]) / 7.0
                 trend1d = "LONG" if cur >= ma1d else "SHORT"
+                ma3d = sum(b["close"] for b in c3d_s[-5:]) / 5.0
                 trend3d = "LONG" if cur >= ma3d else "SHORT"
 
-                d_lo = min(b["l"] for b in c15m)
-                d_hi = max(b["h"] for b in c15m)
+                d_lo = min(b["low"] for b in c15m)
+                d_hi = max(b["high"] for b in c15m)
                 if d_hi > d_lo:
                     buckets = 40
                     step_p = (d_hi - d_lo) / buckets
-                    hist = [0.0] * buckets
+                    hist_v = [0.0] * buckets
                     for b in c15m:
-                        mid = (b["h"] + b["l"] + b["c"]) / 3.0
+                        mid = (b["high"] + b["low"] + b["close"]) / 3.0
                         idx = min(buckets - 1, max(0, int((mid - d_lo) / step_p)))
-                        hist[idx] += b["qv"]
-                    poc_idx = max(range(buckets), key=lambda i: hist[i])
-                    poc = d_lo + (poc_idx + 0.5) * step_p
+                        hist_v[idx] += b["quote_vol"]
+                    poc_idx = max(range(buckets), key=lambda i: hist_v[i])
+                    poc_price = d_lo + (poc_idx + 0.5) * step_p
 
-                    best_bid = (0.0, 0.0)
-                    best_ask = (0.0, 0.0)
+                    best_bid, best_ask = (0.0, 0.0), (0.0, 0.0)
                     for ps, qs in depth.get("bids", []):
-                        p, q = float(ps), float(qs)
-                        usd = p * q
+                        p, usd = float(ps), float(ps) * float(qs)
                         if abs(cur - p) / cur <= 0.025 and usd > best_bid[1]:
                             best_bid = (p, usd)
                     for ps, qs in depth.get("asks", []):
-                        p, q = float(ps), float(qs)
-                        usd = p * q
+                        p, usd = float(ps), float(ps) * float(qs)
                         if abs(p - cur) / cur <= 0.025 and usd > best_ask[1]:
                             best_ask = (p, usd)
 
-                    bias = None
-                    wall_p, wall_usd, wall_lbl = 0.0, 0.0, ""
+                    bias, wall = None, None
                     if best_ask[1] >= 120_000 and cur <= best_ask[0] * 1.004 and best_ask[1] >= best_bid[1] * 1.15:
-                        bias, wall_p, wall_usd, wall_lbl = "SHORT", best_ask[0], best_ask[1], "Ask (Satış) Duvarı"
+                        bias, wall = "SHORT", (best_ask[0], best_ask[1], "Ask (Satış) Duvarı")
                     elif best_bid[1] >= 120_000 and cur >= best_bid[0] * 0.996 and best_bid[1] >= best_ask[1] * 1.15:
-                        bias, wall_p, wall_usd, wall_lbl = "LONG", best_bid[0], best_bid[1], "Bid (Alış) Duvarı"
+                        bias, wall = "LONG", (best_bid[0], best_bid[1], "Bid (Alış) Duvarı")
 
-                    if bias and bias == trend1d == trend3d:
-                        should_fire = False
+                    if bias and bias == trend1d and bias == trend3d and locks["flow"].get(sym, {}).get("direction") != bias:
+                        sw_hi = max(b["high"] for b in c4h[-28:])
+                        sw_lo = min(b["low"] for b in c4h[-28:])
+                        rng = max(sw_hi - sw_lo, cur * 0.03)
+                        tp1 = min(cur * 0.97, cur - rng * 0.25) if bias == "SHORT" else max(cur * 1.03, cur + rng * 0.25)
+                        tp2 = min(cur * 0.948, cur - rng * 0.45) if bias == "SHORT" else max(cur * 1.052, cur + rng * 0.45)
+                        tp3 = tp2 * 0.975 if bias == "SHORT" else tp2 * 1.025
+                        stop_tight = max(wall[0] * 1.005, cur * 1.008) if bias == "SHORT" else min(wall[0] * 0.995, cur * 0.992)
+                        trigger = cur * 0.992 if bias == "SHORT" else cur * 1.008
+                        exchanges = fetch_multi_exchange_sync(sym, cur)
+
                         with state_lock:
-                            if locks["flow"].get(sym, {}).get("dir") != bias:
-                                locks["flow"][sym] = {"dir": bias, "ts": now_ts}
-                                save_state()
-                                should_fire = True
-                        if should_fire:
-                            sw_hi = max(b["h"] for b in c4h[-28:])
-                            sw_lo = min(b["l"] for b in c4h[-28:])
-                            rng = max(sw_hi - sw_lo, cur * 0.03)
-                            tp1 = min(cur * 0.97, cur - rng * 0.25) if bias == "SHORT" else max(cur * 1.03, cur + rng * 0.25)
-                            tp2 = min(cur * 0.948, cur - rng * 0.45) if bias == "SHORT" else max(cur * 1.052, cur + rng * 0.45)
-                            tp3 = tp2 * (0.975 if bias == "SHORT" else 1.025)
-                            stop = max(wall_p * 1.005, cur * 1.008) if bias == "SHORT" else min(wall_p * 0.995, cur * 0.992)
-                            trigger = cur * (0.992 if bias == "SHORT" else 1.008)
-                            exchanges = fetch_multi_exchange_sync(sym, cur)
+                            locks["flow"][sym] = {"symbol": sym, "direction": bias, "trend1d": trend1d, "trend3d": trend3d, "lockedAt": now_ms}
+                            signals_today.append({"engine": "FLOW", "symbol": sym, "dir": bias, "entry": cur, "peak_pct": 0.0, "ts": now_ms})
+                        save_state()
 
-                            with state_lock:
-                                signals_today.append({"sym": sym, "engine": "FLOW", "dir": bias, "entry": cur, "peak": cur, "ts": now_ts})
+                        def _pstr(t):
+                            return f"{((t - cur) / cur) * 100:+.1f}%"
 
-                            def ps(v):
-                                return f"{((v - cur) / cur) * 100:+.1f}%"
-
-                            caption = (
-                                f"#{sym} ({bias})\n\n"
-                                f"Fiyat: {fmt_price(cur)}\n"
-                                f"Hedefler: {fmt_price(tp1)} ({ps(tp1)}) → {fmt_price(tp2)} ({ps(tp2)}) → {fmt_price(tp3)} ({ps(tp3)})\n"
-                                f"İptal: {fmt_price(stop)} {'üstünde' if bias == 'SHORT' else 'altında'} ({ps(stop)})\n\n"
-                                f"{fmt_price(wall_p)} {wall_lbl} (${round(wall_usd/1000)}k) · POC: {fmt_price(poc)}\n"
-                                f"1D ve 3 Günlük (3D) grafik aynı yönü ({bias}) gösteriyor · Senkron: {', '.join(exchanges)}\n"
-                                f"Anahtar tetik: {fmt_price(trigger)} {'altında' if bias == 'SHORT' else 'üstünde'} kapanış/kalıcılık.\n"
-                                f"🔒 Yön kilidi aktif: Ters yöne dönmeden aynı coinden tekrar sinyal gelmez."
-                            )
-                            png = render_candlestick_png(
-                                c4h,
-                                title=f"{sym} | 4S {bias} AKIS",
-                                cur_price=cur,
-                                levels=[
-                                    ("TP1", tp1, (16, 185, 129)),
-                                    ("TP2", tp2, (52, 211, 153)),
-                                    ("STOP", stop, (244, 63, 94)),
-                                    ("POC", poc, (245, 158, 11)),
-                                    ("ANLIK", cur, (56, 189, 248)),
-                                ],
-                                interval="4h",
-                            )
-                            tg_send_photo(png, caption)
+                        caption = (
+                            f"🔥 <b>#{sym} ({bias}) — ${round(wall[1] / 1000)}k {wall[2]}</b>\n"
+                            f"🎯 Hedefler: <code>{fmt_price(tp1)}</code> ({_pstr(tp1)}) → <code>{fmt_price(tp2)}</code> ({_pstr(tp2)}) → <code>{fmt_price(tp3)}</code> ({_pstr(tp3)})\n"
+                            f"🛑 İptal: <code>{fmt_price(stop_tight)}</code> ({_pstr(stop_tight)})\n"
+                            f"🧱 Duvar: {fmt_price(wall[0])} · 24s POC: {fmt_price(poc_price)}\n"
+                            f"📐 1D + 3D Trend Onayı: <b>{bias}</b> · Senkron: {', '.join(exchanges)}\n"
+                            f"🔑 Anahtar Tetik: {fmt_price(trigger)} {'altında' if bias == 'SHORT' else 'üstünde'} kalıcılık"
+                        )
+                        png = render_candlestick_png(
+                            sym,
+                            "4S",
+                            c4h,
+                            levels=[
+                                ("TP1", tp1, (34, 197, 94)),
+                                ("TP2", tp2, (16, 185, 129)),
+                                ("STOP", stop_tight, (239, 68, 68)),
+                                ("POC", poc_price, (250, 204, 21)),
+                                ("ANLIK", cur, (56, 189, 248)),
+                            ],
+                            header_note=bias,
+                        )
+                        tg_send_photo(caption, png)
     except Exception:
         pass
 
-    # --- 4) W1 ATL (Tum zamanlarin en dusugu - kesin kilit) ---
+    # 3) MOTOR 2: W1 ATL (Siki Taban Kilidi)
     try:
-        cached = atl_cache.get(sym)
-        if not cached or (now_ts - cached[1]) > 3600:
-            c1w = fetch_klines(sym, "1w", limit=1000)
+        cached = atl_weekly_cache.get(sym)
+        if not cached or (now_ms - cached["ts"]) > 3_600_000:
+            c1w = fetch_spot_klines(sym, "1w", 1000)
             if len(c1w) >= 12:
-                prev_atl = min(b["l"] for b in c1w[:-1])
-                cached = (prev_atl, now_ts)
-                atl_cache[sym] = cached
-        if cached and cached[0] > 0:
-            prev_atl = cached[0]
-            with state_lock:
-                atl_rec = locks["atl"].get(sym)
-                floor_atl = min(prev_atl, atl_rec["atl"]) if atl_rec else prev_atl
-                broke = (cur < floor_atl * 0.995) if atl_rec else (cur < floor_atl)
-                should_fire = bool(broke and low24h < prev_atl)
-                if should_fire:
-                    locks["atl"][sym] = {"atl": cur, "ts": now_ts}
-                    save_state()
-            if should_fire:
-                c1h = fetch_klines(sym, "1h", limit=72)
+                prev_atl = min(b["low"] for b in c1w[:-1])
+                cached = {"prev_atl": prev_atl, "ts": now_ms}
+                atl_weekly_cache[sym] = cached
+        if cached and cached["prev_atl"] > 0:
+            atl_rec = locks["atl"].get(sym)
+            floor_atl = min(cached["prev_atl"], atl_rec["atl"]) if atl_rec else cached["prev_atl"]
+            broke = (cur < floor_atl * 0.995) if atl_rec else (cur < floor_atl)
+            if broke and tk["low24h"] < cached["prev_atl"]:
+                with state_lock:
+                    locks["atl"][sym] = {"symbol": sym, "atl": cur, "lockedAt": now_ms}
+                    signals_today.append({"engine": "ATL", "symbol": sym, "dir": "ATL", "entry": cur, "peak_pct": 0.0, "ts": now_ms})
+                save_state()
+                c1h_atl = fetch_spot_klines(sym, "1h", 80)
                 caption = (
-                    f"📉 #{sym} ${fmt_price(cur)} tüm zamanların en düşüğü\n\n"
-                    f"Önceki en düşük (${fmt_price(floor_atl)}) kesin olarak aşağı kırıldı.\n"
-                    f"24s Değişim: {chg24h:+.2f}%\n"
-                    f"🔒 Kilit aktif: ${fmt_price(cur)} altına düşmedikçe tekrar ATL sinyali gelmez."
+                    f"🕳 <b>#{sym} ${fmt_price(cur)} tüm zamanların en düşüğü (ATL)</b>\n"
+                    f"📉 Önceki ATL (<code>${fmt_price(floor_atl)}</code>) kesin olarak aşağı kırıldı · 24s: {tk['change24h']:+.2f}%\n"
+                    f"🔒 Kilit aktif: ${fmt_price(cur)} altına düşmedikçe tekrar gelmez."
                 )
                 png = render_candlestick_png(
-                    c1h,
-                    title=f"{sym} | 1S W1 ATL",
-                    cur_price=cur,
-                    levels=[
-                        ("ATL", floor_atl, (244, 63, 94)),
-                        ("ANLIK", cur, (245, 158, 11)),
-                    ],
-                    interval="1h",
+                    sym,
+                    "1S ATL",
+                    c1h_atl,
+                    levels=[("ATL", floor_atl, (250, 204, 21)), ("ANLIK", cur, (239, 68, 68))],
+                    header_note="W1 ATL",
                 )
-                tg_send_photo(png, caption)
+                tg_send_photo(caption, png)
+    except Exception:
+        pass
+
+    # 4) MOTOR EXHAUST: PARABOLIK TUKENME / PUMP TEPESI DONUSU (SHORT / Kar Al Uyarisi - 24s Kilitli)
+    try:
+        prev_exh = locks["exhaust"].get(sym)
+        exh_cooldown_ms = 24 * 3600 * 1000
+        if (
+            tk["volume24h"] >= 5_000_000
+            and tk["change24h"] >= 7.5
+            and tk["high24h"] > cur
+            and (tk["high24h"] * 0.955 <= cur <= tk["high24h"] * 0.996)
+            and (not prev_exh or (now_ms - prev_exh["lockedAt"]) >= exh_cooldown_ms)
+        ):
+            c15m = fetch_spot_klines(sym, "15m", 40)
+            if len(c15m) >= 24:
+                recent16 = c15m[-17:]
+                swing_low = min(b["low"] for b in recent16[:-1])
+                swing_high = max(b["high"] for b in recent16)
+                rally_pct = ((swing_high - swing_low) / swing_low * 100.0) if swing_low > 0 else 0.0
+
+                if rally_pct >= 7.5 and (swing_high * 0.960 <= cur <= swing_high * 0.996):
+                    closes15 = [b["close"] for b in c15m]
+                    closes15[-1] = cur
+                    rsi_ser = compute_rsi_series(closes15, 14)
+                    rsi_cur = rsi_ser[-1]
+                    rsi_peak4 = max(rsi_ser[-4:])
+
+                    last_bar = c15m[-1]
+                    prev_bar = c15m[-2]
+
+                    def _wick_ratio(b):
+                        return (b["high"] - max(b["open"], b["close"])) / max(b["high"] - b["low"], 1e-9)
+
+                    has_rejection = (
+                        _wick_ratio(prev_bar) >= 0.35
+                        or _wick_ratio(last_bar) >= 0.35
+                        or prev_bar["close"] < prev_bar["open"]
+                    )
+                    last2 = c15m[-2:]
+                    tot_q = sum(b["quote_vol"] for b in last2)
+                    tot_tb = sum(b["taker_buy_quote"] for b in last2)
+                    taker_buy_pct = (tot_tb / tot_q * 100.0) if tot_q > 0 else 50.0
+
+                    if rsi_peak4 >= 75.0 and rsi_cur <= (rsi_peak4 - 1.5) and has_rejection and taker_buy_pct <= 47.0:
+                        rng = swing_high - swing_low
+                        tp1 = min(cur * 0.985, swing_high - rng * 0.382)
+                        tp2 = min(tp1 * 0.985, swing_high - rng * 0.50)
+                        tp3 = min(tp2 * 0.985, swing_high - rng * 0.618)
+                        stop_loss = swing_high * 1.008
+
+                        with state_lock:
+                            locks["exhaust"][sym] = {"symbol": sym, "peakPrice": swing_high, "entryPrice": cur, "lockedAt": now_ms}
+                            signals_today.append({"engine": "EXHAUST", "symbol": sym, "dir": "SHORT", "entry": cur, "peak_pct": 0.0, "ts": now_ms})
+                        save_state()
+
+                        fut_line = fetch_futures_context_line(sym)
+
+                        def _exh_p(t):
+                            return f"{((t - cur) / cur) * 100:+.1f}%"
+
+                        caption = (
+                            f"🪫 <b>#{sym} (SHORT / Tepe Uyarısı) — Parabolik Tükenme (${fmt_price(cur)})</b>\n"
+                            f"📈 Ralli: <b>+%{rally_pct:.1f}</b> · Tepe 15dk RSI: {rsi_peak4:.1f} → {rsi_cur:.1f} (Üst fitil reddi + Taker Satıcı %{round(100 - taker_buy_pct)})\n"
+                            f"🎯 Hedefler (Fib): <code>{fmt_price(tp1)}</code> ({_exh_p(tp1)}) → <code>{fmt_price(tp2)}</code> ({_exh_p(tp2)}) → <code>{fmt_price(tp3)}</code> ({_exh_p(tp3)})\n"
+                            f"🛑 İptal (Sıkı Stop): <code>{fmt_price(stop_loss)}</code> üstünde ({_exh_p(stop_loss)})\n"
+                            + (f"📊 {fut_line}\n" if fut_line else "")
+                            + "🔒 24 saatlik kilit aktif · Spotta kâr al / Vadelide tepe dönüşü uyarısı."
+                        )
+                        png = render_candlestick_png(
+                            sym,
+                            "15DK TEPE",
+                            c15m[-40:],
+                            levels=[
+                                ("TP1", tp1, (34, 197, 94)),
+                                ("TP2", tp2, (16, 185, 129)),
+                                ("STOP", stop_loss, (239, 68, 68)),
+                                ("ANLIK", cur, (250, 204, 21)),
+                            ],
+                            header_note="TEPE TUKENME",
+                        )
+                        tg_send_photo(caption, png)
     except Exception:
         pass
 
 
 # ==============================================================================
-# MOTOR 8: BINANCE RESMI DUYURU & HABER TAKIBI
+# MOTOR 4, 5 & 8: CANLI PIK RAPORLARI (21:00 / 23:00 TR) & BINANCE DUYURU
 # ==============================================================================
-def translate_binance_title(title):
+def update_signal_peaks():
+    changed = False
+    with state_lock:
+        for s in signals_today:
+            tk = ticker_map.get(s["symbol"])
+            if not tk or tk["price"] <= 0:
+                continue
+            cur = tk["price"]
+            is_short = s["dir"] in ("SHORT", "BELOW", "ATL")
+            pct = ((s["entry"] - cur) / s["entry"] * 100.0) if is_short else ((cur - s["entry"]) / s["entry"] * 100.0)
+            if pct > s["peak_pct"]:
+                s["peak_pct"] = round(pct, 2)
+                changed = True
+    if changed:
+        save_state()
+
+
+def check_daily_reports():
+    now_tr = datetime.now(TR_TZ)
+    day_key = now_tr.strftime("%Y-%m-%d")
+    cutoff_ms = int((time.time() - 86400) * 1000)
+
+    if now_tr.hour == 21 and report_sent_days["victory"] != day_key:
+        report_sent_days["victory"] = day_key
+        with state_lock:
+            winners = [s for s in signals_today if s["ts"] >= cutoff_ms and s["peak_pct"] >= 3.0]
+        winners.sort(key=lambda x: x["peak_pct"], reverse=True)
+        if winners:
+            lines = [f"🏆 <b>GÜNÜN ZAFERİ ({day_key})</b>\n"]
+            for i, w in enumerate(winners[:10], 1):
+                lines.append(f"{i}. #{w['symbol']} [{w['engine']}/{w['dir']}] → <b>+{w['peak_pct']:.2f}%</b> pik")
+            tg_send_text("\n".join(lines))
+
+    if now_tr.hour == 23 and report_sent_days["top24"] != day_key:
+        report_sent_days["top24"] = day_key
+        with state_lock:
+            top_list = [s for s in signals_today if s["ts"] >= cutoff_ms]
+        top_list.sort(key=lambda x: x["peak_pct"], reverse=True)
+        if top_list:
+            lines = [f"📊 <b>TOP 24 SAAT ÖZETİ ({day_key})</b>\n"]
+            for i, w in enumerate(top_list[:15], 1):
+                lines.append(f"{i}. #{w['symbol']} [{w['engine']}/{w['dir']}] → {w['peak_pct']:+.2f}%")
+            tg_send_text("\n".join(lines))
+
+
+def translate_binance_title_tr(title: str) -> str:
+    tr = title.strip()
     pairs = [
         ("Binance Will List", "Binance Listeliyor:"),
         ("Binance Will Add", "Binance Ekliyor:"),
         ("Binance Will Support", "Binance Destekliyor:"),
         ("Binance Has Completed the", "Binance Tamamladı:"),
         ("Binance Futures Will Launch", "Binance Vadeli Başlatıyor:"),
-        ("Token Merge", "Token Birleşmesi (Merge)"),
-        ("Contract Swap", "Kontrat Değişimi (Swap)"),
-        ("Withdrawals Reopened", "Çekim İşlemleri Yeniden Açıldı"),
-        ("Notice of Removal of Spot Trading Pairs", "Spot İşlem Çiftleri Kaldırma (Delist)"),
+        ("Notice of Removal of Spot Trading Pairs", "Spot İşlem Çiftleri Delist:"),
         ("Binance Will Delist", "Binance Delist Ediyor:"),
         ("Network Upgrade", "Ağ Güncellemesi"),
     ]
-    out = title.strip()
-    for eng, tr in pairs:
-        out = re.sub(re.escape(eng), tr, out, flags=re.IGNORECASE)
-    return out
+    for eng, tur in pairs:
+        tr = tr.replace(eng, tur)
+    return tr
 
 
-def poll_news():
-    global news_seeded
-    catalogs = [(48, "Yeni Listeleme"), (49, "Binance Duyuru"), (161, "Delist / Kaldırma")]
-    for cat_id, cat_lbl in catalogs:
+def poll_binance_news():
+    global news_initial_seeded
+    for cat_id, cat_lbl in [(48, "Yeni Listeleme"), (49, "Binance Duyuru"), (161, "Delist / Kaldırma")]:
         try:
             url = f"https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query?catalogId={cat_id}&pageNo=1&pageSize=6"
-            d = http_get_json(url, 8.0)
-            for art in d.get("data", {}).get("articles", []):
+            data = http_get_json(url, timeout=8.0)
+            arts = (data.get("data") or {}).get("articles") or []
+            for art in arts:
                 aid = str(art.get("id") or art.get("code") or art.get("title") or "")
-                if not aid or aid in news_seen:
+                if not aid or aid in news_seen_ids:
                     continue
-                news_seen.add(aid)
-                if news_seeded:
+                news_seen_ids.add(aid)
+                if news_initial_seeded:
+                    title_tr = translate_binance_title_tr(str(art.get("title") or ""))
                     code = str(art.get("code") or "")
                     link = f"https://www.binance.com/en/support/announcement/detail/{code}" if code else "https://www.binance.com/en/support/announcement"
-                    tg_send_text(f"📰 <b>Binance | {cat_lbl}</b>\n{translate_binance_title(art.get('title', ''))}\n{link}")
+                    tg_send_text(f"📰 <b>Binance | {cat_lbl}</b>\n{title_tr}\n{link}")
         except Exception:
             pass
-    news_seeded = True
+    news_initial_seeded = True
 
 
 # ==============================================================================
-# ANA DONGULER & GUNLUK RAPORLAR
+# ANA DONGULER & RENDER KEEP-ALIVE SUNUCUSU
 # ==============================================================================
-latest_usdt_liquid = []
-
-
-def ticker_loop():
-    global latest_usdt_liquid
+def ticker_pump_loop():
     while True:
         try:
-            arr = fetch_binance_json("/api/v3/ticker/24hr", 9.0)
-            now_ts = time.time()
-            liq = []
-            for item in arr:
-                sym = item["symbol"]
-                if is_excluded(sym):
-                    continue
-                p = float(item["lastPrice"])
-                v = float(item["quoteVolume"])
-                if p <= 0:
-                    continue
-                check_pump_ticker(sym, p, v, now_ts)
-                if sym.endswith("USDT") and v >= 1_500_000:
-                    liq.append(item)
-                with state_lock:
-                    for sig in signals_today:
-                        if sig["sym"] == sym:
-                            if sig["dir"] == "SHORT":
-                                if ((sig["entry"] - p) / sig["entry"]) > ((sig["entry"] - sig["peak"]) / sig["entry"]):
-                                    sig["peak"] = p
-                            else:
-                                if p > sig["peak"]:
-                                    sig["peak"] = p
-            liq.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-            latest_usdt_liquid = liq[:300]
-        except Exception as e:
-            print("ticker_loop hata:", e)
+            raw = fetch_binance_json("/api/v3/ticker/24hr", timeout=10.0)
+            now_ms = int(time.time() * 1000)
+            if isinstance(raw, list):
+                for item in raw:
+                    sym = item.get("symbol", "")
+                    if is_excluded_pair(sym):
+                        continue
+                    bq = extract_base_quote(sym)
+                    if not bq:
+                        continue
+                    price = float(item.get("lastPrice") or 0)
+                    if price <= 0:
+                        continue
+                    tk = {
+                        "symbol": sym,
+                        "base": bq[0],
+                        "quote": bq[1],
+                        "price": price,
+                        "change24h": float(item.get("priceChangePercent") or 0),
+                        "volume24h": float(item.get("quoteVolume") or 0),
+                        "high24h": float(item.get("highPrice") or price),
+                        "low24h": float(item.get("lowPrice") or price),
+                    }
+                    ticker_map[sym] = tk
+                    evaluate_pump_for_ticker(tk, now_ms)
+                update_signal_peaks()
+                check_daily_reports()
+        except Exception:
+            pass
         time.sleep(3)
 
 
@@ -1132,64 +1149,45 @@ def structure_loop():
     cursor = 0
     while True:
         try:
-            snap = list(latest_usdt_liquid)
-            if snap:
+            liquid = sorted(
+                [t for t in ticker_map.values() if t["quote"] == "USDT" and t["volume24h"] >= 1_500_000],
+                key=lambda x: x["volume24h"],
+                reverse=True,
+            )[:500]
+            if liquid:
                 batch = []
-                for _ in range(min(8, len(snap))):
-                    batch.append(snap[cursor % len(snap)])
+                for _ in range(min(8, len(liquid))):
+                    batch.append(liquid[cursor % len(liquid)])
                     cursor += 1
-                threads = [threading.Thread(target=scan_structural_pair, args=(tk,), daemon=True) for tk in batch]
+                threads = [threading.Thread(target=scan_structural_pair, args=(t,), daemon=True) for t in batch]
                 for th in threads:
                     th.start()
                 for th in threads:
-                    th.join(timeout=15)
-        except Exception as e:
-            print("structure_loop hata:", e)
+                    th.join(timeout=18)
+        except Exception:
+            pass
         time.sleep(4)
 
 
-def daily_report_and_news_loop():
-    global last_daily_21, last_daily_23
+def news_loop():
     while True:
-        try:
-            poll_news()
-            now_tr = tr_now()
-            day_key = now_tr.strftime("%Y-%m-%d")
-            with state_lock:
-                cutoff = time.time() - 86400
-                signals_today[:] = [s for s in signals_today if s["ts"] >= cutoff]
-                ranked = []
-                for s in signals_today:
-                    pct = ((s["entry"] - s["peak"]) / s["entry"] * 100.0) if s["dir"] == "SHORT" else ((s["peak"] - s["entry"]) / s["entry"] * 100.0)
-                    ranked.append((pct, s))
-                ranked.sort(key=lambda x: x[0], reverse=True)
-
-            if now_tr.hour == 21 and last_daily_21 != day_key and ranked:
-                last_daily_21 = day_key
-                top_lines = [f"{i+1}. #{s['sym']} ({s['engine']} {s['dir']}) → +{pct:.2f}%" for i, (pct, s) in enumerate(ranked[:5])]
-                tg_send_text("🏆 <b>GÜNÜN ZAFERİ (21:00 TR)</b>\n\n" + "\n".join(top_lines))
-
-            if now_tr.hour == 23 and last_daily_23 != day_key and ranked:
-                last_daily_23 = day_key
-                top_lines = [f"{i+1}. #{s['sym']} ({s['engine']}) → +{pct:.2f}%" for i, (pct, s) in enumerate(ranked[:10])]
-                tg_send_text("📊 <b>TOP 24 SAAT ÖZETİ (23:00 TR)</b>\n\n" + "\n".join(top_lines))
-        except Exception as e:
-            print("daily_news_loop hata:", e)
+        poll_binance_news()
         time.sleep(60)
 
 
-class KeepAliveHandler(http.server.BaseHTTPRequestHandler):
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        with state_lock:
-            payload = {
-                "status": "ok",
+        body = json.dumps(
+            {
+                "ok": True,
+                "pairs": len(ticker_map),
                 "locks": {k: len(v) for k, v in locks.items()},
-                "liquid_pairs": len(latest_usdt_liquid),
             }
-        self.wfile.write(json.dumps(payload).encode("utf-8"))
+        ).encode("utf-8")
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
         return
@@ -1197,12 +1195,12 @@ class KeepAliveHandler(http.server.BaseHTTPRequestHandler):
 
 def main():
     load_state()
-    threading.Thread(target=ticker_loop, daemon=True).start()
+    threading.Thread(target=ticker_pump_loop, daemon=True).start()
     threading.Thread(target=structure_loop, daemon=True).start()
-    threading.Thread(target=daily_report_and_news_loop, daemon=True).start()
-    with socketserver.TCPServer(("0.0.0.0", PORT), KeepAliveHandler) as httpd:
-        print(f"Render Spot Bot calisiyor (PORT={PORT})")
-        httpd.serve_forever()
+    threading.Thread(target=news_loop, daemon=True).start()
+    srv = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"[SpotFlowBot] Port {PORT} uzerinde aktif. Takip edilen kilit gruplari: {list(locks.keys())}", flush=True)
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
