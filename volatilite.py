@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Render Spot Crypto Bot (8 Motor - Tam Turkce & Canli Gorselli)
----------------------------------------------------------------
-1) 0-7 dk Spot Anlik Pump Dedektoru (sade, egitici not yok)
+Render Spot Crypto Bot (8 Motor - Tam Turkce & Tekilleştirilmiş Pump)
+--------------------------------------------------------------------
+1) 0-7 dk Spot Anlik Pump Dedektoru (Sade, ayni coinden sadece 1 defa sinyal)
 2) W1 Tum Zamanlarin En Dusugu (ATL) (Fiyat + Hacim$M + RSI)
 3) 4h Akis / Emir Defteri Duvari & POC Analizi (Spot Duvar + Fib/POC/Borsa Senkron)
 4) Gunun Zaferi Karti (21:00 TR & /zafer)
@@ -45,11 +45,12 @@ BINANCE_MIRRORS = [
 ]
 
 SIGNALS_STATE_FILE = "/tmp/spot_bot_signals_v5.json"
+PUMP_SEEN_FILE = "/tmp/spot_pump_seen_v5.json"
 MA200_STATE_FILE = "/tmp/spot_ma200_state_v5.json"
 PABS_SEQ_FILE = "/tmp/pabs_seq_v5.json"
 BINANCE_NEWS_SEEN_FILE = "/tmp/binance_news_seen_v5.json"
 
-# Motor 1: 0-7 dk Spot Pump
+# Motor 1: 0-7 dk Spot Pump (0 = Ayni coinden sadece 1 defa sinyal gelir)
 PUMP_SCAN_SEC = 20
 PUMP_WINDOW_SEC = 420
 PUMP_USDT_PCT = 4.5
@@ -57,7 +58,7 @@ PUMP_BTC_BNB_PCT = 4.0
 PUMP_MIN_VOL_USDT = 150_000.0
 PUMP_MIN_VOL_BTC = 3.0
 PUMP_MIN_VOL_BNB = 250.0
-PUMP_COOLDOWN_SEC = 1800
+PUMP_REPEAT_HOURS = int(os.getenv("PUMP_REPEAT_HOURS", "0"))
 
 # Motor 2: W1 ATL
 ATL_SCAN_SEC = 300
@@ -87,13 +88,13 @@ PABS_COOLDOWN_SEC = 14400
 NEWS_SCAN_SEC = 90
 BINANCE_CATALOGS = [
     (48, "YENİ LİSTELEME"),
-    (49, "BİNNACE DUYURU / HABER"),
+    (49, "BİNANCE DUYURU / HABER"),
     (161, "DELİST / ÇİFT KALDIRMA"),
 ]
 
 _STATE_LOCK = threading.Lock()
 _PRICE_HISTORY = {}
-_PUMP_COOLDOWN = {}
+_PUMP_SENT = {}                # {base_coin: first_sent_ts} -> coin bazli kilit
 _ATL_CACHE = {}
 _ATL_COOLDOWN = {}
 _FLOW_COOLDOWN = {}
@@ -139,6 +140,22 @@ def fmt_vol_k(v):
     return f"{int(round(v / 1000.0))}K" if v >= 1000 else f"{int(round(v))}"
 
 
+def extract_base_asset(sym):
+    for q in ("USDT", "BTC", "BNB"):
+        if sym.endswith(q):
+            return sym[:-len(q)], q
+    return sym, ""
+
+
+def is_pump_locked(base, now_ts):
+    last_ts = _PUMP_SENT.get(base)
+    if last_ts is None:
+        return False
+    if PUMP_REPEAT_HOURS <= 0:
+        return True
+    return (now_ts - float(last_ts)) < (PUMP_REPEAT_HOURS * 3600)
+
+
 def load_json_file(path, default):
     try:
         if os.path.exists(path):
@@ -160,11 +177,14 @@ def save_json_file(path, data):
 
 
 def load_all_states():
-    global _SIGNALS_LOG, _MA200_STATE, _PABS_SEQ, _NEWS_SEEN, _NEWS_SEEDED
+    global _SIGNALS_LOG, _PUMP_SENT, _MA200_STATE, _PABS_SEQ, _NEWS_SEEN, _NEWS_SEEDED
     with _STATE_LOCK:
         _SIGNALS_LOG = load_json_file(SIGNALS_STATE_FILE, [])
         if not isinstance(_SIGNALS_LOG, list):
             _SIGNALS_LOG = []
+        _PUMP_SENT = load_json_file(PUMP_SEEN_FILE, {})
+        if not isinstance(_PUMP_SENT, dict):
+            _PUMP_SENT = {}
         _MA200_STATE = load_json_file(MA200_STATE_FILE, {})
         if not isinstance(_MA200_STATE, dict):
             _MA200_STATE = {}
@@ -178,10 +198,11 @@ def load_all_states():
 
 def record_signal_for_reports(symbol, side, entry_price, source_label):
     now_ts = time.time()
+    base, _ = extract_base_asset(symbol)
     with _STATE_LOCK:
         _SIGNALS_LOG.append({
             "symbol": symbol,
-            "base": symbol.replace("USDT", "").replace("BTC", "").replace("BNB", ""),
+            "base": base,
             "side": side,
             "entry": float(entry_price),
             "peak_price": float(entry_price),
@@ -946,7 +967,7 @@ def tg_send_photo(png_bytes, caption):
 
 
 # ==============================================================================
-# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (SADE)
+# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (SADE & TEK SEFERLIK COIN KILIDI)
 # ==============================================================================
 def format_pump_message(symbol, quote, pct, minutes_used, start_price, cur_price, vol_24h):
     vol_str = f"{vol_24h:,.0f}" if quote == "USDT" else f"{vol_24h:,.2f}"
@@ -959,7 +980,7 @@ def format_pump_message(symbol, quote, pct, minutes_used, start_price, cur_price
 
 
 def pump_worker():
-    print("[MOTOR 1] 0-7 dk Spot Pump baslatildi.")
+    print("[MOTOR 1] 0-7 dk Spot Pump (Tek Sinyal Kilidi) baslatildi.")
     while True:
         try:
             tickers = fetch_spot_tickers()
@@ -987,12 +1008,18 @@ def pump_worker():
                 if quote == "USDT":
                     price_map[sym] = cur
 
+                base, _ = extract_base_asset(sym)
+                with _STATE_LOCK:
+                    locked = is_pump_locked(base, now_ts)
+                if locked:
+                    continue
+
                 hist = _PRICE_HISTORY.setdefault(sym, [])
                 hist.append((now_ts, cur))
                 cutoff = now_ts - PUMP_WINDOW_SEC
                 while hist and hist[0][0] < cutoff:
                     hist.pop(0)
-                if len(hist) < 2 or (now_ts - _PUMP_COOLDOWN.get(sym, 0) < PUMP_COOLDOWN_SEC):
+                if len(hist) < 2:
                     continue
 
                 base_ts, base_price = min(hist, key=lambda x: x[1])
@@ -1001,7 +1028,12 @@ def pump_worker():
                 pct = ((cur - base_price) / base_price) * 100.0
                 if pct >= th_pct:
                     mins = max(1, int(round((now_ts - base_ts) / 60.0)))
-                    _PUMP_COOLDOWN[sym] = now_ts
+                    with _STATE_LOCK:
+                        if is_pump_locked(base, now_ts):
+                            continue
+                        _PUMP_SENT[base] = now_ts
+                        save_json_file(PUMP_SEEN_FILE, _PUMP_SENT)
+                    _PRICE_HISTORY.pop(sym, None)
                     try:
                         png = render_pump_chart_png(sym, quote, fetch_spot_klines(sym, "1m", limit=50), base_price, cur, pct)
                     except Exception:
@@ -1623,13 +1655,15 @@ def telegram_command_worker():
                 if txt in ("/start", "/durum"):
                     with _STATE_LOCK:
                         sig_cnt = len(_SIGNALS_LOG)
+                        pump_cnt = len(_PUMP_SENT)
                         ma_cnt = len(_MA200_STATE)
                         above_cnt = sum(1 for v in _MA200_STATE.values() if v == "ABOVE")
                         below_cnt = sum(1 for v in _MA200_STATE.values() if v == "BELOW")
                         seq_no = _PABS_SEQ
+                    pump_rule = "Sadece 1 defa (Kalıcı Kilit)" if PUMP_REPEAT_HOURS <= 0 else f"{PUMP_REPEAT_HOURS} saatte 1 defa"
                     tg_send_text(
                         "🤖 <b>8 Motorlu Kripto Spot Tarayıcı Aktif</b>\n\n"
-                        "⚡ 1) 0–7 dk Anlık Spot Pump Dedektörü (Sade)\n"
+                        f"⚡ 1) 0–7 dk Spot Pump ({pump_rule} · {pump_cnt} coin kilitli)\n"
                         "📉 2) W1 Tüm Zamanların En Düşüğü (ATL)\n"
                         "🧱 3) 4h Akış / Emir Defteri Duvarı & POC\n"
                         "🏆 4) Günün Zaferi Kartı (21:00 TR & /zafer)\n"
@@ -1637,8 +1671,15 @@ def telegram_command_worker():
                         f"📏 6) 1G MA200 Kilitli Kırılım ({ma_cnt} coin: {above_cnt} üst / {below_cnt} alt)\n"
                         f"🎯 7) PABS Spot Alım Bölgesi (Sıra #{seq_no})\n"
                         "📰 8) Binance Resmi Duyuru & Haber Takibi\n\n"
-                        f"📊 Son 48s takip edilen sinyal: <b>{sig_cnt}</b>"
+                        f"📊 Son 48s takip edilen sinyal: <b>{sig_cnt}</b>\n"
+                        "🔄 Pump kilidini temizlemek için: /pumpsifirla"
                     )
+                elif txt == "/pumpsifirla":
+                    with _STATE_LOCK:
+                        cleared = len(_PUMP_SENT)
+                        _PUMP_SENT.clear()
+                        save_json_file(PUMP_SEEN_FILE, _PUMP_SENT)
+                    tg_send_text(f"🧹 Spot Pump tek-sinyal kilidi sıfırlandı ({cleared} coin temizlendi).")
                 elif txt == "/zafer":
                     send_win_of_day_report(manual=True)
                 elif txt == "/top24":
