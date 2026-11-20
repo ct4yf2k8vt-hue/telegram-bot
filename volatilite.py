@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Spot Akis & Sinyal Telegram Botu (Zero-Dependency Render Edition)
+Spot Akis & Sinyal Telegram Botu (Zero-Dependency Render Edition v3)
 - Ek paket gerektirmez (yalnizca Python 3 standart kutuphanesi)
-- Motorlar: 0-7 dk Pump, W1 ATL, 1D+3D Onayli 4h Akis, 1G MA200, Gunun Zaferi & TOP24, Binance Duyurular
+- Tum veriler dogrudan canli api.binance.com uzerinden alinir
+- Tum grafiklerde baslik, sag fiyat ekseni, etiketli seviye rozetleri (ANLIK/BAS/TP1/STOP/POC/MA200/ATL) ve alt zaman ekseni cizilir
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -28,11 +29,11 @@ STATE_FILE = os.environ.get("STATE_FILE", "/tmp/render_spot_bot_state.json")
 TR_TZ = timezone(timedelta(hours=3))
 
 BINANCE_MIRRORS = [
-    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
+    "https://data-api.binance.vision",
 ]
 
 EXCLUDED_SUBSTRINGS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
@@ -54,6 +55,57 @@ PRICE_WINDOW_HIST = {}
 ATL_WEEKLY_CACHE = {}
 LATEST_TICKERS = {}
 NEWS_SEEDED = False
+
+FONT_5X7 = {
+    "0": [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+    "1": [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+    "2": [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+    "3": [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+    "4": [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+    "5": [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+    "6": [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+    "7": [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+    "8": [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+    "9": [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+    "A": [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+    "B": [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+    "C": [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+    "D": [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C],
+    "E": [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+    "F": [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+    "G": [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
+    "H": [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+    "I": [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+    "J": [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C],
+    "K": [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+    "L": [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+    "M": [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+    "N": [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+    "O": [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+    "P": [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+    "Q": [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
+    "R": [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+    "S": [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+    "T": [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+    "U": [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+    "V": [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+    "W": [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
+    "X": [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+    "Y": [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+    "Z": [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+    ".": [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
+    ",": [0x00, 0x00, 0x00, 0x00, 0x06, 0x04, 0x08],
+    ":": [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00],
+    "-": [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
+    "+": [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00],
+    "%": [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03],
+    "$": [0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04],
+    "/": [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10],
+    "(": [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
+    ")": [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
+    "|": [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+    " ": [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+}
 
 
 def load_state():
@@ -84,7 +136,7 @@ def http_get_json(url, timeout=9):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowRenderBot/2.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowRenderBot/3.0)",
             "Accept": "application/json",
         },
     )
@@ -207,8 +259,33 @@ def tg_send_photo(png_bytes, caption):
         tg_send_message(caption)
 
 
-def render_candlestick_png(candles, hlines=None, sma_series=None, live_price=None, width=900, height=440):
-    bars = [dict(b) for b in candles[-70:]]
+def fmt_price(p):
+    if not p or p <= 0:
+        return "0"
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 10:
+        return f"{p:.3f}".rstrip("0").rstrip(".")
+    if p >= 1:
+        return f"{p:.4f}".rstrip("0").rstrip(".")
+    if p >= 0.01:
+        return f"{p:.5f}".rstrip("0").rstrip(".")
+    if p >= 0.0001:
+        return f"{p:.6f}".rstrip("0").rstrip(".")
+    return f"{p:.8f}".rstrip("0").rstrip(".")
+
+
+def render_candlestick_png(
+    candles,
+    title="",
+    timeframe="1DK",
+    hlines=None,
+    sma_series=None,
+    live_price=None,
+    width=980,
+    height=500,
+):
+    bars = [dict(b) for b in candles[-65:]]
     if not bars:
         return b""
 
@@ -221,11 +298,14 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, live_price=Non
     sma_slice = (sma_series or [])[-len(bars):]
 
     bg = (9, 13, 22)
-    grid_col = (26, 36, 56)
+    panel = (14, 20, 34)
+    grid_col = (28, 39, 60)
     green = (16, 185, 129)
     red = (244, 63, 94)
     amber = (245, 158, 11)
-    sky = (56, 189, 248)
+    sky = (14, 165, 233)
+    text_light = (241, 245, 249)
+    text_muted = (148, 163, 184)
 
     buf = bytearray([bg[0], bg[1], bg[2]] * (width * height))
 
@@ -254,8 +334,36 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, live_price=Non
             y = int(round(y0 + (y1 - y0) * s / steps))
             set_px(x, y, col)
 
+    def draw_text(x, y, text, col, scale=2):
+        cx = int(x)
+        cy = int(y)
+        for ch in text.upper():
+            glyph = FONT_5X7.get(ch, FONT_5X7[" "])
+            for r_idx, row_bits in enumerate(glyph):
+                for c_idx in range(5):
+                    if row_bits & (1 << (4 - c_idx)):
+                        if scale == 1:
+                            set_px(cx + c_idx, cy + r_idx, col)
+                        else:
+                            fill_rect(
+                                cx + c_idx * scale,
+                                cy + r_idx * scale,
+                                cx + c_idx * scale + scale - 1,
+                                cy + r_idx * scale + scale - 1,
+                                col,
+                            )
+            cx += 6 * scale
+
+    fill_rect(0, 0, width - 1, 38, panel)
+    draw_line(0, 39, width - 1, 39, grid_col)
+    now_tr_str = datetime.now(TR_TZ).strftime("%d/%m %H:%M:%S TR")
+    header_txt = f"{title} | {timeframe}" if title else timeframe
+    draw_text(16, 12, header_txt, text_light, scale=2)
+    draw_text(width - len(now_tr_str) * 12 - 16, 12, now_tr_str, text_muted, scale=2)
+
     prices = [b["l"] for b in bars] + [b["h"] for b in bars]
-    for lvl, _ in hlines:
+    for item in hlines:
+        lvl = item[0]
         if lvl and lvl > 0:
             prices.append(lvl)
     if live_price and live_price > 0:
@@ -265,7 +373,7 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, live_price=Non
     max_p = max(prices) * 1.006
     rng = max(max_p - min_p, min_p * 0.01)
 
-    pad_l, pad_r, pad_t, pad_b = 28, 28, 22, 72
+    pad_l, pad_r, pad_t, pad_b = 18, 162, 52, 92
     plot_w = width - pad_l - pad_r
     plot_h = height - pad_t - pad_b
 
@@ -275,14 +383,12 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, live_price=Non
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         gy = int(pad_t + plot_h * frac)
         draw_line(pad_l, gy, pad_l + plot_w, gy, grid_col, dashed=True)
-
-    for lvl, col in hlines:
-        if lvl and lvl > 0:
-            draw_line(pad_l, y_of(lvl), pad_l + plot_w, y_of(lvl), col, dashed=True)
+        val = min_p + rng * (1.0 - frac)
+        draw_text(pad_l + plot_w + 8, gy - 5, fmt_price(val), text_muted, scale=1)
 
     n = len(bars)
     step = plot_w / n
-    bw = max(2, int(step * 0.6))
+    bw = max(3, int(step * 0.62))
     max_vol = max((b["v"] for b in bars), default=1.0) or 1.0
     vol_top = pad_t + plot_h + 10
     vol_h = 46
@@ -308,8 +414,29 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, live_price=Non
             draw_line(prev_pt[0], prev_pt[1], cx, cy, amber)
         prev_pt = (cx, cy)
 
+    for item in hlines:
+        lvl, col = item[0], item[1]
+        lbl = item[2] if len(item) > 2 else ""
+        if lvl and lvl > 0:
+            ly = y_of(lvl)
+            draw_line(pad_l, ly, pad_l + plot_w, ly, col, dashed=True)
+            tag = f"{lbl} {fmt_price(lvl)}".strip()
+            fill_rect(pad_l + plot_w + 4, ly - 8, width - 6, ly + 8, col)
+            draw_text(pad_l + plot_w + 8, ly - 3, tag, (9, 13, 22), scale=1)
+
     cur_line_p = live_price if (live_price and live_price > 0) else bars[-1]["c"]
-    draw_line(pad_l, y_of(cur_line_p), pad_l + plot_w, y_of(cur_line_p), sky, dashed=True)
+    ly_cur = y_of(cur_line_p)
+    draw_line(pad_l, ly_cur, pad_l + plot_w, ly_cur, sky, dashed=True)
+    cur_tag = f"ANLIK {fmt_price(cur_line_p)}"
+    fill_rect(pad_l + plot_w + 4, ly_cur - 9, width - 6, ly_cur + 9, sky)
+    draw_text(pad_l + plot_w + 8, ly_cur - 3, cur_tag, text_light, scale=1)
+
+    for frac in (0.0, 0.25, 0.5, 0.75, 0.98):
+        idx = min(len(bars) - 1, int(frac * (len(bars) - 1)))
+        tx = int(pad_l + (idx + 0.5) * step)
+        dt = datetime.fromtimestamp(bars[idx]["t"], TR_TZ)
+        tlbl = dt.strftime("%d/%m") if timeframe in ("1G", "3G", "1H") else dt.strftime("%H:%M")
+        draw_text(max(pad_l, tx - 16), height - 20, tlbl, text_muted, scale=1)
 
     raw_rows = bytearray()
     stride = width * 3
@@ -334,22 +461,6 @@ def extract_base_quote(sym):
 
 def is_excluded_pair(sym):
     return any(s in sym for s in EXCLUDED_SUBSTRINGS) or any(sym.startswith(p) for p in EXCLUDED_PREFIXES)
-
-
-def fmt_price(p):
-    if not p or p <= 0:
-        return "0"
-    if p >= 1000:
-        return f"{p:,.2f}"
-    if p >= 10:
-        return f"{p:.3f}".rstrip("0").rstrip(".")
-    if p >= 1:
-        return f"{p:.4f}".rstrip("0").rstrip(".")
-    if p >= 0.01:
-        return f"{p:.5f}".rstrip("0").rstrip(".")
-    if p >= 0.0001:
-        return f"{p:.6f}".rstrip("0").rstrip(".")
-    return f"{p:.8f}".rstrip("0").rstrip(".")
 
 
 def fmt_compact_vol(v):
@@ -441,22 +552,43 @@ def check_pump(sym, base, quote, price, vol24h, now):
         STATE["pump_locks"][base] = {"symbol": sym, "locked_at": now}
         save_state()
 
+    try:
+        fresh = binance_get(f"/api/v3/ticker/24hr?symbol={urllib.parse.quote(sym)}", timeout=5)
+        live_cur = float(fresh.get("lastPrice") or price)
+        live_vol = float(fresh.get("quoteVolume") or vol24h)
+        c1m = fetch_klines(sym, "1m", 60, live_price=live_cur)
+        bar_min = min(b["l"] for b in c1m[-7:]) if c1m else min_p
+        verified_min = min(min_p, bar_min) if bar_min > 0 else min_p
+        verified_pct = ((live_cur - verified_min) / verified_min) * 100.0
+        if verified_pct < th_pct:
+            with STATE_LOCK:
+                STATE["pump_locks"].pop(base, None)
+                save_state()
+            return
+    except Exception:
+        live_cur, live_vol, c1m, verified_min, verified_pct = price, vol24h, [], min_p, pct
+
     PRICE_WINDOW_HIST.pop(sym, None)
-    mins = max(1, round((now - min_ts) / 60.0))
-    vol_str = f"{round(vol24h):,}" if quote == "USDT" else f"{vol24h:.2f}"
+    mins = max(1, round((time.time() - min_ts) / 60.0))
+    vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
     msg = (
         f"⚡ <b>SPOT ANLIK PUMP DEDEKTÖRÜ — {sym}</b>\n\n"
-        f"📈 Değişim: +{pct:.2f}% ({mins} dk içinde!)\n"
-        f"💰 Başlangıç: {fmt_price(min_p)}  ➡️  Anlık: {fmt_price(price)}\n"
+        f"📈 Değişim: +{verified_pct:.2f}% ({mins} dk içinde!)\n"
+        f"💰 Başlangıç: {fmt_price(verified_min)}  ➡️  Anlık: {fmt_price(live_cur)}\n"
         f"💧 24s Parite Hacmi: {vol_str} ({quote})"
     )
-    try:
-        c1m = fetch_klines(sym, "1m", 60, live_price=price)
-        png = render_candlestick_png(c1m, hlines=[(min_p, (245, 158, 11))], live_price=price)
+    if c1m:
+        png = render_candlestick_png(
+            c1m,
+            title=f"{sym} +{verified_pct:.2f}%",
+            timeframe="1DK",
+            hlines=[(verified_min, (245, 158, 11), "BAS")],
+            live_price=live_cur,
+        )
         tg_send_photo(png, msg)
-    except Exception:
+    else:
         tg_send_message(msg)
-    record_active_signal(sym, "PUMP", "LONG", price)
+    record_active_signal(sym, "PUMP", "LONG", live_cur)
 
 
 def scan_structural_pair(sym, tk):
@@ -468,7 +600,7 @@ def scan_structural_pair(sym, tk):
     if vol < 1_000_000 or cur <= 0:
         return
 
-    # 1) MOTOR 6: 1G MA200 (Sadece klasik SMA200 - Baslangicta sessiz tohumlama, yalnizca ANLIK kirilim)
+    # 1) MOTOR 6: 1G MA200
     try:
         c1d = fetch_klines(sym, "1d", 235, live_price=cur)
         if len(c1d) >= 203:
@@ -501,7 +633,14 @@ def scan_structural_pair(sym, tk):
                             f"📊 Anlık Fiyat: ${fmt_price(cur)} · Canlı MA200: ${fmt_price(ma_live)} ({diff_pct:+.2f}%)\n"
                             f"🔒 Ters kırılım gelene kadar tekrar sinyal gönderilmez."
                         )
-                        png = render_candlestick_png(c1d[-90:], sma_series=sma200, live_price=cur)
+                        png = render_candlestick_png(
+                            c1d[-90:],
+                            title=f"{sym} MA200",
+                            timeframe="1G",
+                            hlines=[(ma_live, (245, 158, 11), "MA200")],
+                            sma_series=sma200,
+                            live_price=cur,
+                        )
                         tg_send_photo(png, cap)
                         record_active_signal(sym, "MA200", new_pos, cur)
     except Exception:
@@ -600,7 +739,14 @@ def scan_structural_pair(sym, tk):
                             )
                             png = render_candlestick_png(
                                 c4h[-56:],
-                                hlines=[(tp1, (16, 185, 129)), (tp2, (16, 185, 129)), (stop_tight, (244, 63, 94)), (poc_price, (245, 158, 11))],
+                                title=f"{sym} ({bias})",
+                                timeframe="4S",
+                                hlines=[
+                                    (tp1, (16, 185, 129), "TP1"),
+                                    (tp2, (16, 185, 129), "TP2"),
+                                    (stop_tight, (244, 63, 94), "STOP"),
+                                    (poc_price, (245, 158, 11), "POC"),
+                                ],
                                 live_price=cur,
                             )
                             tg_send_photo(png, cap)
@@ -608,7 +754,7 @@ def scan_structural_pair(sym, tk):
     except Exception:
         pass
 
-    # 3) MOTOR 2: W1 ATL (O anki tum zamanlarin en dusugunun altina inmedikce tekrar gelmez + W1 Grafik)
+    # 3) MOTOR 2: W1 ATL
     try:
         cached = ATL_WEEKLY_CACHE.get(sym)
         c1w_recent = None
@@ -618,7 +764,7 @@ def scan_structural_pair(sym, tk):
                 prev_atl = min(b["l"] for b in c1w[:-1])
                 cached = (prev_atl, now)
                 ATL_WEEKLY_CACHE[sym] = cached
-                c1w_recent = c1w[-70:]
+                c1w_recent = c1w[-65:]
         if cached and cached[0] > 0:
             prev_atl = cached[0]
             with STATE_LOCK:
@@ -637,8 +783,14 @@ def scan_structural_pair(sym, tk):
                     f"24s {chg24:+.2f}% Hacim {fmt_compact_vol(vol)}"
                 )
                 try:
-                    bars_w = c1w_recent or fetch_klines(sym, "1w", 70, live_price=cur)
-                    png = render_candlestick_png(bars_w, hlines=[(floor_atl, (244, 63, 94))], live_price=cur)
+                    bars_w = c1w_recent or fetch_klines(sym, "1w", 65, live_price=cur)
+                    png = render_candlestick_png(
+                        bars_w,
+                        title=f"{sym} ATL",
+                        timeframe="1H",
+                        hlines=[(floor_atl, (244, 63, 94), "ATL")],
+                        live_price=cur,
+                    )
                     tg_send_photo(png, msg)
                 except Exception:
                     tg_send_message(msg)
@@ -725,7 +877,7 @@ def main():
     load_state()
     srv = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"Spot Akis Botu baslatildi (Port {PORT}, Chat {CHAT_ID})")
+    print(f"Spot Akis Botu v3 baslatildi (Port {PORT}, Chat {CHAT_ID})")
 
     poll_binance_news()
     last_news = time.time()
