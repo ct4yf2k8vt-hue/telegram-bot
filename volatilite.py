@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Spot Akis & Sinyal Telegram Botu (Zero-Dependency Render Edition)
+Spot Akis & Sinyal Telegram Botu (Zero-Dependency Render Edition v2)
 - Ek paket gerektirmez (yalnizca Python 3 standart kutuphanesi)
 - Render Web Service uyumlu (PORT env, varsayilan 10000)
-- 8 Motor:
-  1) 0-7 dk Spot Anlik Pump Dedektoru (Sade TR format, coin bazli tekil kilit)
-  2) W1 ATL (Tum Zamanlarin En Dusugu - siki dip fiyati altina inmeden tekrar etmez)
-  3) 4h Akis / Emir Defteri Duvari & 24s POC (1D + 3D Trend Onayli + LONG<->SHORT Kilitli)
-  4 & 5) Gunun Zaferi (21:00 TR) & TOP 24 Saat (23:00 TR)
-  6) 1G MA200 Kirilim & Dusus (Sadece klasik SMA200 + ABOVE<->BELOW Yon Kilidi)
-  7) PABS Spot Alim Bolgesi (1h destek donusu + RSI14 + Dongu Kilidi)
-  8) Binance Resmi Duyuru & Haber Takibi (Katalog 48 / 49 / 161)
+- Tum likit coinler eszamanli taranir, tum sinyaller guncel canli PNG grafik ile gonderilir.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -59,15 +53,15 @@ STATE = {
     "ma200_locks": {},      # sym  -> {"direction": "ABOVE"|"BELOW", "ma200": float, "updated_at": ts}
     "pabs_locks": {},       # sym  -> {"unlock_above": float, "locked_at": ts}
     "pabs_seq": 48670,
-    "active_signals": [],   # Gunun Zaferi / TOP 24 takibi
+    "active_signals": [],
     "seen_news_ids": [],
     "last_victory_day": "",
     "last_top24_day": "",
 }
 
-PRICE_WINDOW_HIST = {}  # sym -> list[(ts_sec, price)]
-ATL_WEEKLY_CACHE = {}   # sym -> (prev_atl, ts_sec)
-LATEST_TICKERS = {}     # sym -> {"price": float, "chg24h": float, "vol": float, "high": float, "low": float}
+PRICE_WINDOW_HIST = {}
+ATL_WEEKLY_CACHE = {}
+LATEST_TICKERS = {}
 NEWS_SEEDED = False
 
 
@@ -102,7 +96,7 @@ def http_get_json(url, timeout=9):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowRenderBot/1.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowRenderBot/2.0)",
             "Accept": "application/json",
         },
     )
@@ -120,7 +114,7 @@ def binance_get(path_and_query, timeout=9):
     raise last_err or RuntimeError("Binance mirrorlara ulasilamadi")
 
 
-def fetch_klines(symbol, interval, limit=240):
+def fetch_klines(symbol, interval, limit=240, live_price=None):
     raw = binance_get(
         f"/api/v3/klines?symbol={urllib.parse.quote(symbol)}&interval={urllib.parse.quote(interval)}&limit={int(limit)}",
         timeout=10,
@@ -138,6 +132,11 @@ def fetch_klines(symbol, interval, limit=240):
             "v": float(k[5]),
             "qv": float(k[7]),
         })
+    # Son olusan mumu en guncel canli fiyatla senkronla
+    if bars and live_price and live_price > 0:
+        bars[-1]["c"] = live_price
+        bars[-1]["h"] = max(bars[-1]["h"], live_price)
+        bars[-1]["l"] = min(bars[-1]["l"], live_price)
     return bars
 
 
@@ -186,6 +185,9 @@ def tg_send_message(text):
 
 
 def tg_send_photo(png_bytes, caption):
+    if not png_bytes:
+        tg_send_message(caption)
+        return
     if not BOT_TOKEN:
         print("[TG DRY-RUN PHOTO]\n" + caption + "\n")
         return
@@ -221,10 +223,15 @@ def tg_send_photo(png_bytes, caption):
 # ==============================================================================
 # SIFIR BAGIMLILIKLI PURE-PYTHON PNG MUM GRAFIK OLUSTURUCU
 # ==============================================================================
-def render_candlestick_png(candles, hlines=None, sma_series=None, band=None, width=900, height=440):
-    bars = candles[-70:]
+def render_candlestick_png(candles, hlines=None, sma_series=None, band=None, live_price=None, width=900, height=440):
+    bars = [dict(b) for b in candles[-70:]]
     if not bars:
         return b""
+
+    if live_price and live_price > 0:
+        bars[-1]["c"] = live_price
+        bars[-1]["h"] = max(bars[-1]["h"], live_price)
+        bars[-1]["l"] = min(bars[-1]["l"], live_price)
 
     hlines = hlines or []
     sma_slice = (sma_series or [])[-len(bars):]
@@ -234,6 +241,7 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, band=None, wid
     green = (16, 185, 129)
     red = (244, 63, 94)
     amber = (245, 158, 11)
+    sky = (56, 189, 248)
     zone_col = (16, 70, 52)
 
     buf = bytearray([bg[0], bg[1], bg[2]] * (width * height))
@@ -269,6 +277,8 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, band=None, wid
             prices.append(lvl)
     if band:
         prices.extend([band[0], band[1]])
+    if live_price and live_price > 0:
+        prices.append(live_price)
 
     min_p = min(prices) * 0.994
     max_p = max(prices) * 1.006
@@ -290,8 +300,7 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, band=None, wid
 
     for lvl, col in hlines:
         if lvl and lvl > 0:
-            ly = y_of(lvl)
-            draw_line(pad_l, ly, pad_l + plot_w, ly, col, dashed=True)
+            draw_line(pad_l, y_of(lvl), pad_l + plot_w, y_of(lvl), col, dashed=True)
 
     n = len(bars)
     step = plot_w / n
@@ -320,6 +329,10 @@ def render_candlestick_png(candles, hlines=None, sma_series=None, band=None, wid
         if prev_pt is not None:
             draw_line(prev_pt[0], prev_pt[1], cx, cy, amber)
         prev_pt = (cx, cy)
+
+    # Anlik canli fiyat cizgisi
+    cur_line_p = live_price if (live_price and live_price > 0) else bars[-1]["c"]
+    draw_line(pad_l, y_of(cur_line_p), pad_l + plot_w, y_of(cur_line_p), sky, dashed=True)
 
     raw_rows = bytearray()
     stride = width * 3
@@ -447,7 +460,7 @@ def update_signal_peaks():
 
 
 # ==============================================================================
-# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (SADE FORMAT + COIN BAZLI TEKIL KILIT)
+# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (SADE FORMAT + COIN BAZLI TEKIL KILIT + GRAFIK)
 # ==============================================================================
 def check_pump(sym, base, quote, price, vol24h, now):
     min_vol = 150_000 if quote == "USDT" else (3.0 if quote == "BTC" else 250.0)
@@ -487,12 +500,17 @@ def check_pump(sym, base, quote, price, vol24h, now):
         f"💰 Başlangıç: {fmt_price(min_p)}  ➡️  Anlık: {fmt_price(price)}\n"
         f"💧 24s Parite Hacmi: {vol_str} ({quote})"
     )
-    tg_send_message(msg)
+    try:
+        c1m = fetch_klines(sym, "1m", 60, live_price=price)
+        png = render_candlestick_png(c1m, hlines=[(min_p, (245, 158, 11))], live_price=price)
+        tg_send_photo(png, msg)
+    except Exception:
+        tg_send_message(msg)
     record_active_signal(sym, "PUMP", "LONG", price)
 
 
 # ==============================================================================
-# MOTOR 2, 3, 6, 7: YAPISAL TARAMALAR
+# MOTOR 2, 3, 6, 7: TUM COINLERDE ANLIK VE GUNCEL YAPISAL TARAMALAR
 # ==============================================================================
 def scan_structural_pair(sym, tk):
     cur = tk["price"]
@@ -500,49 +518,46 @@ def scan_structural_pair(sym, tk):
     chg24 = tk["chg24h"]
     low24 = tk["low"]
     now = time.time()
-    if vol < 1_500_000 or cur <= 0:
+    if vol < 1_000_000 or cur <= 0:
         return
 
-    # 1) MOTOR 6: 1G MA200 (Sadece klasik SMA200 & Kalici Yon Kilidi)
+    # 1) MOTOR 6: 1G MA200 (Baslangicta sessiz tohumlama, yalnizca ANLIK canli kirilimda sinyal)
     try:
-        c1d = fetch_klines(sym, "1d", 235)
+        c1d = fetch_klines(sym, "1d", 235, live_price=cur)
         if len(c1d) >= 203:
             closes = [b["c"] for b in c1d]
             sma200 = compute_sma_series(closes, 200)
-            prev_c, last_c = closes[-3], closes[-2]
-            ma_prev, ma_last = sma200[-3], sma200[-2]
-            if ma_prev and ma_last and ma_last > 0:
-                new_pos = "ABOVE" if last_c >= ma_last * 1.0025 else ("BELOW" if last_c <= ma_last * 0.9975 else None)
+            ma_live = sma200[-1]
+            if ma_live and ma_live > 0:
+                new_pos = "ABOVE" if cur >= ma_live * 1.004 else ("BELOW" if cur <= ma_live * 0.996 else None)
                 if new_pos:
                     crossed = False
                     with STATE_LOCK:
                         prev_lock = STATE["ma200_locks"].get(sym)
                         if not prev_lock:
-                            raw_prev = "ABOVE" if prev_c >= ma_prev else "BELOW"
-                            STATE["ma200_locks"][sym] = {"direction": new_pos, "ma200": ma_last, "updated_at": now}
-                            if raw_prev != new_pos:
-                                crossed = True
+                            # Ilk taramada gecmis kapanislardan sahte sinyal uretme; mevcut canli yonu kaydet
+                            STATE["ma200_locks"][sym] = {"direction": new_pos, "ma200": ma_live, "updated_at": now}
                             save_state()
                         elif prev_lock["direction"] != new_pos:
-                            STATE["ma200_locks"][sym] = {"direction": new_pos, "ma200": ma_last, "updated_at": now}
+                            STATE["ma200_locks"][sym] = {"direction": new_pos, "ma200": ma_live, "updated_at": now}
                             crossed = True
                             save_state()
                     if crossed:
-                        diff_pct = ((last_c - ma_last) / ma_last) * 100.0
+                        diff_pct = ((cur - ma_live) / ma_live) * 100.0
                         title = f"🟢 <b>1G MA200 YUKARI KIRILIMI — #{sym}</b>" if new_pos == "ABOVE" else f"🔴 <b>1G MA200 AŞAĞI DÜŞÜŞ — #{sym}</b>"
                         desc = (
-                            "Günlük kapanış 200 Günlük MA ortalamasının üzerine çıktı."
+                            "Anlık fiyat 200 Günlük MA ortalamasının üzerine canlı olarak kırıldı."
                             if new_pos == "ABOVE"
-                            else "Günlük kapanış 200 Günlük MA ortalamasının altına kırıldı."
+                            else "Anlık fiyat 200 Günlük MA ortalamasının altına canlı olarak kırıldı."
                         )
                         cap = (
                             f"{title}\n\n{desc}\n"
-                            f"📊 1G Kapanış: ${fmt_price(last_c)} · MA200: ${fmt_price(ma_last)} ({diff_pct:+.2f}%)\n"
+                            f"📊 Anlık Fiyat: ${fmt_price(cur)} · Canlı MA200: ${fmt_price(ma_live)} ({diff_pct:+.2f}%)\n"
                             f"🔒 Ters kırılım gelene kadar tekrar sinyal gönderilmez."
                         )
-                        png = render_candlestick_png(c1d[-90:], sma_series=sma200)
+                        png = render_candlestick_png(c1d[-90:], sma_series=sma200, live_price=cur)
                         tg_send_photo(png, cap)
-                        record_active_signal(sym, "MA200", new_pos, last_c)
+                        record_active_signal(sym, "MA200", new_pos, cur)
     except Exception:
         pass
 
@@ -554,8 +569,8 @@ def scan_structural_pair(sym, tk):
                 del STATE["pabs_locks"][sym]
                 save_state()
                 pabs_rec = None
-        if not pabs_rec and vol >= 2_000_000:
-            c1h = fetch_klines(sym, "1h", 120)
+        if not pabs_rec and vol >= 1_500_000:
+            c1h = fetch_klines(sym, "1h", 120, live_price=cur)
             if len(c1h) >= 80:
                 bars = c1h[-72:]
                 rsis = compute_rsi_series([b["c"] for b in c1h], 14)
@@ -585,7 +600,7 @@ def scan_structural_pair(sym, tk):
                     base, _ = extract_base_quote(sym)
                     cap = (
                         f"Yeni #{sym} spot sinyali <b>#{seq_no}</b> (PABS)\n"
-                        f"24s Hacim: {fmt_compact_vol(vol)} USDT\n\n"
+                        f"Anlık Fiyat: ${fmt_price(cur)} · 24s Hacim: {fmt_compact_vol(vol)} USDT\n\n"
                         f"Ort: tepeden -{dd_pct:.1f}% geri çekilme, hedef kâr +{avg_profit:.2f}%. Risk: %{risk_pct}\n"
                         f"Alım Bölgesi : {fmt_price(buy_low)} – {fmt_price(buy_high)}\n"
                         f"Altcoin #{base}\n"
@@ -600,6 +615,7 @@ def scan_structural_pair(sym, tk):
                         c1h[-72:],
                         hlines=[(tp1, (16, 185, 129)), (stop_loss, (244, 63, 94))],
                         band=(buy_low, buy_high),
+                        live_price=cur,
                     )
                     tg_send_photo(png, cap)
                     record_active_signal(sym, "PABS", "LONG", cur)
@@ -610,10 +626,10 @@ def scan_structural_pair(sym, tk):
     try:
         if vol >= 2_500_000:
             depth = binance_get(f"/api/v3/depth?symbol={sym}&limit=100", timeout=7)
-            c15m = fetch_klines(sym, "15m", 96)
-            c4h = fetch_klines(sym, "4h", 56)
-            c1d = fetch_klines(sym, "1d", 12)
-            c3d = fetch_klines(sym, "3d", 12)
+            c15m = fetch_klines(sym, "15m", 96, live_price=cur)
+            c4h = fetch_klines(sym, "4h", 56, live_price=cur)
+            c1d = fetch_klines(sym, "1d", 12, live_price=cur)
+            c3d = fetch_klines(sym, "3d", 12, live_price=cur)
             if len(c15m) >= 40 and len(c4h) >= 28 and len(c1d) >= 7 and len(c3d) >= 5:
                 ma1d = sum(b["c"] for b in c1d[-7:]) / 7.0
                 ma3d = sum(b["c"] for b in c3d[-5:]) / 5.0
@@ -655,7 +671,6 @@ def scan_structural_pair(sym, tk):
                         bias = "LONG"
                         wall_p, wall_usd, wall_lbl = best_bid_p, best_bid_usd, "Bid (Alış) Duvarı"
 
-                    # Hem 1D hem de 3D grafik ayni yonu dogrulamalidir
                     if bias and bias == trend_1d and bias == trend_3d:
                         with STATE_LOCK:
                             locked_dir = STATE["flow_locks"].get(sym, {}).get("direction")
@@ -701,21 +716,24 @@ def scan_structural_pair(sym, tk):
                             png = render_candlestick_png(
                                 c4h[-56:],
                                 hlines=[(tp1, (16, 185, 129)), (tp2, (16, 185, 129)), (stop_tight, (244, 63, 94)), (poc_price, (245, 158, 11))],
+                                live_price=cur,
                             )
                             tg_send_photo(png, cap)
                             record_active_signal(sym, "FLOW", bias, cur)
     except Exception:
         pass
 
-    # 4) MOTOR 2: W1 ATL (O anki tum zamanlarin en dusugunun altina inmedikce tekrar gelmez)
+    # 4) MOTOR 2: W1 ATL (O anki tum zamanlarin en dusugunun altina inmedikce tekrar gelmez + W1 Grafik)
     try:
         cached = ATL_WEEKLY_CACHE.get(sym)
+        c1w_recent = None
         if not cached or now - cached[1] > 3600:
-            c1w = fetch_klines(sym, "1w", 1000)
+            c1w = fetch_klines(sym, "1w", 1000, live_price=cur)
             if len(c1w) >= 12:
                 prev_atl = min(b["l"] for b in c1w[:-1])
                 cached = (prev_atl, now)
                 ATL_WEEKLY_CACHE[sym] = cached
+                c1w_recent = c1w[-70:]
         if cached and cached[0] > 0:
             prev_atl = cached[0]
             with STATE_LOCK:
@@ -733,7 +751,12 @@ def scan_structural_pair(sym, tk):
                     f"#{sym} ${fmt_price(cur)} tüm zamanların en düşüğü 👎📛😭\n"
                     f"24s {chg24:+.2f}% Hacim {fmt_compact_vol(vol)}"
                 )
-                tg_send_message(msg)
+                try:
+                    bars_w = c1w_recent or fetch_klines(sym, "1w", 70, live_price=cur)
+                    png = render_candlestick_png(bars_w, hlines=[(floor_atl, (244, 63, 94))], live_price=cur)
+                    tg_send_photo(png, msg)
+                except Exception:
+                    tg_send_message(msg)
                 record_active_signal(sym, "ATL", "ATL", cur)
     except Exception:
         pass
@@ -826,11 +849,12 @@ def main():
     load_state()
     srv = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"Spot Akis Botu baslatildi (Port {PORT}, Chat {CHAT_ID})")
+    print(f"Spot Akis Botu v2 baslatildi (Port {PORT}, Chat {CHAT_ID})")
 
     poll_binance_news()
     last_news = time.time()
     cursor = 0
+    pool = ThreadPoolExecutor(max_workers=6)
 
     while True:
         try:
@@ -853,17 +877,17 @@ def main():
                     continue
                 LATEST_TICKERS[sym] = {"price": price, "chg24h": chg24, "vol": vol, "low": low24, "high": high24}
                 check_pump(sym, base, quote, price, vol, now)
-                if quote == "USDT" and vol >= 1_500_000:
+                if quote == "USDT" and vol >= 1_000_000:
                     usdt_liquid.append((sym, LATEST_TICKERS[sym]))
 
             update_signal_peaks()
             usdt_liquid.sort(key=lambda x: x[1]["vol"], reverse=True)
-            top_liquid = usdt_liquid[:50]
-            if top_liquid:
-                for _ in range(4):
-                    sym, tk = top_liquid[cursor % len(top_liquid)]
+            if usdt_liquid:
+                batch = []
+                for _ in range(min(10, len(usdt_liquid))):
+                    batch.append(usdt_liquid[cursor % len(usdt_liquid)])
                     cursor += 1
-                    scan_structural_pair(sym, tk)
+                list(pool.map(lambda pair: scan_structural_pair(pair[0], pair[1]), batch))
 
             if now - last_news > 60:
                 poll_binance_news()
@@ -871,7 +895,7 @@ def main():
                 last_news = now
         except Exception as e:
             print("Dongu hatasi:", e)
-        time.sleep(3)
+        time.sleep(2)
 
 
 if __name__ == "__main__":
