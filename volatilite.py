@@ -39,6 +39,8 @@ BINANCE_MIRRORS = [
     "https://api3.binance.com",
     "https://data-api.binance.vision",
 ]
+preferred_mirror_idx = 0
+mirror_lock = threading.Lock()
 
 TR_TZ = timezone(timedelta(hours=3))
 
@@ -407,13 +409,13 @@ def load_state():
 
 
 # ==============================================================================
-# HTTP / BINANCE / COKLU BORSA & TELEGRAM ILETISIM
+# HTTP / BINANCE STICKY MIRROR & TELEGRAM ILETISIM
 # ==============================================================================
 def http_get_json(url: str, timeout=8.0):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.1)",
             "Accept": "application/json",
         },
     )
@@ -422,10 +424,21 @@ def http_get_json(url: str, timeout=8.0):
 
 
 def fetch_binance_json(path_and_query: str, timeout=8.0):
+    global preferred_mirror_idx
     last_err = None
-    for m in BINANCE_MIRRORS:
+    n = len(BINANCE_MIRRORS)
+    with mirror_lock:
+        start_idx = preferred_mirror_idx
+    for offset in range(n):
+        idx = (start_idx + offset) % n
+        m = BINANCE_MIRRORS[idx]
         try:
-            return http_get_json(m + path_and_query, timeout=timeout)
+            data = http_get_json(m + path_and_query, timeout=timeout)
+            with mirror_lock:
+                if preferred_mirror_idx != idx:
+                    preferred_mirror_idx = idx
+                    print(f"[Binance Mirror] Aktif ayna secildi: {m}", flush=True)
+            return data
         except Exception as e:
             last_err = e
     raise last_err or RuntimeError("Binance mirrors unreachable")
@@ -524,8 +537,8 @@ def tg_send_text(text: str, chat_id: str = None):
         )
         with urllib.request.urlopen(req, timeout=10) as _:
             pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Telegram Hata] sendMessage: {e}", flush=True)
 
 
 def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None):
@@ -557,7 +570,8 @@ def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None):
         )
         with urllib.request.urlopen(req, timeout=15) as _:
             pass
-    except Exception:
+    except Exception as e:
+        print(f"[Telegram Hata] sendPhoto fallback: {e}", flush=True)
         tg_send_text(caption, chat_id=target)
 
 
@@ -715,11 +729,11 @@ def scan_structural_pair(tk):
             with state_lock:
                 seeded = False
                 if year_max > year_min and sym not in locks["year"]:
-                    init_y = "MAX" if cur >= year_max else ("MIN" if cur <= year_min else "NEUTRAL")
+                    init_y = "MAX" if cur > year_max * 1.04 else ("MIN" if cur < year_min * 0.96 else "NEUTRAL")
                     locks["year"][sym] = {"symbol": sym, "direction": init_y, "level": cur, "yearMax": year_max, "yearMin": year_min, "updatedAt": now_ms}
                     seeded = True
                 if month_max > month_min and sym not in locks["month"]:
-                    init_m = "MAX" if cur >= month_max else ("MIN" if cur <= month_min else "NEUTRAL")
+                    init_m = "MAX" if cur > month_max * 1.04 else ("MIN" if cur < month_min * 0.96 else "NEUTRAL")
                     locks["month"][sym] = {"symbol": sym, "direction": init_m, "level": cur, "monthMax": month_max, "monthMin": month_min, "updatedAt": now_ms}
                     seeded = True
                 prev_y = locks["year"].get(sym)
@@ -729,18 +743,18 @@ def scan_structural_pair(tk):
 
             candidate = None
             if year_max > year_min:
-                if year_max * 1.001 <= cur <= year_max * 1.028:
+                if year_max * 1.001 <= cur <= year_max * 1.04:
                     if not prev_y or prev_y["direction"] != "MAX" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur > prev_y["level"] * 1.02):
                         candidate = ("YEAR", "MAX", year_max, year_max, year_min)
-                elif year_min * 0.972 <= cur <= year_min * 0.999:
+                elif year_min * 0.96 <= cur <= year_min * 0.999:
                     if not prev_y or prev_y["direction"] != "MIN" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur < prev_y["level"] * 0.98):
                         candidate = ("YEAR", "MIN", year_min, year_max, year_min)
 
             if not candidate and month_max > month_min:
-                if month_max * 1.001 <= cur <= month_max * 1.028:
+                if month_max * 1.001 <= cur <= month_max * 1.04:
                     if not prev_m or prev_m["direction"] != "MAX" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur > prev_m["level"] * 1.02):
                         candidate = ("MONTH", "MAX", month_max, month_max, month_min)
-                elif month_min * 0.972 <= cur <= month_min * 0.999:
+                elif month_min * 0.96 <= cur <= month_min * 0.999:
                     if not prev_m or prev_m["direction"] != "MIN" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur < prev_m["level"] * 0.98):
                         candidate = ("MONTH", "MIN", month_min, month_max, month_min)
 
@@ -756,7 +770,10 @@ def scan_structural_pair(tk):
 
                     base20 = c1h[-22:-2]
                     avg1h = sum(b["quote_vol"] for b in base20) / max(len(base20), 1)
-                    recent1h = max(c1h[-1]["quote_vol"], c1h[-2]["quote_vol"])
+                    last_1h = c1h[-1]
+                    elapsed_frac = max(0.15, min(1.0, (time.time() - last_1h["open_time"]) / 3600.0))
+                    norm_cur_1h = last_1h["quote_vol"] / elapsed_frac
+                    recent1h = max(norm_cur_1h, c1h[-2]["quote_vol"])
                     rvol = (recent1h / avg1h) if avg1h > 0 else 1.0
 
                     tot_q = sum(b["quote_vol"] for b in c1h[-2:])
@@ -766,17 +783,17 @@ def scan_structural_pair(tk):
                     is_max = c_dir == "MAX"
                     chg24 = tk["change24h"]
                     momentum_ok = (
-                        1.0 <= chg24 <= 18.0
-                        and 50.0 <= rsi4h <= 74.0
+                        1.0 <= chg24 <= 22.0
+                        and 48.0 <= rsi4h <= 82.0
                         and (macd4h["macd"] > macd4h["signal"] or macd4h["hist"] > macd4h["prev_hist"])
-                        and rvol >= 1.45
-                        and taker_buy_pct >= 52.0
+                        and rvol >= 1.15
+                        and taker_buy_pct >= 51.0
                     ) if is_max else (
-                        -18.0 <= chg24 <= -1.0
-                        and 26.0 <= rsi4h <= 50.0
+                        -22.0 <= chg24 <= -1.0
+                        and 18.0 <= rsi4h <= 52.0
                         and (macd4h["macd"] < macd4h["signal"] or macd4h["hist"] < macd4h["prev_hist"])
-                        and rvol >= 1.45
-                        and taker_buy_pct <= 48.0
+                        and rvol >= 1.15
+                        and taker_buy_pct <= 49.0
                     )
 
                     if momentum_ok:
@@ -942,10 +959,10 @@ def scan_structural_pair(tk):
         prev_exh = locks["exhaust"].get(sym)
         exh_cooldown_ms = 24 * 3600 * 1000
         if (
-            tk["volume24h"] >= 5_000_000
-            and tk["change24h"] >= 7.5
+            tk["volume24h"] >= 2_500_000
+            and tk["change24h"] >= 4.5
             and tk["high24h"] > cur
-            and (tk["high24h"] * 0.955 <= cur <= tk["high24h"] * 0.996)
+            and (tk["high24h"] * 0.945 <= cur <= tk["high24h"] * 0.997)
             and (not prev_exh or (now_ms - prev_exh["lockedAt"]) >= exh_cooldown_ms)
         ):
             c15m = fetch_spot_klines(sym, "15m", 40)
@@ -955,7 +972,7 @@ def scan_structural_pair(tk):
                 swing_high = max(b["high"] for b in recent16)
                 rally_pct = ((swing_high - swing_low) / swing_low * 100.0) if swing_low > 0 else 0.0
 
-                if rally_pct >= 7.5 and (swing_high * 0.960 <= cur <= swing_high * 0.996):
+                if rally_pct >= 7.0 and (swing_high * 0.945 <= cur <= swing_high * 0.997):
                     closes15 = [b["close"] for b in c15m]
                     closes15[-1] = cur
                     rsi_ser = compute_rsi_series(closes15, 14)
@@ -969,8 +986,8 @@ def scan_structural_pair(tk):
                         return (b["high"] - max(b["open"], b["close"])) / max(b["high"] - b["low"], 1e-9)
 
                     has_rejection = (
-                        _wick_ratio(prev_bar) >= 0.35
-                        or _wick_ratio(last_bar) >= 0.35
+                        _wick_ratio(prev_bar) >= 0.32
+                        or _wick_ratio(last_bar) >= 0.32
                         or prev_bar["close"] < prev_bar["open"]
                     )
                     last2 = c15m[-2:]
@@ -978,7 +995,7 @@ def scan_structural_pair(tk):
                     tot_tb = sum(b["taker_buy_quote"] for b in last2)
                     taker_buy_pct = (tot_tb / tot_q * 100.0) if tot_q > 0 else 50.0
 
-                    if rsi_peak4 >= 75.0 and rsi_cur <= (rsi_peak4 - 1.5) and has_rejection and taker_buy_pct <= 47.0:
+                    if rsi_peak4 >= 72.0 and rsi_cur <= (rsi_peak4 - 1.2) and has_rejection and taker_buy_pct <= 49.0:
                         rng = swing_high - swing_low
                         tp1 = min(cur * 0.985, swing_high - rng * 0.382)
                         tp2 = min(tp1 * 0.985, swing_high - rng * 0.50)
@@ -1140,8 +1157,8 @@ def ticker_pump_loop():
                     evaluate_pump_for_ticker(tk, now_ms)
                 update_signal_peaks()
                 check_daily_reports()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Ticker Loop Hata] {e}", flush=True)
         time.sleep(3)
 
 
@@ -1183,6 +1200,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         body = json.dumps(
             {
                 "ok": True,
+                "telegram": bool(BOT_TOKEN),
+                "mirror": BINANCE_MIRRORS[preferred_mirror_idx],
                 "pairs": len(ticker_map),
                 "locks": {k: len(v) for k, v in locks.items()},
             }
@@ -1194,12 +1213,14 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    if not BOT_TOKEN:
+        print("[UYARI] BOT_TOKEN tanimli degil! Telegram mesajlari gonderilemez.", flush=True)
     load_state()
     threading.Thread(target=ticker_pump_loop, daemon=True).start()
     threading.Thread(target=structure_loop, daemon=True).start()
     threading.Thread(target=news_loop, daemon=True).start()
     srv = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"[SpotFlowBot] Port {PORT} uzerinde aktif. Takip edilen kilit gruplari: {list(locks.keys())}", flush=True)
+    print(f"[SpotFlowBot] Port {PORT} aktif | Telegram: {bool(BOT_TOKEN)} | CHAT_ID: {CHAT_ID}", flush=True)
     srv.serve_forever()
 
 
