@@ -1146,7 +1146,7 @@ def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None, tag_label
     target = chat_id or CHAT_ID
     boundary = f"----SpotBotBoundary{int(time.time() * 1000)}"
     parts = []
-    for name, val in [("chat_id", target), ("caption", caption[:1000]), ("parse_mode", "HTML")]:
+    for name, val in [("chat_id", target), ("caption", caption[:1024]), ("parse_mode", "HTML")]:
         parts.append(
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n".encode("utf-8")
         )
@@ -1382,11 +1382,11 @@ def scan_structural_pair(tk):
                 with state_lock:
                     seeded = False
                     if year_max > year_min and sym not in locks["year"]:
-                        init_y = "MAX" if cur > year_max * 1.04 else ("MIN" if cur < year_min * 0.96 else "NEUTRAL")
+                        init_y = "MAX" if cur > year_max * 1.06 else ("MIN" if cur < year_min * 0.94 else "NEUTRAL")
                         locks["year"][sym] = {"symbol": sym, "direction": init_y, "level": cur, "yearMax": year_max, "yearMin": year_min, "updatedAt": now_ms}
                         seeded = True
                     if month_max > month_min and sym not in locks["month"]:
-                        init_m = "MAX" if cur > month_max * 1.04 else ("MIN" if cur < month_min * 0.96 else "NEUTRAL")
+                        init_m = "MAX" if cur > month_max * 1.06 else ("MIN" if cur < month_min * 0.94 else "NEUTRAL")
                         locks["month"][sym] = {"symbol": sym, "direction": init_m, "level": cur, "monthMax": month_max, "monthMin": month_min, "updatedAt": now_ms}
                         seeded = True
                     prev_y = locks["year"].get(sym)
@@ -1396,19 +1396,19 @@ def scan_structural_pair(tk):
 
                 candidate = None
                 if year_max > year_min:
-                    if year_max * 1.001 <= cur <= year_max * 1.04:
-                        if not prev_y or prev_y["direction"] != "MAX" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur > prev_y["level"] * 1.02):
+                    if year_max * 1.001 <= cur <= year_max * 1.06:
+                        if not prev_y or prev_y["direction"] != "MAX" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur > prev_y["level"] * 1.005):
                             candidate = ("YEAR", "MAX", year_max, year_max, year_min)
-                    elif year_min * 0.96 <= cur <= year_min * 0.999:
-                        if not prev_y or prev_y["direction"] != "MIN" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur < prev_y["level"] * 0.98):
+                    elif year_min * 0.94 <= cur <= year_min * 0.999:
+                        if not prev_y or prev_y["direction"] != "MIN" or ((now_ms - prev_y["updatedAt"] >= cooldown_ms) and cur < prev_y["level"] * 0.995):
                             candidate = ("YEAR", "MIN", year_min, year_max, year_min)
 
                 if not candidate and month_max > month_min:
-                    if month_max * 1.001 <= cur <= month_max * 1.04:
-                        if not prev_m or prev_m["direction"] != "MAX" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur > prev_m["level"] * 1.02):
+                    if month_max * 1.001 <= cur <= month_max * 1.06:
+                        if not prev_m or prev_m["direction"] != "MAX" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur > prev_m["level"] * 1.005):
                             candidate = ("MONTH", "MAX", month_max, month_max, month_min)
-                    elif month_min * 0.96 <= cur <= month_min * 0.999:
-                        if not prev_m or prev_m["direction"] != "MIN" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur < prev_m["level"] * 0.98):
+                    elif month_min * 0.94 <= cur <= month_min * 0.999:
+                        if not prev_m or prev_m["direction"] != "MIN" or ((now_ms - prev_m["updatedAt"] >= cooldown_ms) and cur < prev_m["level"] * 0.995):
                             candidate = ("MONTH", "MIN", month_min, month_max, month_min)
 
                 if candidate:
@@ -1466,12 +1466,16 @@ def scan_structural_pair(tk):
                             tag = ("year max" if is_max else "year min") if is_year else ("month max" if is_max else "month min")
                             icon = "🟢" if is_max else "🔴"
                             taker_txt = f"Taker Alıcı: %{round(taker_buy_pct)}" if is_max else f"Taker Satıcı: %{round(100 - taker_buy_pct)}"
+                            next_trig = cur * 1.005 if is_max else cur * 0.995
+                            opp_txt = ("365G dibe" if is_max else "365G zirveye") if is_year else ("30G dibe" if is_max else "30G zirveye")
+                            dir_cond = "üstüne çıkmadıkça" if is_max else "altına düşmedikçe"
                             caption = (
-                                f"{icon} <b>#{sym}, {'1 yıllık' if is_year else '1 aylık'} ({tag}) değere ulaştı: ${fmt_price(cur)}</b>\n"
+                                f"{icon} <b>#{sym}, {'1 yıllık' if is_year else '1 aylık'} ({tag}) değere ulaştı: ${fmt_price(cur)}</b>\n\n"
+                                f"📌 Son {365 if is_year else 30} günün {'en yüksek' if is_max else 'en düşük'} seviyesi (<code>${fmt_price(ref_lvl)}</code>) hacimli kırıldı.\n"
                                 f"⚡ RVOL: <b>{rvol:.1f}x</b> · 4S RSI: {rsi4h:.1f} · 4S MACD {'Pozitif' if is_max else 'Negatif'} · {taker_txt}\n"
-                                f"💰 24s: {chg24:+.2f}% · Hacim: ${tk['volume24h'] / 1_000_000:.1f}M\n"
-                                + (f"📊 {fut_line}\n" if fut_line else "")
-                                + "🔒 48 saatlik kilit aktif (aynı yönde artarda spam yapılmaz)."
+                                f"💧 24s Değişim: {chg24:+.2f}% · Hacim: {tk['volume24h'] / 1_000_000:.1f}M USDT\n"
+                                + (f"🐋 Vadeli Bağlam: {fut_line}\n" if fut_line else "")
+                                + f"🔒 Kilit aktif: ${fmt_price(next_trig)} {dir_cond} veya {opp_txt} dönmedikçe tekrar gelmez (48s kilit)"
                             )
                             lbl_hi = "365MAX" if is_year else "30MAX"
                             lbl_lo = "365MIN" if is_year else "30MIN"
@@ -1549,13 +1553,42 @@ def scan_structural_pair(tk):
                             def _pstr(t):
                                 return f"{((t - cur) / cur) * 100:+.1f}%"
 
+                            base_coin = tk["base"]
+                            wall_usd_str = f"${wall[1] / 1_000_000:.1f}M" if wall[1] >= 1_000_000 else f"${round(wall[1] / 1000)}k"
+                            opp_usd = best_bid[1] if bias == "SHORT" else best_ask[1]
+                            wall_intro = (
+                                f"{base_coin} iki seviye arasında sıkışmış durumda ancak duvarlardan biri gerçekten tutuyor. {fmt_price(wall[0])} seviyesindeki {wall[2]} — tek bir kademede yoğunlaşmış {wall_usd_str} emir bulunuyor."
+                                if opp_usd >= 60_000
+                                else f"{base_coin} kritik likidite kademesine dayanmış durumda. {fmt_price(wall[0])} seviyesindeki {wall[2]} — tek bir kademede yoğunlaşmış {wall_usd_str} emir bulunuyor."
+                            )
+                            hold_sentence = (
+                                f"Şu an fiyatın yukarı sıçramasını tutuyor. Günlük hacim merkezi (POC) {fmt_price(poc_price)} bölgesinde konumlanıyor."
+                                if bias == "SHORT"
+                                else f"Şu an fiyatın aşağı sarkmasını tutuyor. Günlük hacim merkezi (POC) {fmt_price(poc_price)} bölgesinde konumlanıyor."
+                            )
+                            if bias == "SHORT":
+                                poc_rel = (
+                                    "Fiyat zaten bu seviyenin altında, spot dengesizlik zayıf (Spot akışı yönü destekliyor)."
+                                    if cur < poc_price
+                                    else "Fiyat POC direncinin hemen testinde, spot dengesizlik zayıf (Spot akışı yönü destekliyor)."
+                                )
+                            else:
+                                poc_rel = (
+                                    "Fiyat zaten bu seviyenin üzerinde, spot alıcı dengesizliği güçlü (Spot akışı yönü destekliyor)."
+                                    if cur > poc_price
+                                    else "Fiyat POC desteğinin hemen üzerinde, spot alıcı dengesizliği güçlü (Spot akışı yönü destekliyor)."
+                                )
+
                             caption = (
-                                f"🔥 <b>#{sym} ({bias}) — ${round(wall[1] / 1000)}k {wall[2]}</b>\n"
-                                f"🎯 Hedefler: <code>{fmt_price(tp1)}</code> ({_pstr(tp1)}) → <code>{fmt_price(tp2)}</code> ({_pstr(tp2)}) → <code>{fmt_price(tp3)}</code> ({_pstr(tp3)})\n"
-                                f"🛑 İptal: <code>{fmt_price(stop_tight)}</code> ({_pstr(stop_tight)})\n"
-                                f"🧱 Duvar: {fmt_price(wall[0])} · 24s POC: {fmt_price(poc_price)}\n"
-                                f"📐 1D + 3D Trend Onayı: <b>{bias}</b> · Senkron: {', '.join(exchanges)}\n"
-                                f"🔑 Anahtar Tetik: {fmt_price(trigger)} {'altında' if bias == 'SHORT' else 'üstünde'} kalıcılık"
+                                f"<b>#{sym} ({bias})</b>\n\n"
+                                f"Fiyat: <code>{fmt_price(cur)}</code>\n"
+                                f"Hedefler: <code>{fmt_price(tp1)}</code> ({_pstr(tp1)}) → <code>{fmt_price(tp2)}</code> ({_pstr(tp2)}) → <code>{fmt_price(tp3)}</code> ({_pstr(tp3)})\n"
+                                f"İptal: <code>{fmt_price(stop_tight)}</code> {'üstünde' if bias == 'SHORT' else 'altında'} ({_pstr(stop_tight)})\n\n"
+                                f"{wall_intro}\n\n"
+                                f"{hold_sentence}\n\n"
+                                f"{poc_rel} Çoklu borsa akışı senkronize ({', '.join(exchanges)}), ayrışma yok. Günlük (1D) ve 3 Günlük (3D) grafik aynı yönü gösteriyor — bu bir karşı-trend değil, trend yönünde akış.\n\n"
+                                f"Anahtar tetik: <code>{fmt_price(trigger)}</code> {'altında' if bias == 'SHORT' else 'üstünde'} kapanış/kalıcılık.\n"
+                                f"🔒 Yön kilidi aktif: Ters yöne dönmeden aynı coinden tekrar sinyal gelmez."
                             )
                             png = render_candlestick_png(
                                 sym, "4S", c4h,
