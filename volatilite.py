@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Spot Akis Terminali - Bagimsiz Render Telegram Botu (Sifir Harici Kutuphane)
-WebSocket !miniTicker@arr + Akilli Gunluk Onbellek + HTTP 418/429 Devre Kesici
+WebSocket !miniTicker@arr + ws-api.binance.com Yedegi + Akilli Gunluk Onbellek
 """
 
 import os
@@ -44,10 +44,12 @@ WS_HOSTS = [
 preferred_mirror_idx = 0
 mirror_lock = threading.Lock()
 rest_ban_until = 0.0
+ban_notified_active = False
 ban_lock = threading.Lock()
 
 TR_TZ = timezone(timedelta(hours=3))
 
+ticker_lock = threading.Lock()
 state_lock = threading.Lock()
 ticker_map = {}
 price_window_history = {}
@@ -58,6 +60,7 @@ flow_scan_cache = {}
 news_seen_ids = set()
 news_initial_seeded = False
 report_sent_days = {"victory": "", "top24": ""}
+last_peak_save_ts = 0.0
 
 diag_status = {
     "ws_connected": False,
@@ -68,6 +71,7 @@ diag_status = {
     "last_tg_error": "",
     "last_binance_error": "",
     "telegram_bot_ok": False,
+    "structural_scans": 0,
 }
 
 locks = {
@@ -244,7 +248,7 @@ def render_candlestick_png(symbol, interval_label, candles, levels=None, ma_seri
 
     n = len(bars)
     step = cw / max(n, 1)
-    body_w = max(2, int(step * 0.62))
+    body_w = min(22, max(2, int(step * 0.62)))
     for i, b in enumerate(bars):
         cx = int(pad_l + (i + 0.5) * step)
         col = green_col if b["close"] >= b["open"] else red_col
@@ -432,7 +436,7 @@ def http_get_json(url: str, timeout=9.0):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.4)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.5)",
             "Accept": "application/json",
         },
     )
@@ -441,7 +445,7 @@ def http_get_json(url: str, timeout=9.0):
 
 
 def trigger_rest_ban(code: int, retry_after_header: str):
-    global rest_ban_until
+    global rest_ban_until, ban_notified_active
     try:
         sec = int(float(retry_after_header)) if retry_after_header else 0
     except Exception:
@@ -449,17 +453,34 @@ def trigger_rest_ban(code: int, retry_after_header: str):
     if sec <= 0:
         sec = 135 if code == 418 else 25
     target = time.time() + min(sec + 5, 1800)
+    notify = False
     with ban_lock:
         if target > rest_ban_until:
             rest_ban_until = target
-            print(f"[Binance Devre Kesici] HTTP {code} alindi -> {round(target - time.time())} sn REST durduruldu.", flush=True)
+        if not ban_notified_active:
+            ban_notified_active = True
+            notify = True
+    print(f"[Binance Devre Kesici] HTTP {code} -> {round(target - time.time())} sn REST durduruldu.", flush=True)
+    if notify and BOT_TOKEN:
+        tg_send_text(
+            f"⚠️ <b>Binance Geçici Limit ({code})</b>\n"
+            f"Render paylaşımlı IP kotası nedeniyle yapısal REST taraması {round(target - time.time())} sn beklemeye alındı.\n"
+            f"⚡ Canlı WebSocket (0–7 dk Spot Pump) çalışmaya devam ediyor."
+        )
 
 
 def check_rest_ban():
+    global ban_notified_active
+    notify_clear = False
     with ban_lock:
         rem = rest_ban_until - time.time()
-    if rem > 0:
-        raise RuntimeError(f"Binance cooldown ({int(rem)}s kaldi)")
+        if rem > 0:
+            raise RuntimeError(f"Binance cooldown ({int(rem)}s kaldi)")
+        if ban_notified_active:
+            ban_notified_active = False
+            notify_clear = True
+    if notify_clear and BOT_TOKEN:
+        tg_send_text("🟢 <b>Binance REST bağlantısı normale döndü</b> — MA200, MONTH, YEAR, FLOW, ATL ve EXHAUST taramaları tekrar aktif.")
 
 
 def fetch_binance_json(path_and_query: str, timeout=9.0):
@@ -516,51 +537,208 @@ def fetch_spot_klines(symbol: str, interval: str, limit=240):
     return out
 
 
+def fetch_ws_api_klines(symbol: str, interval: str, limit=35, timeout=6.0):
+    ctx = ssl.create_default_context()
+    sock = None
+    try:
+        raw_sock = socket.create_connection(("ws-api.binance.com", 443), timeout=timeout)
+        sock = ctx.wrap_socket(raw_sock, server_hostname="ws-api.binance.com")
+        sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            "GET /ws-api/v3 HTTP/1.1\r\n"
+            "Host: ws-api.binance.com:443\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(req.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return []
+            buf += chunk
+        if b"101" not in buf.split(b"\r\n", 1)[0]:
+            return []
+        rest = buf.split(b"\r\n\r\n", 1)[1]
+        payload = json.dumps({
+            "id": "k1",
+            "method": "klines",
+            "params": {"symbol": symbol, "interval": interval, "limit": limit},
+        }).encode("utf-8")
+        _ws_send_frame(sock, 0x1, payload)
+
+        def _recv_exact(n_bytes):
+            nonlocal rest
+            while len(rest) < n_bytes:
+                ch = sock.recv(65536)
+                if not ch:
+                    raise RuntimeError("ws-api EOF")
+                rest += ch
+
+        frag = bytearray()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _recv_exact(2)
+            b1, b2 = rest[0], rest[1]
+            fin = (b1 & 0x80) != 0
+            opcode = b1 & 0x0F
+            masked = (b2 & 0x80) != 0
+            ln = b2 & 0x7F
+            off = 2
+            if ln == 126:
+                _recv_exact(4)
+                ln = struct.unpack("!H", rest[2:4])[0]
+                off = 4
+            elif ln == 127:
+                _recv_exact(10)
+                ln = struct.unpack("!Q", rest[2:10])[0]
+                off = 10
+            mask_b = b""
+            if masked:
+                _recv_exact(off + 4)
+                mask_b = rest[off : off + 4]
+                off += 4
+            _recv_exact(off + ln)
+            pl = rest[off : off + ln]
+            rest = rest[off + ln :]
+            if masked and mask_b:
+                pl = bytes(pl[i] ^ mask_b[i % 4] for i in range(ln))
+            if opcode == 0x8:
+                break
+            if opcode == 0x9:
+                _ws_send_frame(sock, 0xA, pl)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2, 0x0):
+                frag.extend(pl)
+                if fin:
+                    msg = json.loads(bytes(frag).decode("utf-8"))
+                    if msg.get("status") != 200 or not isinstance(msg.get("result"), list):
+                        return []
+                    return [
+                        {
+                            "open_time": int(float(k[0]) / 1000),
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5]),
+                            "quote_vol": float(k[7]),
+                            "taker_buy_quote": float(k[10]),
+                        }
+                        for k in msg["result"]
+                    ]
+        return []
+    except Exception:
+        return []
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def build_ohlc_from_ticks(ticks, live_cur: float, bucket_sec=15):
+    pts = list(ticks or [])
+    now_ms = int(time.time() * 1000)
+    if live_cur > 0:
+        pts.append((now_ms, live_cur))
+    if len(pts) < 2:
+        return []
+    buckets = {}
+    order = []
+    for ts_ms, price in pts:
+        if price <= 0:
+            continue
+        bkey = int(ts_ms // (bucket_sec * 1000))
+        if bkey not in buckets:
+            buckets[bkey] = {
+                "open_time": bkey * bucket_sec,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 0.0,
+                "quote_vol": 0.0,
+                "taker_buy_quote": 0.0,
+            }
+            order.append(bkey)
+        else:
+            b = buckets[bkey]
+            if price > b["high"]:
+                b["high"] = price
+            if price < b["low"]:
+                b["low"] = price
+            b["close"] = price
+    bars = [buckets[k] for k in sorted(order)]
+    if len(bars) == 1 and live_cur > 0:
+        b0 = bars[0]
+        bars = [
+            {**b0, "close": b0["open"]},
+            {**b0, "open": b0["open"], "close": live_cur},
+        ]
+    return bars[-60:]
+
+
 def fetch_multi_exchange_sync(symbol: str, binance_price: float):
     base = symbol[:-4] if symbol.endswith("USDT") else symbol
     exchanges = ["Binance"]
+    lock = threading.Lock()
     checks = [
         ("Bybit", f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}", lambda d: float(d["result"]["list"][0]["lastPrice"])),
         ("OKX", f"https://www.okx.com/api/v5/market/ticker?instId={base}-USDT", lambda d: float(d["data"][0]["last"])),
         ("Gate", f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={base}_USDT", lambda d: float(d[0]["last"])),
     ]
-    for name, url, parser in checks:
+
+    def _chk(name, url, parser):
         try:
-            p = parser(http_get_json(url, timeout=3.5))
+            p = parser(http_get_json(url, timeout=2.0))
             if p > 0 and abs(p - binance_price) / binance_price < 0.02:
-                exchanges.append(name)
+                with lock:
+                    exchanges.append(name)
         except Exception:
             pass
+
+    threads = [threading.Thread(target=_chk, args=c, daemon=True) for c in checks]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2.2)
     return exchanges
 
 
 def fetch_futures_context_line(symbol: str):
     if not symbol.endswith("USDT"):
         return None
-    parts = []
-    try:
-        oi_data = http_get_json(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={urllib.parse.quote(symbol)}", timeout=2.5)
-        oi_val = float(oi_data.get("openInterest") or 0)
-        if oi_val > 0:
-            parts.append(f"OI: {round(oi_val):,}")
-    except Exception:
-        pass
-    try:
-        top_data = http_get_json(f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={urllib.parse.quote(symbol)}&period=1h&limit=1", timeout=2.5)
-        if isinstance(top_data, list) and top_data:
-            l_pct = round(float(top_data[0].get("longAccount") or 0) * 100)
-            if l_pct > 0:
-                parts.append(f"Balina: %{l_pct}L/%{100 - l_pct}S")
-    except Exception:
-        pass
-    try:
-        gls_data = http_get_json(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={urllib.parse.quote(symbol)}&period=1h&limit=1", timeout=2.5)
-        if isinstance(gls_data, list) and gls_data:
-            l_pct = round(float(gls_data[0].get("longAccount") or 0) * 100)
-            if l_pct > 0:
-                parts.append(f"Kalabalık: %{l_pct}L/%{100 - l_pct}S")
-    except Exception:
-        pass
+    res = {}
+    lock = threading.Lock()
+
+    def _q(key, url, fn):
+        try:
+            val = fn(http_get_json(url, timeout=1.8))
+            if val:
+                with lock:
+                    res[key] = val
+        except Exception:
+            pass
+
+    qs = urllib.parse.quote(symbol)
+    jobs = [
+        ("oi", f"https://fapi.binance.com/fapi/v1/openInterest?symbol={qs}", lambda d: f"OI: {round(float(d.get('openInterest') or 0)):,}" if float(d.get("openInterest") or 0) > 0 else ""),
+        ("top", f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={qs}&period=1h&limit=1", lambda d: (lambda lp: f"Balina: %{lp}L/%{100-lp}S" if lp > 0 else "")(round(float(d[0].get("longAccount") or 0) * 100)) if isinstance(d, list) and d else ""),
+        ("gls", f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={qs}&period=1h&limit=1", lambda d: (lambda lp: f"Kalabalık: %{lp}L/%{100-lp}S" if lp > 0 else "")(round(float(d[0].get("longAccount") or 0) * 100)) if isinstance(d, list) and d else ""),
+    ]
+    threads = [threading.Thread(target=_q, args=j, daemon=True) for j in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2.0)
+    parts = [res[k] for k in ("oi", "top", "gls") if res.get(k)]
     return " · ".join(parts) if parts else None
 
 
@@ -690,12 +868,16 @@ def _verify_and_emit_pump(tk, min_pt):
     th_pct = 4.5 if quote == "USDT" else 4.0
     c1m = []
     try:
-        c1m = fetch_spot_klines(sym, "1m", 10)
+        c1m = fetch_spot_klines(sym, "1m", 35)
     except Exception:
         c1m = []
+    if not c1m:
+        c1m = fetch_ws_api_klines(sym, "1m", 35)
 
-    live_cur = ticker_map.get(sym, tk)["price"]
-    live_vol = ticker_map.get(sym, tk)["volume24h"]
+    with ticker_lock:
+        latest_tk = ticker_map.get(sym, tk)
+    live_cur = latest_tk["price"]
+    live_vol = latest_tk["volume24h"]
     bar_min = min((b["low"] for b in c1m[-7:]), default=min_pt[1]) if c1m else min_pt[1]
     verified_min = min(min_pt[1], bar_min if bar_min > 0 else min_pt[1])
     verified_pct = ((live_cur - verified_min) / verified_min) * 100.0 if verified_min > 0 else 0.0
@@ -706,9 +888,22 @@ def _verify_and_emit_pump(tk, min_pt):
         return
 
     with state_lock:
+        ticks_snap = list(price_window_history.get(sym, []))
         price_window_history.pop(sym, None)
         now_ms = int(time.time() * 1000)
         signals_today.append({"engine": "PUMP", "symbol": sym, "dir": "LONG", "entry": live_cur, "peak_pct": 0.0, "ts": now_ms})
+
+    chart_bars = c1m
+    chart_label = "1DK CANLI"
+    if chart_bars:
+        last_b = dict(chart_bars[-1])
+        last_b["close"] = live_cur
+        last_b["high"] = max(last_b["high"], live_cur)
+        last_b["low"] = min(last_b["low"], live_cur)
+        chart_bars = list(chart_bars[:-1]) + [last_b]
+    else:
+        chart_bars = build_ohlc_from_ticks(ticks_snap, live_cur, bucket_sec=15)
+        chart_label = "15SN CANLI"
 
     mins = max(1, round((time.time() * 1000 - min_pt[0]) / 60000))
     vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
@@ -720,11 +915,11 @@ def _verify_and_emit_pump(tk, min_pt):
     )
     png = (
         render_candlestick_png(
-            sym, "1DK", c1m,
+            sym, chart_label, chart_bars,
             levels=[("BAS", verified_min, (250, 204, 21)), ("ANLIK", live_cur, (34, 197, 94))],
             header_note=f"+{verified_pct:.2f}%",
         )
-        if c1m
+        if chart_bars
         else b""
     )
     tg_send_photo(caption, png, tag_label=f"PUMP {sym}")
@@ -738,20 +933,21 @@ def evaluate_pump_for_ticker(tk, now_ms: int):
     if tk["price"] <= 0 or tk["volume24h"] < min_vol:
         return
     sym = tk["symbol"]
-    hist = price_window_history.setdefault(sym, [])
-    if hist and abs(hist[-1][1] - tk["price"]) < 1e-12 and (now_ms - hist[-1][0]) < 1500:
-        return
-    hist.append((now_ms, tk["price"]))
-    cutoff = now_ms - 420_000
-    while hist and hist[0][0] < cutoff:
-        hist.pop(0)
-    if len(hist) < 2:
-        return
-    min_pt = min(hist, key=lambda x: x[1])
+    with state_lock:
+        hist = price_window_history.setdefault(sym, [])
+        if hist and abs(hist[-1][1] - tk["price"]) < 1e-12 and (now_ms - hist[-1][0]) < 1500:
+            return
+        hist.append((now_ms, tk["price"]))
+        cutoff = now_ms - 420_000
+        while hist and hist[0][0] < cutoff:
+            hist.pop(0)
+        if len(hist) < 2:
+            return
+        min_pt = min(hist, key=lambda x: x[1])
     if min_pt[1] <= 0:
         return
     pct = ((tk["price"] - min_pt[1]) / min_pt[1]) * 100.0
-    if pct < th_pct or is_pump_locked(tk["base"], now_ms):
+    if pct < th_pct:
         return
     with state_lock:
         if is_pump_locked(tk["base"], now_ms):
@@ -761,7 +957,7 @@ def evaluate_pump_for_ticker(tk, now_ms: int):
 
 
 # ==============================================================================
-# MOTOR 2, 3, 6, 7, EXHAUST: GUNLUK ONBELLEKLI DUSUK AGIRLIKLI TARAMA
+# MOTOR 2, 3, 6, 7, EXHAUST: GUNLUK ONBELLEKLI HIZLI & DUSUK AGIRLIKLI TARAMA
 # ==============================================================================
 def get_daily_stats_cached(sym: str):
     day_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -775,7 +971,11 @@ def get_daily_stats_cached(sym: str):
     if len(c1d) >= 203:
         prev199 = [b["close"] for b in c1d[-200:-1]]
         rec["sum199"] = sum(prev199)
-        rec["prev_closes"] = [b["close"] for b in c1d[-80:-1]]
+        closes_full = [b["close"] for b in c1d]
+        sma_hist = compute_sma_series(closes_full[:-1], 200)
+        if len(sma_hist) >= 2 and sma_hist[-1]:
+            rec["yest_close"] = closes_full[-2]
+            rec["yest_ma200"] = sma_hist[-1]
     if len(c1d) >= 60:
         p30 = c1d[-31:-1]
         rec["month_max"] = max(b["high"] for b in p30)
@@ -784,6 +984,8 @@ def get_daily_stats_cached(sym: str):
         p365 = c1d[-366:-1]
         rec["year_max"] = max(b["high"] for b in p365)
         rec["year_min"] = min(b["low"] for b in p365)
+    elif len(c1d) >= 30:
+        rec["year_min"] = min(b["low"] for b in c1d[:-1])
     if len(c1d) >= 7:
         rec["ma1d"] = sum(b["close"] for b in c1d[-7:]) / 7.0
     daily_stats_cache[sym] = rec
@@ -792,16 +994,19 @@ def get_daily_stats_cached(sym: str):
 
 def scan_structural_pair(tk):
     if tk["quote"] != "USDT" or tk["volume24h"] < 1_500_000:
-        return
+        return False
     sym = tk["symbol"]
     cur = tk["price"]
     now_ms = int(time.time() * 1000)
-
+    did_rest = False
     c15m_shared = []
 
-    # 1) MOTOR 6: 1G MA200 & STORMGAIN PRO (YEAR / MONTH - Gunluk onbellekli!)
+    # 1) MOTOR 6: 1G MA200 & STORMGAIN PRO (YEAR / MONTH)
     try:
+        was_cached = daily_stats_cache.get(sym, {}).get("day") == datetime.now(timezone.utc).strftime("%Y-%m-%d")
         dstat = get_daily_stats_cached(sym)
+        if not was_cached:
+            did_rest = True
         if dstat:
             c1d = dstat["c1d"]
             if "sum199" in dstat:
@@ -813,6 +1018,12 @@ def scan_structural_pair(tk):
                         with state_lock:
                             prev_lock = locks["ma200"].get(sym)
                             if not prev_lock:
+                                y_c = dstat.get("yest_close", 0.0)
+                                y_m = dstat.get("yest_ma200", 0.0)
+                                if y_c > 0 and y_m > 0:
+                                    yest_pos = "ABOVE" if y_c >= y_m else "BELOW"
+                                    if yest_pos != new_pos:
+                                        crossed = True
                                 locks["ma200"][sym] = {"symbol": sym, "direction": new_pos, "ma200": ma_live, "updatedAt": now_ms}
                             elif prev_lock["direction"] != new_pos:
                                 locks["ma200"][sym] = {"symbol": sym, "direction": new_pos, "ma200": ma_live, "updatedAt": now_ms}
@@ -878,6 +1089,7 @@ def scan_structural_pair(tk):
                             candidate = ("MONTH", "MIN", month_min, month_max, month_min)
 
                 if candidate:
+                    did_rest = True
                     scope, c_dir, ref_lvl, hi_lvl, lo_lvl = candidate
                     c4h = fetch_spot_klines(sym, "4h", 50)
                     c1h = fetch_spot_klines(sym, "1h", 28)
@@ -950,12 +1162,13 @@ def scan_structural_pair(tk):
         if "cooldown" not in str(e) and "418" not in str(e):
             print(f"[{sym} MA200/StormGain Hata] {e}", flush=True)
 
-    # 2) MOTOR 3: 4h Akis / Emir Defteri Duvari & POC (coin basina min 90 sn aralikli)
+    # 2) MOTOR 3: 4h Akis / Emir Defteri Duvari & POC (coin basina min 120 sn aralikli)
     try:
         dstat = daily_stats_cache.get(sym)
         last_flow_ts = flow_scan_cache.get(sym, 0)
-        if tk["volume24h"] >= 2_500_000 and dstat and "ma1d" in dstat and (now_ms - last_flow_ts) > 90_000:
+        if tk["volume24h"] >= 2_500_000 and dstat and "ma1d" in dstat and (now_ms - last_flow_ts) > 120_000:
             flow_scan_cache[sym] = now_ms
+            did_rest = True
             depth = fetch_binance_json(f"/api/v3/depth?symbol={urllib.parse.quote(sym)}&limit=100", timeout=7.0)
             best_bid, best_ask = (0.0, 0.0), (0.0, 0.0)
             for ps, qs in depth.get("bids", []):
@@ -1037,36 +1250,40 @@ def scan_structural_pair(tk):
         if "cooldown" not in str(e) and "418" not in str(e):
             print(f"[{sym} FLOW Hata] {e}", flush=True)
 
-    # 3) MOTOR 2: W1 ATL (Siki Taban Kilidi - 4 Saat Onbellekli)
+    # 3) MOTOR 2: W1 ATL (Sadece 1 yillik dibe %3 yakinsa 1w ceker -> %95 REST tasarrufu)
     try:
-        cached = atl_weekly_cache.get(sym)
-        if not cached or (now_ms - cached["ts"]) > 14_400_000:
-            c1w = fetch_spot_klines(sym, "1w", 1000)
-            if len(c1w) >= 12:
-                prev_atl = min(b["low"] for b in c1w[:-1])
-                cached = {"prev_atl": prev_atl, "ts": now_ms}
-                atl_weekly_cache[sym] = cached
-        if cached and cached["prev_atl"] > 0:
-            atl_rec = locks["atl"].get(sym)
-            floor_atl = min(cached["prev_atl"], atl_rec["atl"]) if atl_rec else cached["prev_atl"]
-            broke = (cur < floor_atl * 0.995) if atl_rec else (cur < floor_atl)
-            if broke and tk["low24h"] < cached["prev_atl"]:
-                with state_lock:
-                    locks["atl"][sym] = {"symbol": sym, "atl": cur, "lockedAt": now_ms}
-                    signals_today.append({"engine": "ATL", "symbol": sym, "dir": "ATL", "entry": cur, "peak_pct": 0.0, "ts": now_ms})
-                save_state()
-                c1h_atl = fetch_spot_klines(sym, "1h", 80)
-                caption = (
-                    f"🕳 <b>#{sym} ${fmt_price(cur)} tüm zamanların en düşüğü (ATL)</b>\n"
-                    f"📉 Önceki ATL (<code>${fmt_price(floor_atl)}</code>) kesin olarak aşağı kırıldı · 24s: {tk['change24h']:+.2f}%\n"
-                    f"🔒 Kilit aktif: ${fmt_price(cur)} altına düşmedikçe tekrar gelmez."
-                )
-                png = render_candlestick_png(
-                    sym, "1S ATL", c1h_atl,
-                    levels=[("ATL", floor_atl, (250, 204, 21)), ("ANLIK", cur, (239, 68, 68))],
-                    header_note="W1 ATL",
-                )
-                tg_send_photo(caption, png, tag_label=f"ATL {sym}")
+        dstat = daily_stats_cache.get(sym)
+        near_1y_low = bool(dstat and dstat.get("year_min", 0) > 0 and cur <= dstat["year_min"] * 1.03)
+        if near_1y_low:
+            cached = atl_weekly_cache.get(sym)
+            if not cached or (now_ms - cached["ts"]) > 14_400_000:
+                did_rest = True
+                c1w = fetch_spot_klines(sym, "1w", 1000)
+                if len(c1w) >= 12:
+                    prev_atl = min(b["low"] for b in c1w[:-1])
+                    cached = {"prev_atl": prev_atl, "ts": now_ms}
+                    atl_weekly_cache[sym] = cached
+            if cached and cached["prev_atl"] > 0:
+                atl_rec = locks["atl"].get(sym)
+                floor_atl = min(cached["prev_atl"], atl_rec["atl"]) if atl_rec else cached["prev_atl"]
+                broke = (cur < floor_atl * 0.995) if atl_rec else (cur < floor_atl)
+                if broke and tk["low24h"] < cached["prev_atl"]:
+                    with state_lock:
+                        locks["atl"][sym] = {"symbol": sym, "atl": cur, "lockedAt": now_ms}
+                        signals_today.append({"engine": "ATL", "symbol": sym, "dir": "ATL", "entry": cur, "peak_pct": 0.0, "ts": now_ms})
+                    save_state()
+                    c1h_atl = fetch_spot_klines(sym, "1h", 80)
+                    caption = (
+                        f"🕳 <b>#{sym} ${fmt_price(cur)} tüm zamanların en düşüğü (ATL)</b>\n"
+                        f"📉 Önceki ATL (<code>${fmt_price(floor_atl)}</code>) kesin olarak aşağı kırıldı · 24s: {tk['change24h']:+.2f}%\n"
+                        f"🔒 Kilit aktif: ${fmt_price(cur)} altına düşmedikçe tekrar gelmez."
+                    )
+                    png = render_candlestick_png(
+                        sym, "1S ATL", c1h_atl,
+                        levels=[("ATL", floor_atl, (250, 204, 21)), ("ANLIK", cur, (239, 68, 68))],
+                        header_note="W1 ATL",
+                    )
+                    tg_send_photo(caption, png, tag_label=f"ATL {sym}")
     except Exception as e:
         if "cooldown" not in str(e) and "418" not in str(e):
             print(f"[{sym} ATL Hata] {e}", flush=True)
@@ -1082,6 +1299,7 @@ def scan_structural_pair(tk):
             and (tk["high24h"] * 0.945 <= cur <= tk["high24h"] * 0.997)
             and (not prev_exh or (now_ms - prev_exh["lockedAt"]) >= exh_cooldown_ms)
         ):
+            did_rest = True
             c15m = c15m_shared[-40:] if len(c15m_shared) >= 40 else fetch_spot_klines(sym, "15m", 40)
             if len(c15m) >= 24:
                 recent16 = c15m[-17:]
@@ -1152,15 +1370,20 @@ def scan_structural_pair(tk):
         if "cooldown" not in str(e) and "418" not in str(e):
             print(f"[{sym} EXHAUST Hata] {e}", flush=True)
 
+    return did_rest
+
 
 # ==============================================================================
 # MOTOR 4, 5 & 8: CANLI PIK RAPORLARI (21:00 / 23:00 TR) & BINANCE DUYURU
 # ==============================================================================
 def update_signal_peaks():
+    global last_peak_save_ts
     changed = False
+    with ticker_lock:
+        snap = dict(ticker_map)
     with state_lock:
         for s in signals_today:
-            tk = ticker_map.get(s["symbol"])
+            tk = snap.get(s["symbol"])
             if not tk or tk["price"] <= 0:
                 continue
             cur = tk["price"]
@@ -1169,7 +1392,9 @@ def update_signal_peaks():
             if pct > s["peak_pct"]:
                 s["peak_pct"] = round(pct, 2)
                 changed = True
-    if changed:
+    now_s = time.time()
+    if changed and (now_s - last_peak_save_ts) >= 20.0:
+        last_peak_save_ts = now_s
         save_state()
 
 
@@ -1286,7 +1511,8 @@ def _ingest_ws_tickers(arr):
             "high24h": float(item.get("h") or price),
             "low24h": float(item.get("l") or price),
         }
-        ticker_map[sym] = tk
+        with ticker_lock:
+            ticker_map[sym] = tk
         evaluate_pump_for_ticker(tk, now_ms)
     update_signal_peaks()
     check_daily_reports()
@@ -1395,12 +1621,14 @@ def ws_ticker_loop():
 
 
 def rest_seed_loop():
-    """Sadece baslangicta 1 kez ve WS bagli degilse seyrek yedek olarak REST ticker ceker."""
+    """Sadece baslangicta 1 kez veya WS bagli degilse REST ticker ceker."""
     while True:
         try:
             with ban_lock:
                 banned = time.time() < rest_ban_until
-            if not banned and (not diag_status["ws_connected"] or len(ticker_map) < 200):
+            with ticker_lock:
+                t_count = len(ticker_map)
+            if not banned and (not diag_status["ws_connected"] or t_count < 200):
                 raw = fetch_binance_json("/api/v3/ticker/24hr", timeout=10.0)
                 now_ms = int(time.time() * 1000)
                 if isinstance(raw, list):
@@ -1424,7 +1652,8 @@ def rest_seed_loop():
                             "high24h": float(item.get("highPrice") or price),
                             "low24h": float(item.get("lowPrice") or price),
                         }
-                        ticker_map[sym] = tk
+                        with ticker_lock:
+                            ticker_map[sym] = tk
                         evaluate_pump_for_ticker(tk, now_ms)
                     update_signal_peaks()
                     check_daily_reports()
@@ -1443,25 +1672,29 @@ def structure_loop():
             if rem > 0:
                 time.sleep(min(rem, 15))
                 continue
+            with ticker_lock:
+                all_vals = list(ticker_map.values())
             liquid = sorted(
-                [t for t in ticker_map.values() if t["quote"] == "USDT" and t["volume24h"] >= 1_500_000],
+                [t for t in all_vals if t["quote"] == "USDT" and t["volume24h"] >= 1_500_000],
                 key=lambda x: x["volume24h"],
                 reverse=True,
             )[:400]
             if liquid:
                 batch = []
-                for _ in range(min(3, len(liquid))):
+                for _ in range(min(8, len(liquid))):
                     batch.append(liquid[cursor % len(liquid)])
                     cursor += 1
                 for tk in batch:
                     with ban_lock:
                         if time.time() < rest_ban_until:
                             break
-                    scan_structural_pair(tk)
-                    time.sleep(0.35)
+                    did_rest = scan_structural_pair(tk)
+                    diag_status["structural_scans"] += 1
+                    if did_rest:
+                        time.sleep(0.30)
         except Exception as e:
             print(f"[Structure Loop Hata] {e}", flush=True)
-        time.sleep(4)
+        time.sleep(1.5)
 
 
 def news_loop():
@@ -1499,6 +1732,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         with ban_lock:
             ban_rem = max(0, int(rest_ban_until - time.time()))
+        with ticker_lock:
+            pair_count = len(ticker_map)
         body = json.dumps(
             {
                 "ok": True,
@@ -1509,10 +1744,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "ws_connected": diag_status["ws_connected"],
                 "ws_host": diag_status["ws_host"],
                 "ws_messages": diag_status["ws_messages"],
+                "structural_scans": diag_status["structural_scans"],
                 "binance_ban_sec": ban_rem,
                 "binance_last_error": diag_status["last_binance_error"],
                 "mirror": BINANCE_MIRRORS[preferred_mirror_idx],
-                "pairs": len(ticker_map),
+                "pairs": pair_count,
                 "signals_sent": diag_status["signals_sent"],
                 "last_signal": diag_status["last_signal"],
                 "locks": {k: len(v) for k, v in locks.items()},
