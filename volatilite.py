@@ -1,127 +1,349 @@
-def dislanmis(s):
-    return s.startswith(STABIL_ONEKLER) or s.endswith(KALDIRACLI_SONEKLER)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Spot Akis Terminali - Render Python 3 Telegram Botu (Zero-Dependency)
+Aktif Sinyal Motoru (Sadece 1 Numarali Bot):
+  1. 0-7 dk Spot Anlik Pump (PUMP) - Tekil Coin Kilidi + Canli 1dk/15sn Grafik
+Otomatik Ozet & Duyurular:
+  - Gunun Zaferi (21:00 TR)
+  - Top 24 Saat Ozeti (23:00 TR)
+  - Binance Resmi Duyurulari (60 sn)
+"""
 
-class WSFeed:
-    def __init__(self, ad, adresler):
-        self.ad = ad; self.adresler = adresler; self.veri = {}
-        self.son = 0.0; self.bagli = False; self.son_hata = ""
-        self.idx = 0; self.dinleyici = None
+import base64
+import datetime
+import http.server
+import json
+import math
+import os
+import socket
+import ssl
+import struct
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
 
-    @staticmethod
-    def _recv_exact(sock, buf, n):
-        while len(buf) < n:
-            chunk = sock.recv(65536)
-            if not chunk: raise EOFError("WS kapandı")
-            buf.extend(chunk)
-        out = bytes(buf[:n]); del buf[:n]; return out
+# ==============================================================================
+# KONFIGURASYON
+# ==============================================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
+PORT = int(os.environ.get("PORT", "10000"))
+PUMP_REPEAT_HOURS = float(os.environ.get("PUMP_REPEAT_HOURS", "0"))
+STATE_FILE = os.environ.get("STATE_FILE", "/tmp/spot_bot_state.json")
 
-    @staticmethod
-    def _send(sock, data, opcode):
-        mask = os.urandom(4); n = len(data)
-        head = bytearray([0x80 | opcode])
-        if n < 126: head.append(0x80 | n)
-        elif n < 65536: head.append(0x80 | 126); head.extend(struct.pack("!H", n))
-        else: head.append(0x80 | 127); head.extend(struct.pack("!Q", n))
-        head.extend(mask)
-        sock.sendall(bytes(head) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+BINANCE_MIRRORS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://data-api.binance.vision",
+]
 
-    def _mesaj(self, sock, buf):
-        parca = bytearray()
-        while True:
-            b1, b2 = self._recv_exact(sock, buf, 2)
-            fin = b1 & 0x80; op = b1 & 0x0F; ln = b2 & 0x7F
-            if ln == 126: ln = struct.unpack("!H", self._recv_exact(sock, buf, 2))[0]
-            elif ln == 127: ln = struct.unpack("!Q", self._recv_exact(sock, buf, 8))[0]
-            if b2 & 0x80: self._recv_exact(sock, buf, 4)
-            payload = self._recv_exact(sock, buf, ln)
-            if op == 0x8: raise EOFError("WS close")
-            if op == 0x9: self._send(sock, payload, 0xA); continue
-            if op == 0xA: continue
-            if op in (0x1, 0x2): parca = bytearray(payload)
-            elif op == 0x0: parca.extend(payload)
-            if fin: return bytes(parca)
+EXCLUDED_PREFIXES = ("USDC", "FDUSD", "TUSD", "USDP", "EUR", "USDE", "USD1")
+EXCLUDED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
-    def _baglan(self):
-        host, port, path = self.adresler[self.idx % len(self.adresler)]
-        ctx = ssl.create_default_context()
-        sock = socket.create_connection((host, port), timeout=15)
-        ssock = ctx.wrap_socket(sock, server_hostname=host); ssock.settimeout(45)
+TR_TZ = datetime.timezone(datetime.timedelta(hours=3))
+
+# ==============================================================================
+# DURUM & KILIT YONETIMI
+# ==============================================================================
+state_lock = threading.Lock()
+tickers = {}          # sym -> dict
+price_history = {}    # sym -> list[(ts_sec, price)]
+signals_log = []      # list[dict] (24s pik takibi ve raporlar)
+news_seen_ids = set()
+news_seeded = False
+ws_connected = False
+ban_until_ts = 0.0
+preferred_mirror_idx = 0
+
+locks = {
+    "pump": {},   # base -> {"symbol": str, "locked_at": float}
+    "reports": {"victory_day": "", "top24_day": ""},
+}
+
+
+def load_state():
+    global signals_log
+    try:
+        if not os.path.exists(STATE_FILE):
+            return
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        raw_locks = raw.get("locks", {})
+        if isinstance(raw_locks.get("pump"), dict):
+            locks["pump"] = raw_locks["pump"]
+        if isinstance(raw_locks.get("reports"), dict):
+            locks["reports"].update(raw_locks["reports"])
+        raw_sigs = raw.get("signals", [])
+        if isinstance(raw_sigs, list):
+            signals_log = [s for s in raw_sigs if isinstance(s, dict) and s.get("engine") == "PUMP"][-300:]
+    except Exception:
+        pass
+
+
+def save_state():
+    try:
+        with state_lock:
+            payload = {
+                "locks": locks,
+                "signals": signals_log[-300:],
+            }
+        tmp_path = STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        pass
+
+
+# ==============================================================================
+# YARDIMCI FONKSIYONLAR
+# ==============================================================================
+def extract_base_quote(sym):
+    for q in ("USDT", "BTC", "BNB"):
+        if sym.endswith(q) and len(sym) > len(q):
+            return sym[:-len(q)], q
+    return None, None
+
+
+def is_excluded(sym):
+    if any(sym.startswith(p) for p in EXCLUDED_PREFIXES):
+        return True
+    if any(sym.endswith(s) for s in EXCLUDED_SUFFIXES):
+        return True
+    return False
+
+
+def fmt_price(p):
+    if not p or p <= 0 or math.isnan(p) or math.isinf(p):
+        return "0"
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 10:
+        return f"{p:.3f}".rstrip("0").rstrip(".")
+    if p >= 1:
+        return f"{p:.4f}".rstrip("0").rstrip(".")
+    if p >= 0.01:
+        return f"{p:.5f}".rstrip("0").rstrip(".")
+    if p >= 0.0001:
+        return f"{p:.6f}".rstrip("0").rstrip(".")
+    return f"{p:.8f}".rstrip("0").rstrip(".")
+
+
+def tr_now():
+    return datetime.datetime.now(TR_TZ)
+
+
+def update_live_candle(candles, live_price):
+    """Son mumu anlik canli fiyatla gunceller (gorselin daima canli olmasini saglar)."""
+    if not candles or not live_price or live_price <= 0:
+        return candles
+    out = [dict(b) for b in candles]
+    last = out[-1]
+    last["close"] = live_price
+    if live_price > last["high"]:
+        last["high"] = live_price
+    if live_price < last["low"]:
+        last["low"] = live_price
+    return out
+
+
+# ==============================================================================
+# HTTP / BINANCE REST + WS-API + BYBIT FALLBACK
+# ==============================================================================
+def http_get_json(url, timeout=9):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; SpotPumpBot/1.0)",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def binance_rest_get(path_and_query, timeout=9):
+    global ban_until_ts, preferred_mirror_idx
+    now = time.time()
+    if now < ban_until_ts:
+        raise RuntimeError("REST rate limit active")
+    n = len(BINANCE_MIRRORS)
+    last_err = None
+    for off in range(n):
+        idx = (preferred_mirror_idx + off) % n
+        url = BINANCE_MIRRORS[idx] + path_and_query
+        try:
+            data = http_get_json(url, timeout=timeout)
+            preferred_mirror_idx = idx
+            return data
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (418, 429):
+                ban_until_ts = time.time() + 900
+                raise
+        except Exception as e:
+            last_err = e
+    raise last_err or RuntimeError("Binance mirror unreachable")
+
+
+def _ws_send_frame(sock, data, opcode=0x1):
+    mask = os.urandom(4)
+    header = bytearray([0x80 | opcode])
+    n = len(data)
+    if n < 126:
+        header.append(0x80 | n)
+    elif n < 65536:
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", n))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", n))
+    header.extend(mask)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    sock.sendall(bytes(header) + masked)
+
+
+def _ws_recv_exact(sock, buf, n):
+    while len(buf) < n:
+        chunk = sock.recv(max(4096, n - len(buf)))
+        if not chunk:
+            raise EOFError("WS EOF")
+        buf.extend(chunk)
+    out = bytes(buf[:n])
+    del buf[:n]
+    return out
+
+
+def _ws_read_frame(sock, buf):
+    b1, b2 = _ws_recv_exact(sock, buf, 2)
+    opcode = b1 & 0x0F
+    masked = bool(b2 & 0x80)
+    length = b2 & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _ws_recv_exact(sock, buf, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _ws_recv_exact(sock, buf, 8))[0]
+    mask = _ws_recv_exact(sock, buf, 4) if masked else None
+    payload = _ws_recv_exact(sock, buf, length)
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+def ws_api_request(method, params, timeout=9):
+    """Binance WebSocket API (REST 418 kotasindan etkilenmez)."""
+    host = "ws-api.binance.com"
+    path = "/ws-api/v3"
+    ctx = ssl.create_default_context()
+    sock = socket.create_connection((host, 443), timeout=timeout)
+    ssock = ctx.wrap_socket(sock, server_hostname=host)
+    try:
         key = base64.b64encode(os.urandom(16)).decode("ascii")
-        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: Mozilla/5.0\r\n\r\n")
-        ssock.sendall(req.encode("ascii"))
+        handshake = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        ssock.sendall(handshake.encode("ascii"))
         buf = b""
         while b"\r\n\r\n" not in buf:
             chunk = ssock.recv(4096)
-            if not chunk: raise EOFError("handshake kapandı")
+            if not chunk:
+                raise RuntimeError("WS-API handshake closed")
             buf += chunk
-        ilk = buf.split(b"\r\n", 1)[0].decode("utf-8", "ignore")
-        if " 101" not in ilk:
-            ssock.close(); raise RuntimeError(f"handshake red: {ilk}")
-        return ssock, bytearray(buf.split(b"\r\n\r\n", 1)[1])
+        if b"101 " not in buf.split(b"\r\n", 1)[0]:
+            raise RuntimeError("WS-API handshake rejected")
+        req_id = f"r_{int(time.time() * 1000)}"
+        payload = json.dumps({"id": req_id, "method": method, "params": params}).encode("utf-8")
+        _ws_send_frame(ssock, payload)
 
-    def calis(self):
-        while True:
-            ssock = None
-            try:
-                ssock, buf = self._baglan()
-                self.bagli = True; self.son_hata = ""; self.son = time.time()
-                log("WS", f"{self.ad} bağlandı.")
-                while True:
-                    ham = self._mesaj(ssock, buf)
-                    arr = json.loads(ham.decode("utf-8"))
-                    if isinstance(arr, dict) and "data" in arr: arr = arr["data"]
-                    if not isinstance(arr, list): continue
-                    now = time.time()
-                    for it in arr:
-                        try: self.veri[it["s"]] = (float(it["c"]), float(it["o"]), float(it["q"]), now)
-                        except Exception: continue
-                    self.son = now
-                    if self.dinleyici:
-                        try: self.dinleyici(self, arr, now)
-                        except Exception as e: log("WS", f"dinleyici: {e}")
-            except Exception as e:
-                self.bagli = False
-                self.son_hata = f"{type(e).__name__}: {e}"[:120]
-                log("WS", f"{self.ad} koptu: {self.son_hata}")
-                self.idx += 1
-                time.sleep(5)
-            finally:
-                try:
-                    if ssock: ssock.close()
-                except Exception: pass
+        deadline = time.time() + timeout
+        extra = buf.split(b"\r\n\r\n", 1)[1]
+        frame_buf = bytearray(extra)
+        while time.time() < deadline:
+            opcode, msg_bytes = _ws_read_frame(ssock, frame_buf)
+            if opcode == 0x8:
+                break
+            if opcode == 0x9:
+                _ws_send_frame(ssock, msg_bytes, opcode=0xA)
+                continue
+            if opcode in (0x1, 0x2):
+                obj = json.loads(msg_bytes.decode("utf-8"))
+                if obj.get("id") == req_id:
+                    if obj.get("status") != 200:
+                        raise RuntimeError(f"WS-API error {obj.get('status')}")
+                    return obj.get("result")
+        raise TimeoutError("WS-API timeout")
+    finally:
+        try:
+            ssock.close()
+        except Exception:
+            pass
 
-FUT = WSFeed("Futures", [("fstream.binance.com", 443, "/market/ws/!miniTicker@arr"),
-                         ("fstream.binance.com", 443, "/ws/!miniTicker@arr")])
-SPOT = WSFeed("Spot", [("stream.binance.com", 9443, "/ws/!miniTicker@arr"),
-                       ("data-stream.binance.com", 9443, "/ws/!miniTicker@arr")])
 
-def besleme_taze(f): return f.bagli and time.time() - f.son < 25
-def aktif_besleme():
-    if besleme_taze(FUT): return FUT
-    if besleme_taze(SPOT): return SPOT
-    return None
-def pump_besleme():
-    if besleme_taze(SPOT): return SPOT
-    if besleme_taze(FUT): return FUT
-    return None
+def _parse_binance_klines(raw):
+    return [
+        {
+            "openTime": int(k[0]) // 1000,
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+        }
+        for k in raw
+    ]
 
-def ticker_listesi(futures):
-    sirali = (FUT, SPOT) if futures else (SPOT, FUT)
-    now = time.time()
-    for f in sirali:
-        if besleme_taze(f) and len(f.veri) > 50:
-            out = []
-            for s, (c, o, q, t) in list(f.veri.items()):
-                if now - t > 10800 or o <= 0: continue
-                if s in YASAKLI_HISSELER or dislanmis(s): continue
-                out.append({"symbol": s, "lastPrice": c, "quoteVolume": q, "priceChangePercent": (c - o) / o * 100})
-            return out
-    return None
 
-# =====================================================
-# PNG ÇİZİM
-# =====================================================
+def fetch_1m_klines(sym, limit=45):
+    try:
+        raw = binance_rest_get(
+            f"/api/v3/klines?symbol={urllib.parse.quote(sym)}&interval=1m&limit={limit}",
+            timeout=7,
+        )
+        if isinstance(raw, list) and raw:
+            return _parse_binance_klines(raw)
+    except Exception:
+        pass
+    try:
+        raw = ws_api_request("klines", {"symbol": sym, "interval": "1m", "limit": limit}, timeout=7)
+        if isinstance(raw, list) and raw:
+            return _parse_binance_klines(raw)
+    except Exception:
+        pass
+    try:
+        url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={urllib.parse.quote(sym)}&interval=1&limit={limit}"
+        d = http_get_json(url, timeout=6)
+        rows = d.get("result", {}).get("list", [])
+        if rows:
+            return [
+                {
+                    "openTime": int(r[0]) // 1000,
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]),
+                }
+                for r in reversed(rows)
+            ]
+    except Exception:
+        pass
+    return []
+
+
+# ==============================================================================
+# SIFIR BAGIMLILIKLI PNG MUM GRAFIGI OLUSTURUCU (CANLI 1DK / 15SN PUMP)
+# ==============================================================================
 FONT_5X7 = {
     "0": [0x3E, 0x51, 0x49, 0x45, 0x3E], "1": [0x00, 0x42, 0x7F, 0x40, 0x00],
     "2": [0x42, 0x61, 0x51, 0x49, 0x46], "3": [0x21, 0x41, 0x45, 0x4B, 0x31],
@@ -148,359 +370,584 @@ FONT_5X7 = {
     " ": [0x00, 0x00, 0x00, 0x00, 0x00], "|": [0x00, 0x00, 0x7F, 0x00, 0x00],
 }
 
-def render_png(baslik, candles, live_price, start_price, zaman=None):
-    W, H = 860, 440
-    BG = (9, 13, 22); GRID = (28, 38, 56)
-    BULL = (16, 185, 129); BEAR = (244, 63, 94)
-    TEXT = (226, 232, 240); MUTED = (148, 163, 184)
-    START_COL = (245, 158, 11); LIVE_COL = (56, 189, 248)
 
-    bars = []
-    for b in candles[-75:]:
-        try:
-            if b["high"] >= b["low"] > 0 and b["close"] > 0 and b["open"] > 0:
-                bars.append(dict(b))
-        except (KeyError, TypeError): continue
-    if not bars: return b""
-    if live_price is None or live_price <= 0 or math.isnan(live_price) or math.isinf(live_price):
-        live_price = bars[-1]["close"]
-    last = bars[-1]
-    last["close"] = live_price
-    last["high"] = max(last["high"], live_price)
-    last["low"] = min(last["low"], live_price)
+def render_pump_png(symbol, tf_label, candles, live_price, start_price):
+    """Saf Python PNG mum grafigi (canli fiyat + baslangic cizgisi + hacim)."""
+    W, H = 860, 440
+    BG = (9, 13, 22)
+    GRID = (28, 38, 56)
+    BULL = (16, 185, 129)
+    BEAR = (244, 63, 94)
+    TEXT = (226, 232, 240)
+    MUTED = (148, 163, 184)
+    START_COL = (245, 158, 11)
+    LIVE_COL = (56, 189, 248)
+
+    bars = update_live_candle(candles[-75:], live_price)
+    if not bars:
+        return b""
 
     buf = bytearray(bytes(BG) * (W * H))
 
     def set_px(x, y, col):
         if 0 <= x < W and 0 <= y < H:
             i = (y * W + x) * 3
-            buf[i] = col[0]; buf[i + 1] = col[1]; buf[i + 2] = col[2]
+            buf[i] = col[0]
+            buf[i + 1] = col[1]
+            buf[i + 2] = col[2]
 
     def fill_rect(x0, y0, x1, y1, col):
         x0, x1 = max(0, min(x0, x1)), min(W - 1, max(x0, x1))
         y0, y1 = max(0, min(y0, y1)), min(H - 1, max(y0, y1))
-        if x1 < x0 or y1 < y0: return
-        row = bytes(col) * (x1 - x0 + 1)
+        row_bytes = bytes(col) * (x1 - x0 + 1)
         for y in range(y0, y1 + 1):
-            st = (y * W + x0) * 3
-            buf[st:st + len(row)] = row
+            start = (y * W + x0) * 3
+            buf[start:start + len(row_bytes)] = row_bytes
 
     def draw_line(x0, y0, x1, y1, col, dashed=False):
-        dx = abs(x1 - x0); dy = -abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1; sy = 1 if y0 < y1 else -1
-        err = dx + dy; n = 0
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        step_n = 0
         while True:
-            if not dashed or (n % 8) < 5: set_px(x0, y0, col)
-            if x0 == x1 and y0 == y1: break
+            if not dashed or (step_n % 8) < 5:
+                set_px(x0, y0, col)
+            if x0 == x1 and y0 == y1:
+                break
             e2 = 2 * err
-            if e2 >= dy: err += dy; x0 += sx
-            if e2 <= dx: err += dx; y0 += sy
-            n += 1
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+            step_n += 1
 
     def draw_text(x, y, text, col, scale=1):
         cx = x
         for ch in text.upper():
-            g = FONT_5X7.get(ch, FONT_5X7[" "])
+            glyph = FONT_5X7.get(ch, FONT_5X7[" "])
             for gx in range(5):
+                bits = glyph[gx]
                 for gy in range(7):
-                    if g[gx] & (1 << gy):
-                        fill_rect(cx + gx * scale, y + gy * scale,
-                                  cx + gx * scale + scale - 1, y + gy * scale + scale - 1, col)
+                    if bits & (1 << gy):
+                        if scale == 1:
+                            set_px(cx + gx, y + gy, col)
+                        else:
+                            fill_rect(cx + gx * scale, y + gy * scale, cx + gx * scale + scale - 1, y + gy * scale + scale - 1, col)
             cx += 6 * scale
 
-    pad_l, pad_r, pad_t, pad_b = 18, 118, 48, 24
-    vol_h, gap = 62, 12
+    pad_l, pad_r, pad_t, pad_b = 18, 118, 42, 24
+    vol_h = 62
+    gap = 12
     plot_w = W - pad_l - pad_r
     price_h = H - pad_t - pad_b - vol_h - gap
 
-    allp = [b["high"] for b in bars] + [b["low"] for b in bars] + [live_price]
-    if start_price and start_price > 0: allp.append(start_price)
-    lo_p = min(allp) * 0.994
-    hi_p = max(allp) * 1.006
+    all_p = [b["high"] for b in bars] + [b["low"] for b in bars]
+    if live_price and live_price > 0:
+        all_p.append(live_price)
+    if start_price and start_price > 0:
+        all_p.append(start_price)
+
+    lo_p = min(all_p) * 0.994
+    hi_p = max(all_p) * 1.006
     rng_p = max(hi_p - lo_p, lo_p * 0.005)
     max_vol = max([b["volume"] for b in bars] + [1.0])
 
-    def y_of(p): return int(pad_t + ((hi_p - p) / rng_p) * price_h)
+    def y_of(p):
+        return int(pad_t + ((hi_p - p) / rng_p) * price_h)
 
-    draw_text(pad_l, 14, baslik, TEXT, scale=2)
-    if zaman: draw_text(pad_l, 34, zaman, MUTED, scale=1)
+    draw_text(pad_l, 14, f"{symbol} | {tf_label} | SPOT PUMP | ANLIK ${fmt_price(live_price)}", TEXT, scale=2)
 
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         gy = int(pad_t + price_h * frac)
         draw_line(pad_l, gy, pad_l + plot_w, gy, GRID, dashed=True)
-        draw_text(pad_l + plot_w + 8, gy - 3, fmt_price(hi_p - rng_p * frac), MUTED)
+        pval = hi_p - rng_p * frac
+        draw_text(pad_l + plot_w + 8, gy - 3, fmt_price(pval), MUTED, scale=1)
 
     if start_price and start_price > 0:
         sy = y_of(start_price)
         if pad_t <= sy <= pad_t + price_h:
             draw_line(pad_l, sy, pad_l + plot_w, sy, START_COL, dashed=True)
-            draw_text(pad_l + plot_w + 8, sy - 3, "BAS " + fmt_price(start_price), START_COL)
+            draw_text(pad_l + plot_w + 8, sy - 3, f"BAS {fmt_price(start_price)}", START_COL, scale=1)
 
-    n = len(bars); step = plot_w / max(1, n); bw = max(2, int(step * 0.62))
+    n = len(bars)
+    step = plot_w / max(1, n)
+    bw = max(2, int(step * 0.62))
     vol_top = pad_t + price_h + gap
-    for i, b in enumerate(bars):
-        cx = int(pad_l + (i + 0.5) * step)
+    for idx, b in enumerate(bars):
+        cx = int(pad_l + (idx + 0.5) * step)
         col = BULL if b["close"] >= b["open"] else BEAR
-        yo, yc, yh, yl = y_of(b["open"]), y_of(b["close"]), y_of(b["high"]), y_of(b["low"])
+        yo = y_of(b["open"])
+        yc = y_of(b["close"])
+        yh = y_of(b["high"])
+        yl = y_of(b["low"])
         draw_line(cx, yh, cx, yl, col)
-        fill_rect(cx - bw // 2, min(yo, yc), cx + bw // 2,
-                  max(min(yo, yc) + 1, max(yo, yc)), col)
+        fill_rect(cx - bw // 2, min(yo, yc), cx + bw // 2, max(min(yo, yc) + 1, max(yo, yc)), col)
         vh = max(1, int((b["volume"] / max_vol) * vol_h))
-        fill_rect(cx - bw // 2, vol_top + vol_h - vh, cx + bw // 2, vol_top + vol_h,
-                  (col[0] // 2, col[1] // 2, col[2] // 2))
+        fill_rect(cx - bw // 2, vol_top + vol_h - vh, cx + bw // 2, vol_top + vol_h, (col[0] // 2, col[1] // 2, col[2] // 2))
 
-    ly = y_of(live_price)
-    draw_line(pad_l, ly, pad_l + plot_w, ly, LIVE_COL, dashed=True)
-    fill_rect(pad_l + plot_w + 4, ly - 7, W - 4, ly + 7, (2, 132, 199))
-    draw_text(pad_l + plot_w + 8, ly - 3, fmt_price(live_price), (248, 250, 252))
+    if live_price and live_price > 0:
+        ly = y_of(live_price)
+        draw_line(pad_l, ly, pad_l + plot_w, ly, LIVE_COL, dashed=True)
+        fill_rect(pad_l + plot_w + 4, ly - 7, W - 4, ly + 7, (2, 132, 199))
+        draw_text(pad_l + plot_w + 8, ly - 3, fmt_price(live_price), (248, 250, 252), scale=1)
 
-    raw = bytearray()
+    raw_rows = bytearray()
     stride = W * 3
     for y in range(H):
-        raw.append(0)
-        raw.extend(buf[y * stride:(y + 1) * stride])
-    comp = zlib.compress(bytes(raw), 6)
+        raw_rows.append(0)
+        raw_rows.extend(buf[y * stride:(y + 1) * stride])
+    compressed = zlib.compress(bytes(raw_rows), 6)
 
-    def chunk(tag, payload):
+    def png_chunk(tag, payload):
         return struct.pack("!I", len(payload)) + tag + payload + struct.pack("!I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
 
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack("!IIBBBBB", W, H, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", comp)
-            + chunk(b"IEND", b""))
+    ihdr = struct.pack("!IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", ihdr) + png_chunk(b"IDAT", compressed) + png_chunk(b"IEND", b"")
 
-# =====================================================
-# PUMP / DUMP (ATR + EWMA + CANLI FİYAT)
-# =====================================================
-PUMP_MIN_HACIM = 2_000_000
-PUMP_PENCERELER = ((420, 4.5),)
-PUMP_MIN_CARPAN = 2.0
-PUMP_MIN_SON5 = 25_000
-PUMP_MIN_Z = 2.0
 
-pump_gecmis = {}
-pump_son_ornek = {}
-pump_cd = {}
-pump_aktif = set()
-pump_kilit = threading.Lock()
-pump_sem = threading.Semaphore(3)
-pump_durum = {"feed": None}
-toplu = {"t": [], "sessiz": 0.0}
-sayac = {"PUMP": 0, "DUMP": 0}
-
-def toplu_kontrol(now):
-    if now < toplu["sessiz"]: return True
-    toplu["t"] = [x for x in toplu["t"] if now - x < 120] + [now]
-    if len(toplu["t"]) > 6:
-        toplu["sessiz"] = now + 300
-        log("PUMP", "Piyasa genelinde sert hareket: 5 dk durduruldu")
-        return True
-    return False
-
-def pump_isle(feed, arr, now):
-    if pump_besleme() is not feed: return
-    if pump_durum["feed"] is not feed:
-        pump_durum["feed"] = feed
-        pump_gecmis.clear(); pump_son_ornek.clear()
+# ==============================================================================
+# TELEGRAM GONDERICILER (MESAJ & FOTOGRAF)
+# ==============================================================================
+def telegram_send_message(text):
+    if not BOT_TOKEN:
+        print(f"[SINYAL/MESAJ]\n{text}\n")
         return
-    for it in arr:
-        try:
-            s = it["s"]
-            if not s.endswith("USDT") or s in YASAKLI_HISSELER or dislanmis(s): continue
-            q = float(it["q"])
-            if q < PUMP_MIN_HACIM: continue
-            if now - pump_son_ornek.get(s, 0) < 5: continue
-            p = float(it["c"]); o = float(it["o"])
-            if p <= 0: continue
-            pump_son_ornek[s] = now
-            h = pump_gecmis.setdefault(s, [])
-            h.append((now, p))
-            kes = 0
-            while kes < len(h) and h[kes][0] < now - 1200: kes += 1
-            if kes: del h[:kes]
-            if len(h) < 8 or h[0][0] > now - 90: continue
-            pump_kontrol(feed, s, p, o, q, h, now)
-        except Exception: continue
-
-def pump_kontrol(feed, s, p, o, q, h, now):
-    for pencere, esik in PUMP_PENCERELER:
-        pts = [x[1] for x in h if x[0] >= now - pencere]
-        if len(pts) < 4: continue
-        lo, hi = min(pts), max(pts)
-        if lo <= 0 or hi <= 0: continue
-        up = (p - lo) / lo * 100
-        if up >= esik and p >= hi * 0.985: yon = "PUMP"
-        else: continue
-        key = (s, yon)
-        with pump_kilit:
-            if key in pump_aktif or now < pump_cd.get(key, 0): return
-            pump_aktif.add(key)
-        deg24 = (p - o) / o * 100 if o > 0 else 0.0
-        threading.Thread(target=pump_dogrula,
-                         args=(feed.ad, s, yon, p, pencere, esik, q, deg24),
-                         daemon=True).start()
-        return
-
-def pump_dogrula(feed_ad, s, yon, p, pencere, esik, q24, deg24):
-    key = (s, yon)
-    bitis = time.time() + 300
-    alindi = pump_sem.acquire(timeout=30)
     try:
-        if not alindi: return
-        fut = feed_ad == "Futures"
-        url = (f"{FAPI}/fapi/v1/klines?symbol={s}&interval=1m&limit=45" if fut
-               else f"{BASE}/api/v3/klines?symbol={s}&interval=1m&limit=45")
-        kl = gj(url)
-        if not isinstance(kl, list) or len(kl) < 25:
-            log("PUMP", f"{s} {yon}: mum verisi alınamadı"); return
+        body = json.dumps({
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=12).read()
+    except Exception as e:
+        print(f"[TG sendMessage hata] {e}")
 
-        feed = FUT if fut else SPOT
-        if feed.bagli and s in feed.veri:
-            cp, _, _, ct = feed.veri[s]
-            if time.time() - ct < 30 and cp > 0:
-                p = cp
 
-        zirveler = [float(k[2]) for k in kl]
-        dipler = [float(k[3]) for k in kl]
-        hacimler = [float(k[7]) for k in kl]
-        up = yon == "PUMP"
-        n_son = pencere // 60 + 1
-        if up:
-            ref = min(dipler[-n_son:]); kp = (p - ref) / ref * 100
-        else:
-            ref = max(zirveler[-n_son:]); kp = (ref - p) / ref * 100
+def telegram_send_photo(png_bytes, caption):
+    if len(caption) > 1000:
+        caption = caption[:997] + "..."
+    if not BOT_TOKEN:
+        print(f"[SINYAL/GORSEL {len(png_bytes)}B]\n{caption}\n")
+        return
+    if not png_bytes:
+        telegram_send_message(caption)
+        return
+    try:
+        boundary = "----SpotPumpBoundary7e8a9b"
+        parts = []
+        for k, v in (("chat_id", CHAT_ID), ("caption", caption), ("parse_mode", "HTML")):
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
+            )
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"chart.png\"\r\nContent-Type: image/png\r\n\r\n".encode("utf-8")
+            + png_bytes
+            + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(parts)
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        print(f"[TG sendPhoto hata] {e}")
+        telegram_send_message(caption)
 
-        atr = atr_pct(kl, 14) or 1.5
-        dinamik_esik = max(esik, atr * 1.2)
-        if kp < dinamik_esik * 0.9:
-            log("PUMP", f"{s} {yon}: mum teyidi yok ({kp:.2f}% / gerekli {dinamik_esik:.2f}%)")
+
+def record_pump_and_notify(symbol, base, entry_price, caption, png_bytes=b""):
+    now = time.time()
+    with state_lock:
+        signals_log.append({
+            "id": f"PUMP-{symbol}-{int(now)}",
+            "engine": "PUMP",
+            "symbol": symbol,
+            "base": base,
+            "direction": "LONG",
+            "entry": entry_price,
+            "current": entry_price,
+            "peak_price": entry_price,
+            "peak_pct": 0.0,
+            "created_at": now,
+        })
+        if len(signals_log) > 300:
+            del signals_log[:-300]
+    save_state()
+    if png_bytes:
+        telegram_send_photo(png_bytes, caption)
+    else:
+        telegram_send_message(caption)
+
+
+# ==============================================================================
+# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (TEKIL COIN KILIDI + CANLI 1DK/15SN GRAFIK)
+# ==============================================================================
+def is_pump_locked(base, now):
+    rec = locks["pump"].get(base)
+    if not rec:
+        return False
+    if PUMP_REPEAT_HOURS <= 0:
+        return True
+    return (now - rec["locked_at"]) < PUMP_REPEAT_HOURS * 3600
+
+
+def evaluate_pump(sym, price, vol24h, now):
+    base, quote = extract_base_quote(sym)
+    if not base:
+        return
+    min_vol = 150_000 if quote == "USDT" else (3.0 if quote == "BTC" else 250.0)
+    th_pct = 4.5 if quote == "USDT" else 4.0
+    if price <= 0 or vol24h < min_vol:
+        return
+
+    with state_lock:
+        hist = price_history.setdefault(sym, [])
+        hist.append((now, price))
+        cutoff = now - 420
+        while hist and hist[0][0] < cutoff:
+            hist.pop(0)
+        if len(hist) < 2:
+            return
+        min_pt = min(hist, key=lambda x: x[1])
+        pct = ((price - min_pt[1]) / min_pt[1]) * 100.0 if min_pt[1] > 0 else 0.0
+        if pct < th_pct or is_pump_locked(base, now):
+            return
+        locks["pump"][base] = {"symbol": sym, "locked_at": now}
+        hist_copy = list(hist)
+
+    threading.Thread(
+        target=_verify_and_emit_pump,
+        args=(sym, base, quote, price, vol24h, min_pt, hist_copy),
+        daemon=True,
+    ).start()
+
+
+def _verify_and_emit_pump(sym, base, quote, approx_cur, approx_vol, min_pt, hist_copy):
+    try:
+        live_cur, live_vol = approx_cur, approx_vol
+        try:
+            tk = binance_rest_get(f"/api/v3/ticker/24hr?symbol={urllib.parse.quote(sym)}", timeout=4)
+            if isinstance(tk, dict):
+                live_cur = float(tk.get("lastPrice") or approx_cur)
+                live_vol = float(tk.get("quoteVolume") or approx_vol)
+        except Exception:
+            pass
+
+        c1m = fetch_1m_klines(sym, limit=45)
+        recent_bars = c1m[-7:] if c1m else []
+        bar_min = min((b["low"] for b in recent_bars if b["low"] > 0), default=min_pt[1])
+        verified_min = min(min_pt[1], bar_min)
+        verified_pct = ((live_cur - verified_min) / verified_min) * 100.0
+        th_pct = 4.5 if quote == "USDT" else 4.0
+        if verified_pct < th_pct:
+            with state_lock:
+                locks["pump"].pop(base, None)
             return
 
-        son5 = sum(hacimler[-5:])
-        onceki = hacimler[:-5]
-        if len(onceki) < 10:
-            log("PUMP", f"{s} {yon}: yeterli hacim geçmişi yok"); return
-        ort, std = ewma_stats(onceki, alpha=0.15)
-        son5_avg = son5 / 5
-        if ort <= 0: return
-        carpan = son5_avg / ort
-        z = (son5_avg - ort) / std if std > 0 else 0.0
-        if carpan < PUMP_MIN_CARPAN or son5 < PUMP_MIN_SON5:
-            log("PUMP", f"{s} {yon}: hacim oranı yetersiz ({carpan:.1f}x)"); return
-        if z < PUMP_MIN_Z:
-            log("PUMP", f"{s} {yon}: z-skoru düşük ({z:.1f})"); return
+        with state_lock:
+            price_history.pop(sym, None)
 
-        bitis = time.time() + (PUMP_TEKRAR_SAAT * 3600 if PUMP_TEKRAR_SAAT > 0 else 10 ** 9)
-        sayac[yon] += 1
-        if toplu_kontrol(time.time()): return
+        mins = max(1, round((time.time() - min_pt[0]) / 60))
+        vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
+        tf_label = "1DK CANLI"
+        chart_bars = c1m
+        if not chart_bars or len(chart_bars) < 5:
+            tf_label = "15SN CANLI"
+            buckets = {}
+            for ts_p, pr in hist_copy:
+                bk = (int(ts_p) // 15) * 15
+                if bk not in buckets:
+                    buckets[bk] = {"openTime": bk, "open": pr, "high": pr, "low": pr, "close": pr, "volume": 1.0}
+                else:
+                    b = buckets[bk]
+                    b["high"] = max(b["high"], pr)
+                    b["low"] = min(b["low"], pr)
+                    b["close"] = pr
+                    b["volume"] += 1.0
+            chart_bars = [buckets[k] for k in sorted(buckets.keys())]
 
-        guc_raw = (min(4, kp / max(dinamik_esik, 0.1)) +
-                   min(3, carpan / 2) +
-                   min(2, z / 2) +
-                   min(1, atr / 3))
-        guc = max(1, min(10, round(guc_raw + 1)))
+        png = render_pump_png(sym, tf_label, chart_bars, live_cur, verified_min)
+        caption = (
+            f"⚡ <b>SPOT ANLIK PUMP DEDEKTORU — #{sym}</b>\n\n"
+            f"📈 Degisim: <b>+{verified_pct:.2f}%</b> ({mins} dk icinde!)\n"
+            f"💰 Baslangic: {fmt_price(verified_min)} ➡️ Anlik: <b>{fmt_price(live_cur)}</b>\n"
+            f"💧 24s Parite Hacmi: {vol_str} ({quote})\n"
+            f"🔒 Tekil coin kilidi aktif."
+        )
+        record_pump_and_notify(sym, base, live_cur, caption, png)
+    except Exception:
+        with state_lock:
+            locks["pump"].pop(base, None)
 
-        kaynak = feed_ad.upper()
-        tur = "PUMP"
-        msg = (f"⚡ <b>{kaynak} ANLIK {tur} — #{s}</b>\n\n"
-               f"📈 Değişim: <b>+{kp:.2f}%</b> ({pencere // 60} dk)\n"
-               f"💰 Başlangıç: {fmt_price(ref)} ➡️ Anlık: <b>{fmt_price(p)}</b>\n"
-               f"💧 24s Hacim: {q24:,.0f} USDT\n"
-               f"🔥 Hacim: <b>{carpan:.1f}x</b> (z={z:.1f})\n"
-               f"📊 ATR(14): {atr:.2f}% → Dinamik eşik: {dinamik_esik:.2f}%\n"
-               f"⭐ Sinyal gücü: <b>{guc}/10</b>")
 
-        mumlar = [{"openTime": int(k[0]) // 1000, "open": float(k[1]), "high": float(k[2]),
-                   "low": float(k[3]), "close": float(k[4]), "volume": float(k[7])} for k in kl]
+# ==============================================================================
+# PIK TAKIBI, GUNUN ZAFERI (21:00 TR), TOP 24 SAAT (23:00 TR) & DUYURULAR (60 SN)
+# ==============================================================================
+def update_signal_peaks():
+    changed = False
+    with state_lock:
+        for s in signals_log:
+            tk = tickers.get(s["symbol"])
+            if not tk or tk["price"] <= 0:
+                continue
+            p = tk["price"]
+            s["current"] = p
+            pct = ((p - s["entry"]) / s["entry"]) * 100.0
+            if pct > s.get("peak_pct", 0.0):
+                s["peak_pct"] = round(pct, 2)
+                s["peak_price"] = p
+                changed = True
+    if changed:
+        save_state()
+
+
+def build_victory_report(now_ts=None):
+    now_ts = now_ts or time.time()
+    cutoff = now_ts - 86400
+    with state_lock:
+        recent = [s for s in signals_log if s["created_at"] >= cutoff and s.get("peak_pct", 0.0) >= 3.0]
+    best_by_sym = {}
+    for s in recent:
+        prev = best_by_sym.get(s["symbol"])
+        if not prev or s["peak_pct"] > prev["peak_pct"]:
+            best_by_sym[s["symbol"]] = s
+    ranked = sorted(best_by_sym.values(), key=lambda x: x["peak_pct"], reverse=True)
+    if not ranked:
+        return "🏆 <b>GUNUN ZAFERI (21:00 TR)</b>\n\nSon 24 saatte +%3 ve uzeri pik yapan Spot Pump sinyali henuz olusmadi."
+    lines = ["🏆 <b>GUNUN ZAFERI — SPOT PUMP SIRALAMASI (21:00 TR)</b>\n"]
+    for i, s in enumerate(ranked[:15], 1):
+        lines.append(
+            f"{i}. <b>#{s['symbol']}</b> · <b>+{s['peak_pct']:.2f}%</b> | ${fmt_price(s['entry'])} ➡️ ${fmt_price(s['peak_price'])}"
+        )
+    return "\n".join(lines)
+
+
+def build_top24_report(now_ts=None):
+    now_ts = now_ts or time.time()
+    cutoff = now_ts - 86400
+    with state_lock:
+        recent = [s for s in signals_log if s["created_at"] >= cutoff]
+    best_by_sym = {}
+    for s in recent:
+        prev = best_by_sym.get(s["symbol"])
+        if not prev or s["peak_pct"] > prev["peak_pct"]:
+            best_by_sym[s["symbol"]] = s
+    ranked = sorted(best_by_sym.values(), key=lambda x: x["peak_pct"], reverse=True)
+    if not ranked:
+        return "📊 <b>TOP 24 SAAT OZETI (23:00 TR)</b>\n\nSon 24 saatte kaydedilen Spot Pump sinyali bulunmuyor."
+    lines = ["📊 <b>TOP 24 SAAT SPOT PUMP OZETI (23:00 TR)</b>\n"]
+    for i, s in enumerate(ranked[:20], 1):
+        lines.append(
+            f"{i}. <b>#{s['symbol']}</b> · Pik: <b>+{s['peak_pct']:.2f}%</b> | Anlik: ${fmt_price(s['current'])}"
+        )
+    return "\n".join(lines)
+
+
+def translate_binance_title_tr(title):
+    tr = title.strip()
+    pairs = (
+        ("Binance Will List", "Binance Listeliyor:"),
+        ("Binance Will Add", "Binance Ekliyor:"),
+        ("Binance Will Support", "Binance Destekliyor:"),
+        ("Binance Has Completed the", "Binance Tamamladi:"),
+        ("Binance Futures Will Launch", "Binance Vadeli Baslatiyor:"),
+        ("Token Merge", "Token Birlesmesi (Merge)"),
+        ("Contract Swap", "Kontrat Degisimi (Swap)"),
+        ("Withdrawals Reopened", "Cekim Islemleri Yeniden Acildi"),
+        ("Notice of Removal of Spot Trading Pairs", "Spot Islem Ciftleri Kaldirma (Delist)"),
+        ("Binance Will Delist", "Binance Delist Ediyor:"),
+        ("Network Upgrade", "Ag Guncellemesi"),
+    )
+    for eng, tur in pairs:
+        tr = tr.replace(eng, tur)
+    return tr
+
+
+def poll_binance_announcements():
+    global news_seeded
+    catalogs = ((48, "Yeni Listeleme"), (49, "Binance Duyuru"), (161, "Delist / Kaldirma"))
+    newly = []
+    for cat_id, cat_label in catalogs:
         try:
-            png = render_png(f"{s} | 1DK | {kaynak} {tur} | ${fmt_price(p)}",
-                             mumlar, p, ref, zaman=simdi().strftime("%d.%m %H:%M:%S TR"))
-        except Exception as e:
-            log("PUMP", f"grafik: {e}"); png = b""
-        if tg_foto(png, msg):
-            log("PUMP", f"🔥 {s} (+{kp:.2f}%) güç={guc}/10")
-    except Exception as e:
-        log("PUMP", f"{s} doğrulama hatası: {e}")
-    finally:
-        if alindi: pump_sem.release()
-        with pump_kilit:
-            pump_aktif.discard(key)
-            pump_cd[key] = bitis
+            url = f"https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query?catalogId={cat_id}&pageNo=1&pageSize=8"
+            data = http_get_json(url, timeout=8)
+            arts = data.get("data", {}).get("articles", [])
+            for art in arts:
+                aid = str(art.get("id") or art.get("code") or art.get("title") or "")
+                if not aid or aid in news_seen_ids:
+                    continue
+                news_seen_ids.add(aid)
+                title_orig = str(art.get("title") or "").strip()
+                code = str(art.get("code") or "")
+                link = f"https://www.binance.com/en/support/announcement/detail/{code}" if code else "https://www.binance.com/en/support/announcement"
+                newly.append((cat_label, translate_binance_title_tr(title_orig), link))
+        except Exception:
+            pass
+    if news_seeded and newly:
+        for cat_label, title_tr, link in newly[:5]:
+            telegram_send_message(f"📰 <b>Binance | {cat_label}</b>\n{title_tr}\n{link}")
+    news_seeded = True
 
-# =====================================================
-# WEB SUNUCU + BAŞLAT
-# =====================================================
-class Handler(http.server.BaseHTTPRequestHandler):
+
+# ==============================================================================
+# CANLI PIYASA DONGULERI (WEBSOCKET + REST + ZAMANLAYICI)
+# ==============================================================================
+def process_ticker(sym, price, vol24h, now):
+    if price <= 0 or is_excluded(sym):
+        return
+    base, quote = extract_base_quote(sym)
+    if not base:
+        return
+    with state_lock:
+        tickers[sym] = {
+            "symbol": sym,
+            "base": base,
+            "quote": quote,
+            "price": price,
+            "volume24h": vol24h,
+            "updated_at": now,
+        }
+    evaluate_pump(sym, price, vol24h, now)
+
+
+def ws_stream_loop():
+    global ws_connected
+    host = "stream.binance.com"
+    path = "/ws/!miniTicker@arr"
+    while True:
+        ssock = None
+        try:
+            ctx = ssl.create_default_context()
+            sock = socket.create_connection((host, 9443), timeout=15)
+            ssock = ctx.wrap_socket(sock, server_hostname=host)
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:9443\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            ssock.sendall(req.encode("ascii"))
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = ssock.recv(4096)
+                if not chunk:
+                    raise EOFError("WS handshake EOF")
+                buf += chunk
+            ws_connected = True
+            frame_buf = bytearray(buf.split(b"\r\n\r\n", 1)[1])
+            while True:
+                opcode, payload = _ws_read_frame(ssock, frame_buf)
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    _ws_send_frame(ssock, payload, opcode=0xA)
+                    continue
+                if opcode in (0x1, 0x2):
+                    arr = json.loads(payload.decode("utf-8"))
+                    if isinstance(arr, list):
+                        now = time.time()
+                        for item in arr:
+                            process_ticker(
+                                item.get("s", ""),
+                                float(item.get("c") or 0),
+                                float(item.get("q") or 0),
+                                now,
+                            )
+                        update_signal_peaks()
+        except Exception:
+            ws_connected = False
+            time.sleep(5)
+        finally:
+            try:
+                if ssock:
+                    ssock.close()
+            except Exception:
+                pass
+
+
+def rest_seed_loop():
+    while True:
+        try:
+            raw = binance_rest_get("/api/v3/ticker/24hr", timeout=10)
+            if isinstance(raw, list):
+                now = time.time()
+                for item in raw:
+                    process_ticker(
+                        item.get("symbol", ""),
+                        float(item.get("lastPrice") or 0),
+                        float(item.get("quoteVolume") or 0),
+                        now,
+                    )
+                update_signal_peaks()
+        except Exception:
+            pass
+        time.sleep(25 if ws_connected else 5)
+
+
+def scheduler_and_news_loop():
+    last_news_ts = 0.0
+    while True:
+        now = time.time()
+        if now - last_news_ts >= 60:
+            poll_binance_announcements()
+            last_news_ts = now
+
+        dt = tr_now()
+        today = dt.strftime("%Y-%m-%d")
+        if dt.hour == 21 and locks["reports"].get("victory_day") != today:
+            locks["reports"]["victory_day"] = today
+            save_state()
+            telegram_send_message(build_victory_report(now))
+        if dt.hour == 23 and locks["reports"].get("top24_day") != today:
+            locks["reports"]["top24_day"] = today
+            save_state()
+            telegram_send_message(build_top24_report(now))
+        time.sleep(15)
+
+
+class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"Ultimate Futures Bot is running!")
-    def do_HEAD(self):
-        self.send_response(200); self.end_headers()
-    def log_message(self, *a): return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        body = json.dumps({
+            "ok": True,
+            "ws": ws_connected,
+            "pairs": len(tickers),
+            "engines": ["PUMP"],
+        }).encode("utf-8")
+        self.wfile.write(body)
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    log("SİSTEM", f"WEB SUNUCU - PORT: {port}")
-    server.serve_forever()
+    def log_message(self, format, *args):
+        return
 
-def gozetmen(fn):
-    while True:
-        try:
-            fn(); return
-        except Exception as e:
-            log("GÖZETMEN", f"{getattr(fn, '__name__', 'motor')} çöktü: {e}")
-            time.sleep(30)
 
-def durum_loop():
-    baslangic = time.time(); son_uyari_ws = 0.0
-    while True:
-        time.sleep(30)
-        try:
-            now = time.time()
-            if now - baslangic > 300 and now - son_uyari_ws > 1800:
-                kopuk = [f for f in (FUT, SPOT) if not (f.bagli and now - f.son < 120)]
-                if len(kopuk) == 2:
-                    son_uyari_ws = now
-                    tg(C, "⚠️ <b>Canlı akış kesildi</b>\n" +
-                       "\n".join(f"{f.ad}: {f.son_hata or 'veri yok'}" for f in kopuk))
-        except Exception as e:
-            log("DURUM", f"Hata: {e}")
+def main():
+    load_state()
+    print(f"[Spot Pump Bot] Baslatiliyor... Port={PORT}, ChatID={CHAT_ID}")
+    for fn in (ws_stream_loop, rest_seed_loop, scheduler_and_news_loop):
+        threading.Thread(target=fn, daemon=True).start()
 
-def keepalive_loop():
-    url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-    if not url: return
-    while True:
-        time.sleep(600)
-        try: urllib.request.urlopen(url, timeout=15).read()
-        except Exception: pass
+    srv = http.server.HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    srv.serve_forever()
+
 
 if __name__ == "__main__":
-    threading.Thread(target=run_web_server, daemon=True).start()
-    FUT.dinleyici = pump_isle
-    SPOT.dinleyici = pump_isle
-    for f in (FUT, SPOT):
-        threading.Thread(target=gozetmen, args=(f.calis,), daemon=True).start()
-    for m in (pump_winner_loop, durum_loop, keepalive_loop):
-        threading.Thread(target=gozetmen, args=(m,), daemon=True).start()
-
-    time.sleep(10)
-    satirlar = []
-    for f in (FUT, SPOT):
-        if besleme_taze(f): satirlar.append(f"✅ {f.ad} canlı akış ({len(f.veri)} coin)")
-        else: satirlar.append(f"❌ {f.ad}: {f.son_hata or 'bağlanıyor'}")
-    if aktif_besleme():
-        bilgi = "Canlı akıştan çalışıyor."
-    else:
-        ok, durum = baglanti_testi("fapi")
-        if not ok:
-            ok2, durum2 = baglanti_testi("spot"); durum += "\n" + durum2; ok = ok2
-        satirlar.append(durum)
-        bilgi = "REST ile devam." if ok else "Veri yok, sinyal gelmez."
-    if tg(C, f"🤖 <b>Bot başladı</b> ({simdi().strftime('%d.%m %H:%M')})\n" + "\n".join(satirlar) + f"\n\n{bilgi}"):
-        log("SİSTEM", "Telegram OK.")
-    else:
-        log("SİSTEM", "⚠️ Telegram gönderilemedi!")
-
-    while True:
-        time.sleep(3600)
+    main()
