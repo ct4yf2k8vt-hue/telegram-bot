@@ -432,7 +432,7 @@ def http_get_json(url: str, timeout=9.0):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.3)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.4)",
             "Accept": "application/json",
         },
     )
@@ -564,9 +564,19 @@ def fetch_futures_context_line(symbol: str):
     return " · ".join(parts) if parts else None
 
 
+def _extract_http_err(e):
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+            return f"HTTP {e.code}: {body[:200]}"
+        except Exception:
+            return f"HTTP {e.code}"
+    return str(e)
+
+
 def verify_telegram_token():
     if not BOT_TOKEN:
-        diag_status["last_tg_error"] = "BOT_TOKEN tanimli degil"
+        diag_status["last_tg_error"] = "BOT_TOKEN tanimli degil (Render Environment Variables'a ekleyin)"
         print("[UYARI] BOT_TOKEN tanimli degil! Telegram mesajlari gonderilemez.", flush=True)
         return False
     try:
@@ -580,14 +590,16 @@ def verify_telegram_token():
             tg_send_text(f"✅ <b>Spot Akış Botu aktif!</b> (@{uname}) — WebSocket akışı ve tüm motorlar başladı.")
         return ok
     except Exception as e:
-        diag_status["last_tg_error"] = str(e)
-        print(f"[Telegram getMe Hata] {e}", flush=True)
+        err_msg = _extract_http_err(e)
+        diag_status["last_tg_error"] = err_msg
+        print(f"[Telegram getMe Hata] {err_msg}", flush=True)
         return False
 
 
-def tg_send_text(text: str, chat_id: str = None):
+def tg_send_text(text: str, chat_id: str = None, tag_label: str = "") -> bool:
     if not BOT_TOKEN:
-        return
+        diag_status["last_tg_error"] = "BOT_TOKEN tanimli degil"
+        return False
     target = chat_id or CHAT_ID
     try:
         body = json.dumps(
@@ -607,20 +619,23 @@ def tg_send_text(text: str, chat_id: str = None):
         with urllib.request.urlopen(req, timeout=12) as _:
             pass
         diag_status["last_tg_error"] = ""
+        if tag_label:
+            diag_status["signals_sent"] += 1
+            diag_status["last_signal"] = tag_label
+        return True
     except Exception as e:
-        diag_status["last_tg_error"] = str(e)
-        print(f"[Telegram Hata] sendMessage: {e}", flush=True)
+        err_msg = _extract_http_err(e)
+        diag_status["last_tg_error"] = err_msg
+        print(f"[Telegram Hata] sendMessage: {err_msg}", flush=True)
+        return False
 
 
-def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None, tag_label: str = ""):
-    diag_status["signals_sent"] += 1
-    if tag_label:
-        diag_status["last_signal"] = tag_label
+def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None, tag_label: str = "") -> bool:
     if not BOT_TOKEN:
-        return
+        diag_status["last_tg_error"] = "BOT_TOKEN tanimli degil"
+        return False
     if not png_bytes:
-        tg_send_text(caption, chat_id=chat_id)
-        return
+        return tg_send_text(caption, chat_id=chat_id, tag_label=tag_label)
     target = chat_id or CHAT_ID
     boundary = f"----SpotBotBoundary{int(time.time() * 1000)}"
     parts = []
@@ -645,14 +660,19 @@ def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None, tag_label
         with urllib.request.urlopen(req, timeout=15) as _:
             pass
         diag_status["last_tg_error"] = ""
+        if tag_label:
+            diag_status["signals_sent"] += 1
+            diag_status["last_signal"] = tag_label
+        return True
     except Exception as e:
-        diag_status["last_tg_error"] = str(e)
-        print(f"[Telegram Hata] sendPhoto fallback: {e}", flush=True)
-        tg_send_text(caption, chat_id=target)
+        err_msg = _extract_http_err(e)
+        diag_status["last_tg_error"] = err_msg
+        print(f"[Telegram Hata] sendPhoto fallback: {err_msg}", flush=True)
+        return tg_send_text(caption, chat_id=target, tag_label=tag_label)
 
 
 # ==============================================================================
-# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (TEKIL COIN KILIDI - WEBSOCKET CANLI)
+# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (WEBSOCKET CANLI - REST BAN OLSA BILE CALISIR)
 # ==============================================================================
 def is_pump_locked(base: str, now_ms: int) -> bool:
     rec = locks["pump"].get(base)
@@ -668,39 +688,47 @@ def _verify_and_emit_pump(tk, min_pt):
     base = tk["base"]
     quote = tk["quote"]
     th_pct = 4.5 if quote == "USDT" else 4.0
+    c1m = []
     try:
         c1m = fetch_spot_klines(sym, "1m", 10)
-        live_cur = ticker_map.get(sym, tk)["price"]
-        live_vol = ticker_map.get(sym, tk)["volume24h"]
-        bar_min = min((b["low"] for b in c1m[-7:]), default=min_pt[1])
-        verified_min = min(min_pt[1], bar_min if bar_min > 0 else min_pt[1])
-        verified_pct = ((live_cur - verified_min) / verified_min) * 100.0
-        if verified_pct < th_pct:
-            with state_lock:
-                locks["pump"].pop(base, None)
-            return
+    except Exception:
+        c1m = []
+
+    live_cur = ticker_map.get(sym, tk)["price"]
+    live_vol = ticker_map.get(sym, tk)["volume24h"]
+    bar_min = min((b["low"] for b in c1m[-7:]), default=min_pt[1]) if c1m else min_pt[1]
+    verified_min = min(min_pt[1], bar_min if bar_min > 0 else min_pt[1])
+    verified_pct = ((live_cur - verified_min) / verified_min) * 100.0 if verified_min > 0 else 0.0
+
+    if verified_pct < th_pct:
         with state_lock:
-            price_window_history.pop(sym, None)
-            now_ms = int(time.time() * 1000)
-            signals_today.append({"engine": "PUMP", "symbol": sym, "dir": "LONG", "entry": live_cur, "peak_pct": 0.0, "ts": now_ms})
-        mins = max(1, round((time.time() * 1000 - min_pt[0]) / 60000))
-        vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
-        caption = (
-            f"⚡ <b>SPOT ANLIK PUMP DEDEKTÖRÜ — {sym}</b>\n\n"
-            f"📈 Değişim: <b>+{verified_pct:.2f}%</b> ({mins} dk içinde!)\n"
-            f"💰 Başlangıç: <code>{fmt_price(verified_min)}</code>  ➡️  Anlık: <code>{fmt_price(live_cur)}</code>\n"
-            f"💧 24s Parite Hacmi: {vol_str} ({quote})"
-        )
-        png = render_candlestick_png(
+            locks["pump"].pop(base, None)
+        return
+
+    with state_lock:
+        price_window_history.pop(sym, None)
+        now_ms = int(time.time() * 1000)
+        signals_today.append({"engine": "PUMP", "symbol": sym, "dir": "LONG", "entry": live_cur, "peak_pct": 0.0, "ts": now_ms})
+
+    mins = max(1, round((time.time() * 1000 - min_pt[0]) / 60000))
+    vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
+    caption = (
+        f"⚡ <b>SPOT ANLIK PUMP DEDEKTÖRÜ — {sym}</b>\n\n"
+        f"📈 Değişim: <b>+{verified_pct:.2f}%</b> ({mins} dk içinde!)\n"
+        f"💰 Başlangıç: <code>{fmt_price(verified_min)}</code>  ➡️  Anlık: <code>{fmt_price(live_cur)}</code>\n"
+        f"💧 24s Parite Hacmi: {vol_str} ({quote})"
+    )
+    png = (
+        render_candlestick_png(
             sym, "1DK", c1m,
             levels=[("BAS", verified_min, (250, 204, 21)), ("ANLIK", live_cur, (34, 197, 94))],
             header_note=f"+{verified_pct:.2f}%",
         )
-        tg_send_photo(caption, png, tag_label=f"PUMP {sym}")
-        save_state()
-    except Exception:
-        with state_lock:
-            locks["pump"].pop(base, None)
+        if c1m
+        else b""
+    )
+    tg_send_photo(caption, png, tag_label=f"PUMP {sym}")
+    save_state()
 
 
 def evaluate_pump_for_ticker(tk, now_ms: int):
@@ -1449,6 +1477,23 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path == "/test-telegram":
+            ok = tg_send_text("🔔 <b>Telegram Test Mesajı</b> — Render botu Telegram bağlantısı çalışıyor!")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "sent": ok,
+                        "telegram_token_set": bool(BOT_TOKEN),
+                        "chat_id": CHAT_ID,
+                        "telegram_last_error": diag_status["last_tg_error"],
+                    }
+                ).encode("utf-8")
+            )
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -1460,6 +1505,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "telegram_token_set": bool(BOT_TOKEN),
                 "telegram_bot_ok": diag_status["telegram_bot_ok"],
                 "telegram_last_error": diag_status["last_tg_error"],
+                "chat_id": CHAT_ID,
                 "ws_connected": diag_status["ws_connected"],
                 "ws_host": diag_status["ws_host"],
                 "ws_messages": diag_status["ws_messages"],
