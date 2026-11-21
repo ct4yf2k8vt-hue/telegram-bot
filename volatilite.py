@@ -2,15 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Spot Akis Terminali - Bagimsiz Render Telegram Botu (Sifir Harici Kutuphane)
-Motorlar:
-  1) 0-7 dk Spot Anlik Pump (Tekil Coin Kilidi + Canli 1m Kline Dogrulama)
-  2) W1 ATL (Tum Zamanlarin En Dusugu - Siki Taban Kilidi)
-  3) 4h Akis / Emir Defteri Duvari >=$120K & 24s POC (1D + 3D Trend Onayi)
-  4) & 5) Gunun Zaferi (21:00 TR) & TOP 24 Saat (23:00 TR) Canli Pik Raporlari
-  6) 1G MA200 Kirilimi (Klasik SMA200 - Sessiz Tohumlama + Canli Kirilim)
-  7) StormGain PRO (365G YEAR & 30G MONTH Max/Min + RVOL + 4h MACD/RSI + Taker Baskisi + 48s Kilit)
-  8) Parabolik Tukenme / Pump Tepesi Donusu (EXHAUST - 15dk RSI/Fitil/Taker + Siki Stop + 24s Kilit)
-  9) Binance Resmi Duyurular & Haberler (48, 49, 161)
 """
 
 import os
@@ -33,11 +24,11 @@ PUMP_REPEAT_HOURS = float(os.environ.get("PUMP_REPEAT_HOURS", "0"))
 STATE_FILE = "/tmp/spot_bot_state.json"
 
 BINANCE_MIRRORS = [
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
-    "https://data-api.binance.vision",
 ]
 preferred_mirror_idx = 0
 mirror_lock = threading.Lock()
@@ -52,6 +43,14 @@ atl_weekly_cache = {}
 news_seen_ids = set()
 news_initial_seeded = False
 report_sent_days = {"victory": "", "top24": ""}
+
+diag_status = {
+    "signals_sent": 0,
+    "last_signal": "",
+    "last_tg_error": "",
+    "last_binance_error": "",
+    "telegram_bot_ok": False,
+}
 
 locks = {
     "pump": {},
@@ -399,7 +398,7 @@ def load_state():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if isinstance(raw.get("locks"), dict):
-            for k in ("pump", "atl", "flow", "ma200", "year", "exhaust"):
+            for k in ("pump", "atl", "flow", "ma200", "month", "year", "exhaust"):
                 if isinstance(raw["locks"].get(k), dict):
                     locks[k] = raw["locks"][k]
         if isinstance(raw.get("signals_today"), list):
@@ -411,11 +410,11 @@ def load_state():
 # ==============================================================================
 # HTTP / BINANCE STICKY MIRROR & TELEGRAM ILETISIM
 # ==============================================================================
-def http_get_json(url: str, timeout=8.0):
+def http_get_json(url: str, timeout=9.0):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.1)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotFlowBot/2.2)",
             "Accept": "application/json",
         },
     )
@@ -423,7 +422,7 @@ def http_get_json(url: str, timeout=8.0):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def fetch_binance_json(path_and_query: str, timeout=8.0):
+def fetch_binance_json(path_and_query: str, timeout=9.0):
     global preferred_mirror_idx
     last_err = None
     n = len(BINANCE_MIRRORS)
@@ -437,10 +436,14 @@ def fetch_binance_json(path_and_query: str, timeout=8.0):
             with mirror_lock:
                 if preferred_mirror_idx != idx:
                     preferred_mirror_idx = idx
-                    print(f"[Binance Mirror] Aktif ayna secildi: {m}", flush=True)
+                    print(f"[Binance Mirror] Aktif ayna: {m}", flush=True)
+            diag_status["last_binance_error"] = ""
             return data
         except Exception as e:
             last_err = e
+            if "429" in str(e):
+                time.sleep(2.0)
+    diag_status["last_binance_error"] = str(last_err)
     raise last_err or RuntimeError("Binance mirrors unreachable")
 
 
@@ -516,6 +519,27 @@ def fetch_futures_context_line(symbol: str):
     return " · ".join(parts) if parts else None
 
 
+def verify_telegram_token():
+    if not BOT_TOKEN:
+        diag_status["last_tg_error"] = "BOT_TOKEN tanimli degil"
+        print("[UYARI] BOT_TOKEN tanimli degil! Telegram mesajlari gonderilemez.", flush=True)
+        return False
+    try:
+        res = http_get_json(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=8.0)
+        ok = bool(res.get("ok"))
+        diag_status["telegram_bot_ok"] = ok
+        if ok:
+            diag_status["last_tg_error"] = ""
+            uname = (res.get("result") or {}).get("username", "bot")
+            print(f"[Telegram] Baglanti basarili: @{uname}", flush=True)
+            tg_send_text(f"✅ <b>Spot Akış Botu aktif!</b> (@{uname}) — Tüm motorlar taramaya başladı.")
+        return ok
+    except Exception as e:
+        diag_status["last_tg_error"] = str(e)
+        print(f"[Telegram getMe Hata] {e}", flush=True)
+        return False
+
+
 def tg_send_text(text: str, chat_id: str = None):
     if not BOT_TOKEN:
         return
@@ -535,13 +559,18 @@ def tg_send_text(text: str, chat_id: str = None):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as _:
+        with urllib.request.urlopen(req, timeout=12) as _:
             pass
+        diag_status["last_tg_error"] = ""
     except Exception as e:
+        diag_status["last_tg_error"] = str(e)
         print(f"[Telegram Hata] sendMessage: {e}", flush=True)
 
 
-def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None):
+def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None, tag_label: str = ""):
+    diag_status["signals_sent"] += 1
+    if tag_label:
+        diag_status["last_signal"] = tag_label
     if not BOT_TOKEN:
         return
     if not png_bytes:
@@ -570,7 +599,9 @@ def tg_send_photo(caption: str, png_bytes: bytes, chat_id: str = None):
         )
         with urllib.request.urlopen(req, timeout=15) as _:
             pass
+        diag_status["last_tg_error"] = ""
     except Exception as e:
+        diag_status["last_tg_error"] = str(e)
         print(f"[Telegram Hata] sendPhoto fallback: {e}", flush=True)
         tg_send_text(caption, chat_id=target)
 
@@ -607,16 +638,7 @@ def _verify_and_emit_pump(tk, min_pt):
         with state_lock:
             price_window_history.pop(sym, None)
             now_ms = int(time.time() * 1000)
-            signals_today.append(
-                {
-                    "engine": "PUMP",
-                    "symbol": sym,
-                    "dir": "LONG",
-                    "entry": live_cur,
-                    "peak_pct": 0.0,
-                    "ts": now_ms,
-                }
-            )
+            signals_today.append({"engine": "PUMP", "symbol": sym, "dir": "LONG", "entry": live_cur, "peak_pct": 0.0, "ts": now_ms})
         mins = max(1, round((time.time() * 1000 - min_pt[0]) / 60000))
         vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
         caption = (
@@ -626,13 +648,11 @@ def _verify_and_emit_pump(tk, min_pt):
             f"💧 24s Parite Hacmi: {vol_str} ({quote})"
         )
         png = render_candlestick_png(
-            sym,
-            "1DK",
-            c1m,
+            sym, "1DK", c1m,
             levels=[("BAS", verified_min, (250, 204, 21)), ("ANLIK", live_cur, (34, 197, 94))],
             header_note=f"+{verified_pct:.2f}%",
         )
-        tg_send_photo(caption, png)
+        tg_send_photo(caption, png, tag_label=f"PUMP {sym}")
         save_state()
     except Exception:
         with state_lock:
@@ -664,7 +684,7 @@ def evaluate_pump_for_ticker(tk, now_ms: int):
 
 
 # ==============================================================================
-# MOTOR 2, 3, 6, 7, EXHAUST: YAPISAL & YON KILITLI TARAMA
+# MOTOR 2, 3, 6, 7, EXHAUST: YAPISAL & YON KILITLI TARAMA (TEKRAR ISTEK YOK)
 # ==============================================================================
 def scan_structural_pair(tk):
     if tk["quote"] != "USDT" or tk["volume24h"] < 1_500_000:
@@ -673,9 +693,13 @@ def scan_structural_pair(tk):
     cur = tk["price"]
     now_ms = int(time.time() * 1000)
 
-    # 1) MOTOR 6: 1G MA200 (Klasik SMA200 - Sessiz tohumlama + Anlik kirilim)
+    c1d_shared = []
+    c15m_shared = []
+
+    # 1) MOTOR 6: 1G MA200 & STORMGAIN PRO (YEAR / MONTH)
     try:
         c1d = fetch_spot_klines(sym, "1d", 370)
+        c1d_shared = c1d
         if len(c1d) >= 203:
             closes = [b["close"] for b in c1d]
             closes[-1] = cur
@@ -704,16 +728,12 @@ def scan_structural_pair(tk):
                             f"🔒 Kilit aktif: Ters kırılım gelene kadar tekrar sinyal üretilmez."
                         )
                         png = render_candlestick_png(
-                            sym,
-                            "1G MA200",
-                            c1d[-80:],
+                            sym, "1G MA200", c1d[-80:],
                             levels=[("MA200", ma_live, (56, 189, 248)), ("ANLIK", cur, (34, 197, 94) if new_pos == "ABOVE" else (239, 68, 68))],
-                            ma_series=sma200[-80:],
-                            header_note=f"MA200 {diff_pct:+.2f}%",
+                            ma_series=sma200[-80:], header_note=f"MA200 {diff_pct:+.2f}%",
                         )
-                        tg_send_photo(caption, png)
+                        tg_send_photo(caption, png, tag_label=f"MA200 {sym} {new_pos}")
 
-        # 1B) STORMGAIN PRO MOTORU: 365G (YEAR) & 30G (MONTH) + 5-FAKTOR MOMENTUM/HACIM ONAYI
         if tk["volume24h"] >= 15_000_000 and len(c1d) >= 60:
             cooldown_ms = 48 * 3600 * 1000
             prior30 = c1d[-31:-1]
@@ -822,26 +842,24 @@ def scan_structural_pair(tk):
                         lbl_hi = "365MAX" if is_year else "30MAX"
                         lbl_lo = "365MIN" if is_year else "30MIN"
                         png = render_candlestick_png(
-                            sym,
-                            "1G",
-                            c1d[-80:],
+                            sym, "1G", c1d[-80:],
                             levels=[(lbl_hi, hi_lvl, (34, 197, 94)), (lbl_lo, lo_lvl, (239, 68, 68)), ("ANLIK", cur, (56, 189, 248))],
                             header_note=tag.upper(),
                         )
-                        tg_send_photo(caption, png)
-    except Exception:
-        pass
+                        tg_send_photo(caption, png, tag_label=f"{scope} {sym} {c_dir}")
+    except Exception as e:
+        print(f"[{sym} MA200/StormGain Hata] {e}", flush=True)
 
-    # 2) MOTOR 3: 4h Akis / Emir Defteri Duvari & POC (1D + 3D Trend Onayli)
+    # 2) MOTOR 3: 4h Akis / Emir Defteri Duvari & POC (c1d_shared yeniden kullanilir)
     try:
-        if tk["volume24h"] >= 2_500_000:
+        if tk["volume24h"] >= 2_500_000 and len(c1d_shared) >= 7:
             depth = fetch_binance_json(f"/api/v3/depth?symbol={urllib.parse.quote(sym)}&limit=100", timeout=7.0)
             c15m = fetch_spot_klines(sym, "15m", 96)
+            c15m_shared = c15m
             c4h = fetch_spot_klines(sym, "4h", 56)
-            c1d_s = fetch_spot_klines(sym, "1d", 12)
             c3d_s = fetch_spot_klines(sym, "3d", 12)
-            if len(c15m) >= 40 and len(c4h) >= 28 and len(c1d_s) >= 7 and len(c3d_s) >= 5:
-                ma1d = sum(b["close"] for b in c1d_s[-7:]) / 7.0
+            if len(c15m) >= 40 and len(c4h) >= 28 and len(c3d_s) >= 5:
+                ma1d = sum(b["close"] for b in c1d_shared[-7:]) / 7.0
                 trend1d = "LONG" if cur >= ma1d else "SHORT"
                 ma3d = sum(b["close"] for b in c3d_s[-5:]) / 5.0
                 trend3d = "LONG" if cur >= ma3d else "SHORT"
@@ -903,9 +921,7 @@ def scan_structural_pair(tk):
                             f"🔑 Anahtar Tetik: {fmt_price(trigger)} {'altında' if bias == 'SHORT' else 'üstünde'} kalıcılık"
                         )
                         png = render_candlestick_png(
-                            sym,
-                            "4S",
-                            c4h,
+                            sym, "4S", c4h,
                             levels=[
                                 ("TP1", tp1, (34, 197, 94)),
                                 ("TP2", tp2, (16, 185, 129)),
@@ -915,9 +931,9 @@ def scan_structural_pair(tk):
                             ],
                             header_note=bias,
                         )
-                        tg_send_photo(caption, png)
-    except Exception:
-        pass
+                        tg_send_photo(caption, png, tag_label=f"FLOW {sym} {bias}")
+    except Exception as e:
+        print(f"[{sym} FLOW Hata] {e}", flush=True)
 
     # 3) MOTOR 2: W1 ATL (Siki Taban Kilidi)
     try:
@@ -944,17 +960,15 @@ def scan_structural_pair(tk):
                     f"🔒 Kilit aktif: ${fmt_price(cur)} altına düşmedikçe tekrar gelmez."
                 )
                 png = render_candlestick_png(
-                    sym,
-                    "1S ATL",
-                    c1h_atl,
+                    sym, "1S ATL", c1h_atl,
                     levels=[("ATL", floor_atl, (250, 204, 21)), ("ANLIK", cur, (239, 68, 68))],
                     header_note="W1 ATL",
                 )
-                tg_send_photo(caption, png)
-    except Exception:
-        pass
+                tg_send_photo(caption, png, tag_label=f"ATL {sym}")
+    except Exception as e:
+        print(f"[{sym} ATL Hata] {e}", flush=True)
 
-    # 4) MOTOR EXHAUST: PARABOLIK TUKENME / PUMP TEPESI DONUSU (SHORT / Kar Al Uyarisi - 24s Kilitli)
+    # 4) MOTOR EXHAUST: PARABOLIK TUKENME (c15m_shared varsa yeniden kullan)
     try:
         prev_exh = locks["exhaust"].get(sym)
         exh_cooldown_ms = 24 * 3600 * 1000
@@ -965,7 +979,7 @@ def scan_structural_pair(tk):
             and (tk["high24h"] * 0.945 <= cur <= tk["high24h"] * 0.997)
             and (not prev_exh or (now_ms - prev_exh["lockedAt"]) >= exh_cooldown_ms)
         ):
-            c15m = fetch_spot_klines(sym, "15m", 40)
+            c15m = c15m_shared[-40:] if len(c15m_shared) >= 40 else fetch_spot_klines(sym, "15m", 40)
             if len(c15m) >= 24:
                 recent16 = c15m[-17:]
                 swing_low = min(b["low"] for b in recent16[:-1])
@@ -1021,9 +1035,7 @@ def scan_structural_pair(tk):
                             + "🔒 24 saatlik kilit aktif · Spotta kâr al / Vadelide tepe dönüşü uyarısı."
                         )
                         png = render_candlestick_png(
-                            sym,
-                            "15DK TEPE",
-                            c15m[-40:],
+                            sym, "15DK TEPE", c15m[-40:],
                             levels=[
                                 ("TP1", tp1, (34, 197, 94)),
                                 ("TP2", tp2, (16, 185, 129)),
@@ -1032,9 +1044,9 @@ def scan_structural_pair(tk):
                             ],
                             header_note="TEPE TUKENME",
                         )
-                        tg_send_photo(caption, png)
-    except Exception:
-        pass
+                        tg_send_photo(caption, png, tag_label=f"EXHAUST {sym}")
+    except Exception as e:
+        print(f"[{sym} EXHAUST Hata] {e}", flush=True)
 
 
 # ==============================================================================
@@ -1125,7 +1137,7 @@ def poll_binance_news():
 
 
 # ==============================================================================
-# ANA DONGULER & RENDER KEEP-ALIVE SUNUCUSU
+# ANA DONGULER & RENDER KEEP-ALIVE SUNUCUSU (HEAD + GET DESTEKLI)
 # ==============================================================================
 def ticker_pump_loop():
     while True:
@@ -1159,7 +1171,7 @@ def ticker_pump_loop():
                 check_daily_reports()
         except Exception as e:
             print(f"[Ticker Loop Hata] {e}", flush=True)
-        time.sleep(3)
+        time.sleep(5)
 
 
 def structure_loop():
@@ -1173,17 +1185,17 @@ def structure_loop():
             )[:500]
             if liquid:
                 batch = []
-                for _ in range(min(8, len(liquid))):
+                for _ in range(min(5, len(liquid))):
                     batch.append(liquid[cursor % len(liquid)])
                     cursor += 1
                 threads = [threading.Thread(target=scan_structural_pair, args=(t,), daemon=True) for t in batch]
                 for th in threads:
                     th.start()
                 for th in threads:
-                    th.join(timeout=18)
-        except Exception:
-            pass
-        time.sleep(4)
+                    th.join(timeout=20)
+        except Exception as e:
+            print(f"[Structure Loop Hata] {e}", flush=True)
+        time.sleep(5)
 
 
 def news_loop():
@@ -1193,6 +1205,11 @@ def news_loop():
 
 
 class HealthHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1200,9 +1217,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         body = json.dumps(
             {
                 "ok": True,
-                "telegram": bool(BOT_TOKEN),
+                "telegram_token_set": bool(BOT_TOKEN),
+                "telegram_bot_ok": diag_status["telegram_bot_ok"],
+                "telegram_last_error": diag_status["last_tg_error"],
+                "binance_last_error": diag_status["last_binance_error"],
                 "mirror": BINANCE_MIRRORS[preferred_mirror_idx],
                 "pairs": len(ticker_map),
+                "signals_sent": diag_status["signals_sent"],
+                "last_signal": diag_status["last_signal"],
                 "locks": {k: len(v) for k, v in locks.items()},
             }
         ).encode("utf-8")
@@ -1213,14 +1235,13 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not BOT_TOKEN:
-        print("[UYARI] BOT_TOKEN tanimli degil! Telegram mesajlari gonderilemez.", flush=True)
     load_state()
+    verify_telegram_token()
     threading.Thread(target=ticker_pump_loop, daemon=True).start()
     threading.Thread(target=structure_loop, daemon=True).start()
     threading.Thread(target=news_loop, daemon=True).start()
     srv = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"[SpotFlowBot] Port {PORT} aktif | Telegram: {bool(BOT_TOKEN)} | CHAT_ID: {CHAT_ID}", flush=True)
+    print(f"[SpotFlowBot] Port {PORT} aktif | TokenSet: {bool(BOT_TOKEN)} | CHAT_ID: {CHAT_ID}", flush=True)
     srv.serve_forever()
 
 
