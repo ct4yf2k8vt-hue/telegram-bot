@@ -5,6 +5,7 @@ Spot Akis Terminali - Render Python 3 Telegram Botu (Zero-Dependency)
 Aktif Sinyal Motorlari:
   1. 0-7 dk Spot Anlik Pump (PUMP) - Tekil Coin Kilidi + Canli 1dk/15sn Grafik
   2. 15 dk Yapi Kirilimi (YAPI) - Onceki tepe/dip kirilimi (MSS) + Canli 15dk Grafik
+  3. Gunun Kazanani (6 saatte bir) - 24s en cok yukselen coin + Canli 1G Grafik
 Otomatik Ozet & Duyurular:
   - Gunun Zaferi (21:00 TR)
   - Top 24 Saat Ozeti (23:00 TR)
@@ -145,6 +146,25 @@ def fmt_price(p):
     if p >= 0.0001:
         return f"{p:.6f}".rstrip("0").rstrip(".")
     return f"{p:.8f}".rstrip("0").rstrip(".")
+
+
+def akilli_fiyat(p):
+    if p is None:
+        return "0"
+    p = float(p)
+    if p >= 1000:
+        return f"{p:.2f}"
+    if p >= 1:
+        return f"{p:.4f}"
+    if p >= 0.01:
+        return f"{p:.6f}"
+    return f"{p:.8f}"
+
+
+def _chg_from_open(item):
+    o = float(item.get("o") or 0)
+    c = float(item.get("c") or 0)
+    return (c - o) / o * 100.0 if o > 0 else 0.0
 
 
 def tr_now():
@@ -928,6 +948,57 @@ def yapi_loop():
 
 
 # ==============================================================================
+# MOTOR 3: GUNUN KAZANANI (24s en cok yukselen coin + canli 1G mum grafigi)
+# ==============================================================================
+WINNER_ARALIGI = 21600        # 6 saatte bir
+WINNER_MIN_DEGISIM = 15.0     # 24s en az %15 yukselis yoksa mesaj yok
+WINNER_MIN_HACIM = 10_000_000
+
+
+def winner_loop():
+    print("[KAZANAN] Gunun Kazanani motoru basladi.", flush=True)
+    time.sleep(60)
+    while True:
+        try:
+            with state_lock:
+                adaylar = [dict(tk) for tk in tickers.values()
+                           if tk["quote"] == "USDT" and tk["volume24h"] >= WINNER_MIN_HACIM]
+            if len(adaylar) < 20:
+                time.sleep(30)
+                continue
+            adaylar.sort(key=lambda x: x.get("chg", 0.0), reverse=True)
+            w = adaylar[0]
+            if w.get("chg", 0.0) < WINNER_MIN_DEGISIM:
+                time.sleep(WINNER_ARALIGI)
+                continue
+            sym = w["symbol"]
+            kl = fetch_klines(sym, "1d", 45)
+            if len(kl) < 5:
+                time.sleep(300)
+                continue
+            day_low, day_high, day_open = kl[-1]["low"], kl[-1]["high"], kl[-1]["open"]
+            live = w["price"]
+            max_move = ((day_high - day_low) / day_low) * 100 if day_low > 0 else 0.0
+            msg = (f"🏆 <b>GÜNÜN KAZANANI: {sym}</b>\n\n"
+                   f"🔥 24 saat içinde en çok yükselen coin!\n\n"
+                   f"📉 <b>Dip Fiyat:</b> {akilli_fiyat(day_low)}\n"
+                   f"🚀 <b>Zirve Fiyat:</b> {akilli_fiyat(day_high)}\n"
+                   f"📈 <b>Maksimum Yükseliş:</b> <b>+{max_move:.1f}%</b>\n\n"
+                   f"💡 <b>Değerlendirme:</b> {sym} gün içerisinde muazzam bir hacim ve fiyat patlaması yaşadı. "
+                   f"Pump Dedektör verilerimize göre günün en kârlı hareketi bu coinde gerçekleşti.")
+            try:
+                png = render_pump_png(sym, "1G CANLI", kl, live, day_open, tur="GUNUN KAZANANI", cizgi="BAS")
+            except Exception as e:
+                print(f"[KAZANAN] grafik hatasi: {e}", flush=True)
+                png = b""
+            telegram_send_photo(png, msg)
+            time.sleep(WINNER_ARALIGI)
+        except Exception as e:
+            print(f"[KAZANAN] hata: {e}", flush=True)
+            time.sleep(60)
+
+
+# ==============================================================================
 # PIK TAKIBI, GUNUN ZAFERI (21:00 TR), TOP 24 SAAT (23:00 TR) & DUYURULAR (60 SN)
 # ==============================================================================
 def update_signal_peaks():
@@ -1039,7 +1110,7 @@ def poll_binance_announcements():
 # ==============================================================================
 # CANLI PIYASA DONGULERI (WEBSOCKET + REST + ZAMANLAYICI)
 # ==============================================================================
-def process_ticker(sym, price, vol24h, now):
+def process_ticker(sym, price, vol24h, now, chg=0.0):
     if price <= 0 or is_excluded(sym):
         return
     base, quote = extract_base_quote(sym)
@@ -1052,6 +1123,7 @@ def process_ticker(sym, price, vol24h, now):
             "quote": quote,
             "price": price,
             "volume24h": vol24h,
+            "chg": chg,
             "updated_at": now,
         }
     evaluate_pump(sym, price, vol24h, now)
@@ -1104,6 +1176,7 @@ def ws_stream_loop():
                                 float(item.get("c") or 0),
                                 float(item.get("q") or 0),
                                 now,
+                                _chg_from_open(item),
                             )
                         update_signal_peaks()
         except Exception:
@@ -1129,6 +1202,7 @@ def rest_seed_loop():
                         float(item.get("lastPrice") or 0),
                         float(item.get("quoteVolume") or 0),
                         now,
+                        float(item.get("priceChangePercent") or 0.0),
                     )
                 update_signal_peaks()
         except Exception:
@@ -1167,7 +1241,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             "ws": ws_connected,
             "pairs": len(tickers),
             "yapi_izlenen": len(struct_levels),
-            "engines": ["PUMP", "YAPI"],
+            "engines": ["PUMP", "YAPI", "KAZANAN"],
         }).encode("utf-8")
         self.wfile.write(body)
 
@@ -1182,7 +1256,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
 def main():
     load_state()
     print(f"[Spot Pump Bot] Baslatiliyor... Port={PORT}, ChatID={CHAT_ID}")
-    for fn in (ws_stream_loop, rest_seed_loop, scheduler_and_news_loop, yapi_loop):
+    for fn in (ws_stream_loop, rest_seed_loop, scheduler_and_news_loop, yapi_loop, winner_loop):
         threading.Thread(target=fn, daemon=True).start()
 
     srv = http.server.HTTPServer(("0.0.0.0", PORT), HealthHandler)
