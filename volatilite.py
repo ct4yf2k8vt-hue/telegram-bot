@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Binance Spot Anlık Pump Dedektörü — Render / Standalone Telegram Bot (Zero Dependencies)
+Binance Spot Anlık Pump Dedektörü & Canlı Piyasa Radarı — Render / Standalone Telegram Bot
 - Sadece Motor #1 (Spot Anlık Pump: 15dk Hacimli Mum Patlaması + 0-7dk Ani Pump) sinyal üretir.
 - 2 Saatlik Dalga Kilidi (PUMP_REPEAT_HOURS, varsayılan 2) ile aynı dalgada spam önler,
-  fakat PARTIUSDT örneğindeki gibi saatler sonra gelen ikinci kırılım dalgasını kaçırmaz.
+  ikinci kırılım dalgasını kaçırmaz.
+- Yalnızca aktif TRADING durumundaki güncel pariteleri tarar (BREAK / delist / donmuş pariteleri eler).
+- /piyasa (ve inline butonlar: 7dk % | 24s % | Hacim | Güncelle) + /piyasagorsel ile
+  Anlık Spot Piyasa ekranını Telegram içinde canlı kullanabilirsiniz.
 - Ek Telegram Yardımcıları: 21:00 TR Günün Zaferi (>= %3), 23:00 TR Top 24 Özeti, 60sn Binance Duyuruları.
 """
 
@@ -63,15 +66,17 @@ last_scan_at = 0.0
 scan_loops = 0
 preferred_mirror_idx = 0
 
+# Yalnızca aktif spot TRADING pariteleri (/api/v3/exchangeInfo)
+active_trading_symbols = set()
 # { symbol: [ (ts_sec, price), ... ] } -> 15 dakikalik canli fiyat penceresi
 price_history = {}
 # { symbol: retry_ts } -> RVOL/mum dogrulamasi gecemeyenler icin 20sn bekleme
 verify_cooldown = {}
-# { symbol: { "price": float, "vol24h": float, "chg24h": float, "quote": str, "base": str } }
+# { symbol: { "symbol", "base", "quote", "price", "chg24h", "vol24h", "window7mPct", "updatedAt" } }
 latest_tickers = {}
 # { base: { "base": str, "symbol": str, "lockedAt": float } }
 pump_locks = {}
-# Son 48 saat sinyaller: [ { id, symbol, base, quote, entryPrice, currentPrice, peakPrice, peakPct, createdAt, mode, rvol } ]
+# Son 48 saat sinyaller
 tracked_signals = []
 # Binance resmi duyuru ID seti
 seen_news_ids = set()
@@ -149,6 +154,16 @@ def fmt_price(p):
     return f"{p:.8f}".rstrip("0").rstrip(".")
 
 
+def fmt_compact_usd(v):
+    if v >= 1_000_000_000:
+        return f"${v / 1_000_000_000:.1f}B"
+    if v >= 1_000_000:
+        return f"${v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"${round(v / 1_000)}K"
+    return f"${round(v)}"
+
+
 def compute_sma(values, period):
     out = [None] * len(values)
     if len(values) < period:
@@ -168,7 +183,7 @@ def http_get_json(url, timeout=9):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotPumpBot/2.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotPumpBot/2.1)",
             "Accept": "application/json",
         },
     )
@@ -189,6 +204,26 @@ def fetch_binance_json(path_and_query, timeout=9):
         except Exception as exc:
             last_err = exc
     raise RuntimeError(f"Binance mirror error: {last_err}")
+
+
+def refresh_active_trading_symbols():
+    global active_trading_symbols
+    try:
+        info = fetch_binance_json("/api/v3/exchangeInfo", timeout=12)
+        next_set = set()
+        for s in info.get("symbols") or []:
+            sym = s.get("symbol")
+            if sym and s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", True):
+                next_set.add(sym)
+        if len(next_set) > 50:
+            with state_lock:
+                active_trading_symbols = next_set
+                for sym in list(latest_tickers.keys()):
+                    if sym not in active_trading_symbols:
+                        latest_tickers.pop(sym, None)
+                        price_history.pop(sym, None)
+    except Exception:
+        pass
 
 
 def fetch_spot_klines(symbol, interval="15m", limit=65):
@@ -223,18 +258,33 @@ def tg_request(method, payload=None, timeout=12):
         return None
 
 
-def tg_send_message(text, chat_id=None):
+def tg_send_message(text, chat_id=None, reply_markup=None):
     if not BOT_TOKEN:
         return None
-    return tg_request(
-        "sendMessage",
-        {
-            "chat_id": chat_id or CHAT_ID,
-            "text": text[:3900],
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-    )
+    payload = {
+        "chat_id": chat_id or CHAT_ID,
+        "text": text[:3900],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_request("sendMessage", payload)
+
+
+def tg_edit_message(chat_id, message_id, text, reply_markup=None):
+    if not BOT_TOKEN:
+        return None
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text[:3900],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_request("editMessageText", payload)
 
 
 def tg_send_photo(png_bytes, caption, chat_id=None):
@@ -255,7 +305,7 @@ def tg_send_photo(png_bytes, caption, chat_id=None):
     parts.append(
         (
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="photo"; filename="pump_chart.png"\r\n'
+            f'Content-Disposition: form-data; name="photo"; filename="chart.png"\r\n'
             f"Content-Type: image/png\r\n\r\n"
         ).encode("utf-8")
     )
@@ -277,7 +327,7 @@ def tg_send_photo(png_bytes, caption, chat_id=None):
 
 
 # ==============================================================================
-# SIFIR BAGIMLILIKLI PNG GRAFIK MOTORU (PARTIUSDT REFERANSLI: 15DK + MA7 + MA25 + VOL)
+# SIFIR BAGIMLILIKLI PNG GRAFIK MOTORU (MUM + MA7 + MA25 + VOL & ANLIK SPOT PIYASA)
 # ==============================================================================
 FONT_5X7 = {
     "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
@@ -316,6 +366,7 @@ FONT_5X7 = {
     "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
     "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
     "Z": ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+    "$": ["00100", "01111", "10100", "01110", "00101", "11110", "00100"],
     ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
     ",": ["00000", "00000", "00000", "00000", "00100", "00100", "01000"],
     ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
@@ -406,6 +457,10 @@ class PixelCanvas:
                             self.fill_rect(cx + gx * scale, cy + gy * scale, scale, scale, col)
             cx += 6 * scale
 
+    def draw_text_right(self, right_x, y, text, col=(226, 232, 240), scale=1):
+        w = len(text) * 6 * scale
+        self.draw_text(right_x - w, y, text, col=col, scale=scale)
+
     def to_png(self):
         def chunk(tag, data):
             return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
@@ -470,7 +525,6 @@ def render_pump_png(symbol, base_price, live_cur, pct_change, rvol, candles_15m=
     if len(bars) < 3:
         bars, tf_label = build_synthetic_ws_bars(symbol, live_cur, base_price)
 
-    # Son mumu anlik fiyata bagla ve MA(7) / MA(25) hesapla
     bars = [dict(b) for b in bars]
     if bars:
         bars[-1]["c"] = live_cur
@@ -579,6 +633,133 @@ def render_pump_png(symbol, base_price, live_cur, pct_change, rvol, candles_15m=
         cx = int(PAD_L + (idx + 0.5) * step)
         dt = datetime.fromtimestamp(bars[idx]["t"], tz=TR_TZ)
         c.draw_text(cx - 14, H - 18, dt.strftime("%H:%M"), col=(148, 163, 184), scale=1)
+
+    return c.to_png()
+
+
+# ==============================================================================
+# ANLIK SPOT PIYASA RADARI (IMG_3153 KARTI + CANLI VERILER + PNG)
+# ==============================================================================
+def get_live_spot_market_rows(sort_by="change24h", limit=12, query=""):
+    with state_lock:
+        rows = [
+            dict(tk)
+            for tk in latest_tickers.values()
+            if tk.get("quote") == "USDT" and tk.get("price", 0) > 0 and tk.get("vol24h", 0) >= 150_000.0
+        ]
+    q = (query or "").strip().upper()
+    if q:
+        rows = [r for r in rows if q in r["symbol"] or q in r["base"]]
+
+    if sort_by == "window7m":
+        rows.sort(key=lambda r: (r.get("window7mPct", 0.0), r.get("chg24h", 0.0)), reverse=True)
+    elif sort_by == "volume":
+        rows.sort(key=lambda r: r.get("vol24h", 0.0), reverse=True)
+    else:
+        rows.sort(key=lambda r: (r.get("chg24h", 0.0), r.get("vol24h", 0.0)), reverse=True)
+    return rows[:limit]
+
+
+def build_spot_market_text(sort_by="change24h", query=""):
+    rows = get_live_spot_market_rows(sort_by=sort_by, limit=12, query=query)
+    now_str = datetime.now(TR_TZ).strftime("%H:%M:%S")
+    sort_labels = {
+        "change24h": "24s %",
+        "window7m": "7dk %",
+        "volume": "Hacim",
+    }
+    sort_label = sort_labels.get(sort_by, "24s %")
+
+    if not rows:
+        return (
+            f"📊 <b>ANLIK SPOT PİYASA</b> ({sort_label} · {now_str} TR)\n"
+            f"Canlı TRADING verileri yükleniyor, birkaç saniye sonra tekrar deneyin."
+        )
+
+    lines = [
+        f"📊 <b>ANLIK SPOT PİYASA</b> · <i>{sort_label}</i> · <code>{now_str} TR</code>",
+        "<i>Yalnızca anlık aktif TRADING USDT pariteleri</i>\n",
+    ]
+    for r in rows:
+        p_str = fmt_price(r["price"])
+        v_str = fmt_compact_usd(r["vol24h"])
+        w7 = r.get("window7mPct", 0.0)
+        c24 = r.get("chg24h", 0.0)
+        w7_str = f"{'+' if w7 >= 0 else ''}{w7:.2f}%"
+        c24_str = f"{'+' if c24 >= 0 else ''}{c24:.1f}%"
+        lines.append(
+            f"<b>{r['symbol']}</b>   <code>${p_str}</code>\n"
+            f"Hacim {v_str}  ·  7dk <code>{w7_str}</code>  ·  24s <b>{c24_str}</b>"
+        )
+    return "\n".join(lines)
+
+
+def build_spot_market_keyboard(active_sort="change24h"):
+    def lbl(key, title):
+        return f"• {title} •" if active_sort == key else title
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": lbl("window7m", "7dk %"), "callback_data": "mkt:window7m"},
+                {"text": lbl("change24h", "24s %"), "callback_data": "mkt:change24h"},
+                {"text": lbl("volume", "Hacim"), "callback_data": "mkt:volume"},
+            ],
+            [
+                {"text": "🔄 Güncelle", "callback_data": f"mkt:{active_sort}"},
+                {"text": "🖼 Görsel Kart", "callback_data": f"mktimg:{active_sort}"},
+            ],
+        ]
+    }
+
+
+def render_spot_market_png(sort_by="change24h", query=""):
+    rows = get_live_spot_market_rows(sort_by=sort_by, limit=9, query=query)
+    W = 620
+    ROW_H = 66
+    HDR_H = 68
+    H = HDR_H + max(1, len(rows)) * ROW_H + 18
+    c = PixelCanvas(W, H, bg=(11, 16, 27))
+
+    c.fill_rect(0, 0, W, HDR_H, (17, 24, 39))
+    c.draw_line(0, HDR_H, W, HDR_H, (30, 41, 59))
+    c.draw_text(22, 22, "ANLIK SPOT PIYASA", col=(241, 245, 249), scale=2)
+
+    tabs = [("window7m", "7DK %", 336), ("change24h", "24S %", 422), ("volume", "HACIM", 508)]
+    c.fill_rect(330, 14, 268, 34, (11, 16, 27))
+    for key, label, tx in tabs:
+        if sort_by == key:
+            c.fill_rect(tx, 17, 82, 28, (30, 41, 59))
+            c.draw_text(tx + 14, 26, label, col=(248, 250, 252), scale=1)
+        else:
+            c.draw_text(tx + 14, 26, label, col=(148, 163, 184), scale=1)
+
+    now_str = datetime.now(TR_TZ).strftime("%H:%M:%S")
+    c.draw_text(22, 48, f"CANLI TRADING . {now_str} TR", col=(100, 116, 139), scale=1)
+
+    if not rows:
+        c.draw_text(22, HDR_H + 26, "CANLI VERI BEKLENIYOR...", col=(148, 163, 184), scale=1)
+        return c.to_png()
+
+    for idx, r in enumerate(rows):
+        ry = HDR_H + idx * ROW_H
+        if idx > 0:
+            c.draw_line(20, ry, W - 20, ry, (24, 34, 52))
+        p_str = "$" + fmt_price(r["price"])
+        v_str = "HACIM " + fmt_compact_usd(r["vol24h"])
+        w7 = r.get("window7mPct", 0.0)
+        c24 = r.get("chg24h", 0.0)
+        w7_str = f"7DK {'+' if w7 >= 0 else ''}{w7:.2f}%"
+        c24_str = f"24S {'+' if c24 >= 0 else ''}{c24:.1f}%"
+
+        c.draw_text(22, ry + 14, r["symbol"], col=(241, 245, 249), scale=2)
+        c.draw_text(22, ry + 40, v_str, col=(148, 163, 184), scale=1)
+
+        c.draw_text_right(W - 22, ry + 14, p_str, col=(241, 245, 249), scale=2)
+        w7_col = (52, 211, 153) if w7 >= 0 else (251, 113, 133)
+        c24_col = (226, 232, 240) if c24 >= 0 else (251, 113, 133)
+        c.draw_text_right(W - 22, ry + 40, c24_str, col=c24_col, scale=1)
+        c.draw_text_right(W - 140, ry + 40, w7_str, col=w7_col, scale=1)
 
     return c.to_png()
 
@@ -711,7 +892,7 @@ def verify_and_emit_pump(symbol, base, quote, min7_price, min7_ts, min15_price, 
             pump_locks.pop(base, None)
 
 
-def evaluate_ticker_record(sym, price, chg24h, vol24h, now_sec):
+def evaluate_ticker_record(sym, price, chg24h, vol24h, now_sec, is_fresh=True):
     if price <= 0 or is_excluded_pair(sym):
         return
     base, quote = extract_base_quote(sym)
@@ -719,28 +900,25 @@ def evaluate_ticker_record(sym, price, chg24h, vol24h, now_sec):
         return
 
     with state_lock:
-        latest_tickers[sym] = {
-            "symbol": sym,
-            "base": base,
-            "quote": quote,
-            "price": price,
-            "chg24h": chg24h,
-            "vol24h": vol24h,
-        }
-
-        min_vol = 150_000.0 if quote == "USDT" else (3.0 if quote == "BTC" else 250.0)
-        if vol24h < min_vol:
+        if active_trading_symbols and sym not in active_trading_symbols:
+            latest_tickers.pop(sym, None)
+            price_history.pop(sym, None)
+            return
+        if not is_fresh:
+            latest_tickers.pop(sym, None)
+            price_history.pop(sym, None)
             return
 
+        min_vol = 150_000.0 if quote == "USDT" else (3.0 if quote == "BTC" else 250.0)
         hist = price_history.setdefault(sym, [])
         hist.append((now_sec, price))
         cutoff_15m = now_sec - 900.0
         cutoff_7m = now_sec - 420.0
         while hist and hist[0][0] < cutoff_15m:
             hist.pop(0)
-        if len(hist) < 2:
-            return
 
+        pct7m = 0.0
+        pct15m = 0.0
         min15_ts, min15_p = hist[0]
         min7_ts, min7_p = None, None
         for ts_pt, p_pt in hist:
@@ -751,11 +929,24 @@ def evaluate_ticker_record(sym, price, chg24h, vol24h, now_sec):
         if min7_p is None:
             min7_ts, min7_p = min15_ts, min15_p
 
-        if min15_p <= 0 or min7_p <= 0:
-            return
+        if min7_p > 0:
+            pct7m = ((price - min7_p) / min7_p) * 100.0
+        if min15_p > 0:
+            pct15m = ((price - min15_p) / min15_p) * 100.0
 
-        pct7m = ((price - min7_p) / min7_p) * 100.0
-        pct15m = ((price - min15_p) / min15_p) * 100.0
+        latest_tickers[sym] = {
+            "symbol": sym,
+            "base": base,
+            "quote": quote,
+            "price": price,
+            "chg24h": chg24h,
+            "vol24h": vol24h,
+            "window7mPct": round(pct7m, 2),
+            "updatedAt": now_sec,
+        }
+
+        if len(hist) < 2 or vol24h < min_vol:
+            return
 
         fast_th = 4.2 if quote == "USDT" else 4.0
         breakout_th = 3.2
@@ -896,19 +1087,37 @@ def check_scheduled_reports():
 # ==============================================================================
 def scanner_loop():
     global last_scan_at, scan_loops
+    refresh_active_trading_symbols()
+    last_exinfo_at = time.time()
     while running_event.is_set():
+        now_sec = time.time()
+        if now_sec - last_exinfo_at >= 900.0:
+            refresh_active_trading_symbols()
+            last_exinfo_at = now_sec
         try:
             tickers = fetch_binance_json("/api/v3/ticker/24hr", timeout=10)
             now_sec = time.time()
+            now_ms = now_sec * 1000.0
             if isinstance(tickers, list):
                 for item in tickers:
                     try:
+                        bid = float(item.get("bidPrice") or 0)
+                        ask = float(item.get("askPrice") or 0)
+                        cnt = int(item.get("count") or 0)
+                        close_ms = float(item.get("closeTime") or 0)
+                        is_fresh = (
+                            bid > 0
+                            and ask > 0
+                            and cnt > 0
+                            and (close_ms <= 0 or (now_ms - close_ms) <= 1_800_000.0)
+                        )
                         evaluate_ticker_record(
                             item["symbol"],
                             float(item["lastPrice"]),
                             float(item["priceChangePercent"]),
                             float(item["quoteVolume"]),
                             now_sec,
+                            is_fresh=is_fresh,
                         )
                     except Exception:
                         continue
@@ -941,21 +1150,77 @@ def telegram_commands_loop():
             if res and res.get("ok"):
                 for upd in res.get("result", []):
                     offset = upd["update_id"] + 1
+
+                    # Inline buton callback islemleri (Anlık Spot Piyasa 7dk / 24s / Hacim / Güncelle)
+                    cb = upd.get("callback_query")
+                    if cb:
+                        cb_id = cb.get("id")
+                        cb_data = cb.get("data") or ""
+                        cb_msg = cb.get("message") or {}
+                        cid = str((cb_msg.get("chat") or {}).get("id") or CHAT_ID)
+                        mid = cb_msg.get("message_id")
+                        if cb_data.startswith("mkt:"):
+                            sort_key = cb_data.split(":", 1)[1]
+                            if mid:
+                                tg_edit_message(
+                                    cid,
+                                    mid,
+                                    build_spot_market_text(sort_by=sort_key),
+                                    reply_markup=build_spot_market_keyboard(sort_key),
+                                )
+                            tg_request("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Piyasa güncellendi"})
+                        elif cb_data.startswith("mktimg:"):
+                            sort_key = cb_data.split(":", 1)[1]
+                            png = render_spot_market_png(sort_by=sort_key)
+                            tg_send_photo(png, f"📊 <b>Anlık Spot Piyasa</b> ({sort_key}) · Güncel TR")
+                            tg_request("answerCallbackQuery", {"callback_query_id": cb_id})
+                        continue
+
                     msg = upd.get("message") or {}
-                    text = (msg.get("text") or "").strip().lower()
+                    raw_text = (msg.get("text") or "").strip()
+                    text = raw_text.lower()
                     cid = str((msg.get("chat") or {}).get("id") or CHAT_ID)
                     if not text:
                         continue
-                    if text.startswith("/durum") or text.startswith("/start"):
+
+                    if text.startswith("/piyasagorsel"):
+                        arg = text.replace("/piyasagorsel", "", 1).strip()
+                        sort_key = "window7m" if "7" in arg else ("volume" if "hacim" in arg else "change24h")
+                        png = render_spot_market_png(sort_by=sort_key)
+                        tg_send_photo(png, build_spot_market_text(sort_by=sort_key)[:980], chat_id=cid)
+                    elif text.startswith("/piyasa") or text.startswith("/radar") or text.startswith("/yukselenler"):
+                        arg = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
+                        sort_key = "change24h"
+                        query = ""
+                        if arg.lower() in ("7dk", "7", "7m"):
+                            sort_key = "window7m"
+                        elif arg.lower() in ("hacim", "vol", "volume"):
+                            sort_key = "volume"
+                        elif arg.lower() in ("24s", "24h", "24"):
+                            sort_key = "change24h"
+                        else:
+                            query = arg
+                        tg_send_message(
+                            build_spot_market_text(sort_by=sort_key, query=query),
+                            chat_id=cid,
+                            reply_markup=build_spot_market_keyboard(sort_key) if not query else None,
+                        )
+                    elif text.startswith("/durum") or text.startswith("/start"):
                         with state_lock:
                             lk_cnt = len(pump_locks)
                             sig_cnt = len(tracked_signals)
+                            act_cnt = len(latest_tickers)
                         tg_send_message(
                             f"🤖 <b>Spot Anlık Pump Dedektörü Aktif</b>\n"
                             f"• Motor: 15dk Hacimli (≥+3.2%, RVOL ≥2.0x) & 0-7dk Ani (+4.2%)\n"
                             f"• Dalga Kilidi: {PUMP_REPEAT_HOURS:g} saat ({lk_cnt} coin kilitli)\n"
-                            f"• Tarama Turu: {scan_loops} | Kayıtlı Sinyal: {sig_cnt}",
+                            f"• Aktif TRADING Parite: {act_cnt} | Tarama Turu: {scan_loops} | Sinyal: {sig_cnt}\n\n"
+                            f"📌 <b>Komutlar:</b>\n"
+                            f"/piyasa — Canlı Anlık Spot Piyasa (7dk % / 24s % / Hacim)\n"
+                            f"/piyasagorsel — Anlık Spot Piyasa PNG Kartı\n"
+                            f"/zafer · /top24 · /kilitler · /kilitsifirla",
                             chat_id=cid,
+                            reply_markup={"inline_keyboard": [[{"text": "📊 Anlık Spot Piyasa", "callback_data": "mkt:change24h"}]]},
                         )
                     elif text.startswith("/kilitsifirla"):
                         with state_lock:
