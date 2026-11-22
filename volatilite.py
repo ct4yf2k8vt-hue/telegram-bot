@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Binance Spot Anlık Pump & 24s En Yükseğe Gidenler Dedektörü (Motor #1 — LONG)
+SPOT ANLIK PUMP DEDEKTÖRÜ (7/24 Kesintisiz Telegram Botu — Motor #1)
 - Sıfır harici bağımlılık (yalnızca Python 3 standart kütüphanesi)
-- Render / Bulut uyumlu mirror sırası (data-api.binance.vision öncelikli)
-- Zaman-normalize edilmiş 15dk Paced RVOL + 1dk Peak RVOL
-- 24s En Yükseğe Gidenler (24s +%6 ve 24s zirvesinin üst %28 bandında tutunan yeşil coinler)
-- Aktif TRADING + taze orderbook filtresi (BREAK/delist hayalet coin temizliği)
-- Açık Telegram hata teşhisi, çoklu chat /start kaydı, /test komutu & Health HEAD/GET
-- 21:00 Günün Zaferi, 23:00 Top 24s Özeti, 60sn Binance Duyuruları
+- Birebir referans görsel & kart formatı:
+  * 1DK CANLI | SPOT PUMP | ANLIK $... karanlık mum grafik PNG
+  * Turuncu kesik BAS çizgisi + sağ eksende mavi ANLIK fiyat etiketi + alt hacim barları
+  * Net 4 satırlık "SPOT ANLIK PUMP DEDEKTÖRÜ — #SYMBOL" bildirimi
+- 7/24 Dayanıklılık: Otomatik thread watchdog, mirror fallback (data-api.binance.vision öncelikli),
+  HTML->PlainText yedek, Health GET & HEAD 200 OK (UptimeRobot/Render uyumlu)
+- Komutlar: /start, /test, /piyasa, /24s, /piyasagorsel, /durum, /sifirla
+- Ek Özellikler: 21:00 Günün Zaferi, 23:00 Top 24s Özeti, 60sn Binance Duyuruları
 """
 
 import datetime
@@ -62,7 +64,8 @@ PREFERRED_MIRROR_IDX = 0
 BOT_USERNAME = ""
 TELEGRAM_OK = False
 LAST_TG_ERROR = ""
-LAST_TICK_TS = 0.0
+LAST_TICK_TS = time.time()
+LAST_AUX_TS = time.time()
 
 ACTIVE_TRADING_SYMBOLS = set()
 TICKER_MAP = {}
@@ -200,6 +203,10 @@ def fmt_vol(v: float, quote: str = "USDT") -> str:
     return f"${v:.0f}"
 
 
+def strip_html(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
 # ==============================================================================
 # HTTP / BINANCE MIRROR & TELEGRAM ISTEMCISI
 # ==============================================================================
@@ -207,7 +214,7 @@ def http_get_json(url: str, timeout: float = 9.0):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotPumpBot/2.1)",
+            "User-Agent": "Mozilla/5.0 (compatible; SpotPumpBot/3.0)",
             "Accept": "application/json",
         },
     )
@@ -231,7 +238,7 @@ def fetch_binance_json(path_and_query: str, timeout: float = 9.0):
     raise RuntimeError(f"Binance mirrors unreachable: {last_err}")
 
 
-def fetch_klines(symbol: str, interval: str, limit: int = 40):
+def fetch_klines(symbol: str, interval: str, limit: int = 45):
     raw = fetch_binance_json(
         f"/api/v3/klines?symbol={urllib.parse.quote(symbol)}&interval={urllib.parse.quote(interval)}&limit={limit}",
         timeout=10.0,
@@ -255,7 +262,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 40):
 def tg_request(method: str, payload: dict, timeout: float = 15.0) -> dict:
     global TELEGRAM_OK, LAST_TG_ERROR
     if not BOT_TOKEN:
-        LAST_TG_ERROR = "BOT_TOKEN boş"
+        LAST_TG_ERROR = "BOT_TOKEN boş — Render/Ortam değişkenlerine BOT_TOKEN ekleyin"
         return {"ok": False, "description": LAST_TG_ERROR}
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     body = json.dumps(payload).encode("utf-8")
@@ -270,6 +277,7 @@ def tg_request(method: str, payload: dict, timeout: float = 15.0) -> dict:
             res = json.loads(resp.read().decode("utf-8"))
             if res.get("ok"):
                 TELEGRAM_OK = True
+                LAST_TG_ERROR = ""
             return res
     except urllib.error.HTTPError as e:
         err_text = e.read().decode("utf-8", errors="ignore")
@@ -279,6 +287,12 @@ def tg_request(method: str, payload: dict, timeout: float = 15.0) -> dict:
             desc = err_json.get("description", err_text)
         except Exception:
             pass
+        if e.code == 400 and "parse entities" in str(desc).lower() and payload.get("parse_mode"):
+            fallback = dict(payload)
+            fallback.pop("parse_mode", None)
+            if "text" in fallback:
+                fallback["text"] = strip_html(fallback["text"])
+            return tg_request(method, fallback, timeout=timeout)
         LAST_TG_ERROR = f"{method} HTTP {e.code}: {desc}"
         if e.code != 409:
             log(f"[Telegram API HATA] {LAST_TG_ERROR}")
@@ -328,6 +342,7 @@ def tg_send_photo(chat_id: str, png_bytes: bytes, caption: str, reply_markup: di
             res = json.loads(resp.read().decode("utf-8"))
             if res.get("ok"):
                 TELEGRAM_OK = True
+                LAST_TG_ERROR = ""
             return res
     except urllib.error.HTTPError as e:
         err_text = e.read().decode("utf-8", errors="ignore")
@@ -357,7 +372,7 @@ def send_to_targets(text: str, png_bytes: bytes = None, caption: str = None, rep
             if res.get("ok"):
                 any_ok = True
                 continue
-            log(f"[Bilgi] chat_id={cid} için sendPhoto başarısız, düz metin (sendMessage) deneniyor...")
+            log(f"[Bilgi] chat_id={cid} için sendPhoto başarısız, sendMessage yedeği deneniyor...")
         msg_payload = {
             "chat_id": cid,
             "text": text,
@@ -377,7 +392,7 @@ def send_to_targets(text: str, png_bytes: bytes = None, caption: str = None, rep
 
 
 # ==============================================================================
-# SAF PYTHON PNG GÖRSEL MOTORU (HARİCİ KÜTÜPHANE YOK)
+# SAF PYTHON PNG GÖRSEL MOTORU (REFERANS 1DK CANLI GRAFİK TASARIMI)
 # ==============================================================================
 FONT_5X7 = {
     "A": [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
@@ -432,7 +447,7 @@ FONT_5X7 = {
 
 
 class Canvas:
-    def __init__(self, w: int, h: int, bg=(10, 14, 23)):
+    def __init__(self, w: int, h: int, bg=(7, 11, 18)):
         self.w = w
         self.h = h
         self.buf = bytearray(bg * (w * h))
@@ -451,6 +466,12 @@ class Canvas:
 
     def hline(self, x0: int, x1: int, y: int, c):
         self.fill_rect(x0, y, x1 - x0 + 1, 1, c)
+
+    def hline_dashed(self, x0: int, x1: int, y: int, c, dash: int = 5, gap: int = 4):
+        x = x0
+        while x <= x1:
+            self.fill_rect(x, y, min(dash, x1 - x + 1), 1, c)
+            x += dash + gap
 
     def vline(self, x: int, y0: int, y1: int, c):
         self.fill_rect(x, y0, 1, y1 - y0 + 1, c)
@@ -483,40 +504,44 @@ class Canvas:
         return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
 
 
-def draw_pump_chart_png(symbol: str, candles_15m: list, pct_str: str, rvol_str: str, cur_price: float, subtitle: str = "15M PUMP") -> bytes:
-    w, h = 920, 520
-    cv = Canvas(w, h, (11, 15, 25))
-    cv.fill_rect(0, 0, w, 62, (16, 22, 36))
-    cv.hline(0, w - 1, 62, (34, 48, 72))
-    cv.draw_text(22, 14, f"{symbol} | {subtitle}", (245, 248, 252), scale=2)
-    cv.draw_text(22, 41, f"FIYAT: ${fmt_price(cur_price)}   {pct_str}   RVOL: {rvol_str}", (34, 211, 153), scale=2)
+def draw_pump_chart_png(symbol: str, candles_1m: list, start_price: float, cur_price: float, timeframe_label: str = "1DK CANLI") -> bytes:
+    w, h = 900, 480
+    cv = Canvas(w, h, (7, 11, 18))
+    cur_label = fmt_price(cur_price)
+    bas_label = fmt_price(start_price)
+    cv.draw_text(18, 12, f"{symbol} | {timeframe_label} | SPOT PUMP | ANLIK ${cur_label}", (215, 224, 234), scale=2)
+    cv.hline_dashed(14, w - 14, 34, (36, 50, 72), dash=4, gap=4)
 
-    bars = candles_15m[-36:] if len(candles_15m) >= 2 else []
+    bars = candles_1m[-42:] if len(candles_1m) >= 2 else []
     if not bars:
         return cv.to_png()
 
-    hi = max(b["high"] for b in bars)
-    lo = min(b["low"] for b in bars)
+    hi = max([b["high"] for b in bars] + [cur_price, start_price]) * 1.0025
+    lo = min([b["low"] for b in bars] + [cur_price, start_price]) * 0.9975
     span = max(hi - lo, 1e-12)
     max_q = max((b["quote_vol"] for b in bars), default=1.0) or 1.0
 
-    px0, px1 = 26, w - 130
-    py0, py1 = 84, 370
-    vy0, vy1 = 392, 488
+    px0, px1 = 16, w - 122
+    py0, py1 = 50, 358
+    vy0, vy1 = 374, 464
+    cv.hline(px0, px1, vy1 + 2, (24, 34, 48))
 
+    # Y ekseni noktalı kılavuzlar
     for i in range(5):
         gy = py0 + int((py1 - py0) * i / 4)
-        cv.hline(px0, px1, gy, (24, 34, 52))
+        cv.hline_dashed(px0, px1, gy, (24, 35, 50), dash=2, gap=6)
         val = hi - span * (i / 4)
-        cv.draw_text(px1 + 10, gy - 6, fmt_price(val), (140, 155, 175), scale=2)
+        cv.draw_text(px1 + 10, gy - 4, fmt_price(val), (140, 155, 175), scale=1)
 
+    # Mumlar ve alt hacim barları
     step = (px1 - px0) / max(len(bars), 1)
     cw = max(4, int(step * 0.62))
 
     for i, b in enumerate(bars):
         cx = int(px0 + i * step + step * 0.5)
         is_up = b["close"] >= b["open"]
-        col = (24, 198, 131) if is_up else (239, 68, 86)
+        col = (20, 184, 132) if is_up else (239, 68, 68)
+        vol_col = (16, 130, 95) if is_up else (145, 45, 50)
 
         wy0 = py0 + int((hi - b["high"]) / span * (py1 - py0))
         wy1 = py0 + int((hi - b["low"]) / span * (py1 - py0))
@@ -529,12 +554,21 @@ def draw_pump_chart_png(symbol: str, candles_15m: list, pct_str: str, rvol_str: 
         cv.fill_rect(cx - cw // 2, top_y, cw, bh, col)
 
         vh = max(2, int((b["quote_vol"] / max_q) * (vy1 - vy0)))
-        cv.fill_rect(cx - cw // 2, vy1 - vh, cw, vh, col)
+        cv.fill_rect(cx - cw // 2, vy1 - vh, cw, vh, vol_col)
 
-    last_cx = int(px0 + (len(bars) - 1) * step + step * 0.5)
-    cv.hline(last_cx - cw, last_cx + cw, py0 + 2, (250, 204, 21))
-    cv.hline(last_cx - cw, last_cx + cw, py1 - 2, (250, 204, 21))
-    cv.draw_text(26, 498, "SPOT ANLIK PUMP & 24S EN YUKSEGE GIDENLER - LONG RADAR", (110, 128, 152), scale=1)
+    # Turuncu kesik BAS çizgisi + etiketi
+    y_bas = max(py0 + 4, min(py1 - 4, py0 + int((hi - start_price) / span * (py1 - py0))))
+    cv.hline_dashed(px0, px1, y_bas, (217, 138, 28), dash=5, gap=4)
+    cv.draw_text(px1 + 8, y_bas - 4, f"BAS {bas_label}", (234, 154, 42), scale=1)
+
+    # Mavi anlık fiyat çizgisi + sağ eksen mavi fiyat etiketi
+    y_cur = max(py0 + 8, min(py1 - 8, py0 + int((hi - cur_price) / span * (py1 - py0))))
+    cv.hline(px0, px1, y_cur, (37, 99, 235))
+    cv.hline(px0, px1, y_cur + 1, (37, 99, 235))
+    badge_w = max(72, len(cur_label) * 7 + 16)
+    cv.fill_rect(px1 + 4, y_cur - 9, badge_w, 18, (37, 99, 235))
+    cv.draw_text(px1 + 10, y_cur - 4, cur_label, (255, 255, 255), scale=1)
+
     return cv.to_png()
 
 
@@ -569,7 +603,7 @@ def draw_market_radar_png(rows: list, title: str = "ANLIK SPOT PIYASA - EN YUKSE
 
 
 # ==============================================================================
-# MOTOR 1: SPOT ANLIK PUMP & 24S EN YÜKSEĞE GİDENLER (SADECE LONG/YÜKSELEN)
+# MOTOR 1: SPOT ANLIK PUMP DEDEKTÖRÜ (0-7 DK ANİ PUMP + 15 DK HACİMLİ KIRILIM)
 # ==============================================================================
 def is_pump_locked(base: str, now_ts: float) -> bool:
     rec = LOCKS["pump"].get(base)
@@ -601,21 +635,18 @@ def refresh_active_trading_symbols():
         log(f"[UYARI] exchangeInfo güncellenemedi: {exc}")
 
 
-def verify_and_emit_pump(sym: str, base: str, quote: str, price: float, vol24h: float, chg24h: float, high24h: float, low24h: float, min7m_p: float, min7m_ts: float, min15m_p: float, min15m_ts: float):
+def verify_and_emit_pump(sym: str, base: str, quote: str, price: float, vol24h: float, min7m_p: float, min7m_ts: float, min15m_p: float, min15m_ts: float):
     fast_th_pct = 4.0 if quote == "USDT" else 3.8
     breakout_th_pct = 3.2
     now_ts = time.time()
 
     try:
         tk = fetch_binance_json(f"/api/v3/ticker/24hr?symbol={urllib.parse.quote(sym)}", timeout=5.0)
-        c1m = fetch_klines(sym, "1m", 20)
-        c15m = fetch_klines(sym, "15m", 30)
+        c1m = fetch_klines(sym, "1m", 45)
+        c15m = fetch_klines(sym, "15m", 24)
 
         live_cur = float(tk.get("lastPrice") or price)
         live_vol = float(tk.get("quoteVolume") or vol24h)
-        live_chg24 = float(tk.get("priceChangePercent") or chg24h)
-        live_high24 = float(tk.get("highPrice") or high24h or live_cur)
-        live_low24 = float(tk.get("lowPrice") or low24h or live_cur)
 
         recent_1m_7 = c1m[-7:]
         recent_1m_15 = c1m[-15:]
@@ -667,31 +698,18 @@ def verify_and_emit_pump(sym: str, base: str, quote: str, price: float, vol24h: 
                 bool(prev_15m) and live_cur > prev_15m["open"] and prev_15m["close"] > prev_15m["open"]
             )
 
-        fast_ok = verified_pct_7 >= fast_th_pct and rvol >= 1.4 and hold_ratio >= 0.45
-        breakout_15m_ok = verified_pct_15 >= breakout_th_pct and rvol >= 1.6 and is_green_15m and hold_ratio >= 0.50
+        fast_ok = verified_pct_7 >= fast_th_pct and hold_ratio >= 0.35
+        breakout_15m_ok = verified_pct_15 >= breakout_th_pct and rvol >= 1.4 and is_green_15m and hold_ratio >= 0.45
 
-        live_pos24 = ((live_cur - live_low24) / (live_high24 - live_low24)) if live_high24 > live_low24 else 0.0
-        live_dist_high = ((live_high24 - live_cur) / live_high24) * 100.0 if live_high24 > 0 else 99.0
-        climber_24h_ok = (
-            quote == "USDT"
-            and live_vol >= 250_000.0
-            and live_chg24 >= 6.0
-            and live_pos24 >= 0.72
-            and live_dist_high <= 3.5
-            and verified_pct_7 >= 0.0
-            and (is_green_15m or hold_ratio >= 0.45)
-        )
-
-        if not fast_ok and not breakout_15m_ok and not climber_24h_ok:
+        if not fast_ok and not breakout_15m_ok:
             with STATE_LOCK:
                 LOCKS["pump"].pop(base, None)
                 VERIFY_COOLDOWN[sym] = time.time() + 20.0
             return
 
         use_fast = fast_ok and (not breakout_15m_ok or verified_pct_7 >= fast_th_pct)
-        use_24h = (not fast_ok) and (not breakout_15m_ok) and climber_24h_ok
-        verified_min = live_low24 if use_24h else (verified_min_7 if use_fast else verified_min_15)
-        verified_pct = live_chg24 if use_24h else (verified_pct_7 if use_fast else verified_pct_15)
+        verified_min = verified_min_7 if use_fast else verified_min_15
+        verified_pct = verified_pct_7 if use_fast else verified_pct_15
         ref_ts = min7m_ts if use_fast else min15m_ts
         mins = max(1, min(7 if use_fast else 15, round((time.time() - ref_ts) / 60.0)))
 
@@ -716,40 +734,27 @@ def verify_and_emit_pump(sym: str, base: str, quote: str, price: float, vol24h: 
             del SIGNALS[200:]
             save_state()
 
-        lock_desc = f"🔒 {int(PUMP_REPEAT_HOURS)} saatlik dalga kilidi aktif" if PUMP_REPEAT_HOURS > 0 else "🔒 Tekil kilit aktif"
-        vol_str = f"{round(live_vol):,} {quote}" if quote == "USDT" else f"{live_vol:.2f} {quote}"
+        lock_desc = f"{int(PUMP_REPEAT_HOURS)} saatlik dalga kilidi aktif." if PUMP_REPEAT_HOURS > 0 else "Tekil coin kilidi aktif."
+        vol_str = f"{round(live_vol):,}" if quote == "USDT" else f"{live_vol:.2f}"
 
-        if use_24h:
-            msg = (
-                f"📈 <b>24 SAAT EN YÜKSEĞE GİDEN — #{html.escape(sym)}</b>\n"
-                f"🚀 <b>24s Yükseliş:</b> +{live_chg24:.2f}% · <b>LONG</b>\n"
-                f"🎯 <b>24s Zirve Gücü:</b> %{round(live_pos24 * 100)} (Zirveye %{live_dist_high:.2f} yakın)\n"
-                f"💵 <b>24s Dip:</b> ${fmt_price(live_low24)} ➜ <b>Anlık:</b> ${fmt_price(live_cur)} (Zirve: ${fmt_price(live_high24)})\n"
-                f"🔥 <b>7dk İvme:</b> +{max(0.0, verified_pct_7):.2f}% · <b>RVOL:</b> {rvol:.1f}x · <b>Hacim:</b> {vol_str}\n"
-                f"{lock_desc}"
-            )
-            png_bytes = draw_pump_chart_png(sym, c15m, f"24S +{live_chg24:.2f}%", f"{rvol:.1f}x", live_cur, subtitle="24S ZIRVEYE GIDEN")
-        else:
-            mode_tag = "0-7 dk Ani Spike" if use_fast else "15dk Hacimli Mum Patlaması"
-            msg = (
-                f"🚀 <b>SPOT ANLIK PUMP DEDEKTÖRÜ — #{html.escape(sym)}</b>\n"
-                f"📌 <b>Mod:</b> {mode_tag} · <b>LONG</b>\n"
-                f"📈 <b>Değişim:</b> +{verified_pct:.2f}% ({mins} dk) · <b>24s:</b> {live_chg24:+.2f}%\n"
-                f"💵 <b>Başlangıç:</b> ${fmt_price(verified_min)} ➜ <b>Anlık:</b> ${fmt_price(live_cur)}\n"
-                f"🔥 <b>Hacim İvmesi (RVOL):</b> {rvol:.1f}x · <b>24s Hacim:</b> {vol_str}\n"
-                f"{lock_desc}"
-            )
-            png_bytes = draw_pump_chart_png(sym, c15m, f"+{verified_pct:.2f}%", f"{rvol:.1f}x", live_cur)
+        msg = (
+            f"⚡ <b>SPOT ANLIK PUMP DEDEKTÖRÜ — #{html.escape(sym)}</b>\n\n"
+            f"📈 <b>Değişim:</b> +{verified_pct:.2f}% ({mins} dk içinde!)\n"
+            f"💰 <b>Başlangıç:</b> {fmt_price(verified_min)} ➡️ <b>Anlık:</b> {fmt_price(live_cur)}\n"
+            f"💧 <b>24s Parite Hacmi:</b> {vol_str} ({quote})\n"
+            f"🔒 {lock_desc}"
+        )
 
+        png_bytes = draw_pump_chart_png(sym, c1m, verified_min, live_cur, timeframe_label="1DK CANLI")
         ok = send_to_targets(msg, png_bytes=png_bytes, caption=msg)
-        log(f"[SİNYAL] {sym} ({'24S' if use_24h else 'PUMP'}) +{verified_pct:.2f}% RVOL {rvol:.1f}x -> Telegram: {'OK' if ok else 'HATA'}")
+        log(f"[SİNYAL] {sym} +{verified_pct:.2f}% ({mins} dk) -> Telegram: {'OK' if ok else 'HATA'}")
     except Exception as exc:
         with STATE_LOCK:
             LOCKS["pump"].pop(base, None)
         log(f"[HATA] {sym} doğrulama hatası: {exc}")
 
 
-def evaluate_pump_tick(sym: str, base: str, quote: str, price: float, vol24h: float, chg24h: float, high24h: float, low24h: float, now_ts: float):
+def evaluate_pump_tick(sym: str, base: str, quote: str, price: float, vol24h: float, now_ts: float):
     min_vol = 150_000.0 if quote == "USDT" else (3.0 if quote == "BTC" else 250.0)
     fast_th_pct = 4.0 if quote == "USDT" else 3.8
     breakout_th_pct = 3.2
@@ -782,20 +787,9 @@ def evaluate_pump_tick(sym: str, base: str, quote: str, price: float, vol24h: fl
         if sym in TICKER_MAP:
             TICKER_MAP[sym]["win7m"] = round(pct7m, 2)
 
-        pos24h = ((price - low24h) / (high24h - low24h)) if high24h > low24h else 0.0
-        dist_high = ((high24h - price) / high24h) * 100.0 if high24h > 0 else 99.0
-        climber_24h_pre = (
-            quote == "USDT"
-            and vol24h >= 250_000.0
-            and chg24h >= 6.0
-            and pos24h >= 0.72
-            and dist_high <= 3.5
-            and pct7m >= 0.0
-        )
-
         if not BOT_RUNNING:
             return
-        if pct7m < fast_th_pct and pct15m < breakout_th_pct and not climber_24h_pre:
+        if pct7m < fast_th_pct and pct15m < breakout_th_pct:
             return
         if is_pump_locked(base, now_ts):
             return
@@ -806,7 +800,7 @@ def evaluate_pump_tick(sym: str, base: str, quote: str, price: float, vol24h: fl
 
     threading.Thread(
         target=verify_and_emit_pump,
-        args=(sym, base, quote, price, vol24h, chg24h, high24h, low24h, min7m[1], min7m[0], min15m[1], min15m[0]),
+        args=(sym, base, quote, price, vol24h, min7m[1], min7m[0], min15m[1], min15m[0]),
         daemon=True,
     ).start()
 
@@ -844,8 +838,6 @@ def poll_tickers_once():
         price = float(item.get("lastPrice") or 0.0)
         vol24h = float(item.get("quoteVolume") or 0.0)
         chg24 = float(item.get("priceChangePercent") or 0.0)
-        high24 = float(item.get("highPrice") or price)
-        low24 = float(item.get("lowPrice") or price)
         if price <= 0:
             continue
 
@@ -858,11 +850,9 @@ def poll_tickers_once():
                 "price": price,
                 "change24h": round(chg24, 2),
                 "vol24h": vol24h,
-                "high24h": high24,
-                "low24h": low24,
                 "win7m": prev_w7,
             }
-        evaluate_pump_tick(sym, base, quote, price, vol24h, chg24, high24, low24, now_ts)
+        evaluate_pump_tick(sym, base, quote, price, vol24h, now_ts)
 
     with STATE_LOCK:
         LAST_TICK_TS = now_ts
@@ -879,40 +869,6 @@ def poll_tickers_once():
                     changed = True
         if changed:
             save_state()
-
-
-def run_boot_breakout_catchup():
-    if not BOT_RUNNING:
-        return
-    with STATE_LOCK:
-        cands = sorted(
-            [t for t in TICKER_MAP.values() if t["quote"] == "USDT" and t["vol24h"] >= 250_000 and t["change24h"] >= 6.0],
-            key=lambda x: x["change24h"],
-            reverse=True,
-        )[:12]
-    now_ts = time.time()
-    triggered = 0
-    for t in cands:
-        if triggered >= 5:
-            break
-        if is_pump_locked(t["base"], now_ts):
-            continue
-        try:
-            pos24 = ((t["price"] - t["low24h"]) / (t["high24h"] - t["low24h"])) if t["high24h"] > t["low24h"] else 0.0
-            dist_high = ((t["high24h"] - t["price"]) / t["high24h"]) * 100.0 if t["high24h"] > 0 else 99.0
-            bars = fetch_klines(t["symbol"], "15m", 12)
-            cur = bars[-1] if bars else None
-            pct15 = ((t["price"] - cur["low"]) / cur["low"]) * 100.0 if cur and cur["low"] > 0 else 0.0
-            if pct15 >= 3.2 or (pos24 >= 0.72 and dist_high <= 3.5):
-                with STATE_LOCK:
-                    PRICE_WINDOW_HISTORY[t["symbol"]] = [
-                        (now_ts - 60.0, cur["low"] if cur else t["price"]),
-                        (now_ts - 1.0, t["price"]),
-                    ]
-                evaluate_pump_tick(t["symbol"], t["base"], t["quote"], t["price"], t["vol24h"], t["change24h"], t["high24h"], t["low24h"], now_ts)
-                triggered += 1
-        except Exception:
-            pass
 
 
 # ==============================================================================
@@ -978,7 +934,7 @@ def check_daily_summaries():
         if winners:
             lines = ["🏆 <b>GÜNÜN ZAFERİ (Son 24s +%3+ Pik Sinyaller)</b>\n"]
             for i, s in enumerate(winners[:15], 1):
-                lines.append(f"{i}. <b>#{s['symbol']}</b> · Pik: <b>+{s['peak_pct']:.2f}%</b> · Giriş: ${fmt_price(s['entry_price'])}")
+                lines.append(f"{i}. <b>#{html.escape(s['symbol'])}</b> · Pik: <b>+{s['peak_pct']:.2f}%</b> · Giriş: ${fmt_price(s['entry_price'])}")
             send_to_targets("\n".join(lines))
 
     if now_tr.hour == 23 and LAST_SUMMARY_DATE != today_str:
@@ -988,7 +944,7 @@ def check_daily_summaries():
             top_sigs = sorted(day_sigs, key=lambda x: x.get("peak_pct", 0.0), reverse=True)
             lines = [f"📊 <b>TOP 24 SAAT ÖZETİ ({len(top_sigs)} Sinyal)</b>\n"]
             for i, s in enumerate(top_sigs[:20], 1):
-                lines.append(f"{i}. <b>#{s['symbol']}</b> · Pik: <b>+{s.get('peak_pct', 0.0):.2f}%</b> · Anlık: ${fmt_price(s.get('current_price', s['entry_price']))}")
+                lines.append(f"{i}. <b>#{html.escape(s['symbol'])}</b> · Pik: <b>+{s.get('peak_pct', 0.0):.2f}%</b> · Anlık: ${fmt_price(s.get('current_price', s['entry_price']))}")
             send_to_targets("\n".join(lines))
 
 
@@ -1033,7 +989,7 @@ def format_market_text(mode: str = "24h") -> str:
     lines = [f"📈 <b>ANLIK SPOT PİYASA ({titles.get(mode, '24s %')})</b>\n"]
     for i, r in enumerate(rows, 1):
         lines.append(
-            f"{i:02d}. <b>{r['symbol']}</b> · ${fmt_price(r['price'])} | "
+            f"{i:02d}. <b>{html.escape(r['symbol'])}</b> · ${fmt_price(r['price'])} | "
             f"7dk: {r.get('win7m', 0.0):+.2f}% | 24s: <b>{r['change24h']:+.2f}%</b> | {fmt_vol(r['vol24h'])}"
         )
     if not rows:
@@ -1042,42 +998,42 @@ def format_market_text(mode: str = "24h") -> str:
 
 
 def send_test_notification(target_cid: str = None):
-    now_tr = datetime.datetime.now(TR_TZ).strftime("%H:%M:%S TR")
     try:
-        bars = fetch_klines("BTCUSDT", "15m", 36)
-        cur_p = bars[-1]["close"] if bars else 65000.0
+        c1m = fetch_klines("BTCUSDT", "1m", 45)
+        cur_p = c1m[-1]["close"] if c1m else 65000.0
+        bas_p = round(cur_p / 1.0464, 4)
     except Exception:
-        bars = []
+        c1m = []
         cur_p = 65000.0
+        bas_p = 62117.0
     msg = (
-        f"🧪 <b>TEST BİLDİRİMİ — Telegram Bağlantısı Çalışıyor!</b>\n"
-        f"🕒 Saat: {now_tr}\n"
-        f"🤖 Mod: Sadece Yükselenler (0-7dk / 15dk Pump + 24s En Yükseğe Gidenler)\n"
-        f"🔎 Taranan Aktif Çift: {len(TICKER_MAP)}"
+        f"⚡ <b>SPOT ANLIK PUMP DEDEKTÖRÜ — #BTCUSDT (TEST)</b>\n\n"
+        f"📈 <b>Değişim:</b> +4.64% (7 dk içinde!)\n"
+        f"💰 <b>Başlangıç:</b> {fmt_price(bas_p)} ➡️ <b>Anlık:</b> {fmt_price(cur_p)}\n"
+        f"💧 <b>24s Parite Hacmi:</b> 1,077,624 (USDT)\n"
+        f"🔒 Tekil coin kilidi aktif."
     )
-    png = draw_pump_chart_png("TEST-BTCUSDT", bars, "+4.20%", "2.1x", cur_p) if bars else None
+    png = draw_pump_chart_png("BTCUSDT", c1m, bas_p, cur_p, timeframe_label="1DK CANLI") if c1m else None
     if target_cid:
         if png:
-            res = tg_send_photo(target_cid, png, msg, reply_markup=build_main_keyboard())
+            res = tg_send_photo(target_cid, png, msg)
             if res.get("ok"):
                 return
-        tg_request("sendMessage", {"chat_id": target_cid, "text": msg, "parse_mode": "HTML", "reply_markup": build_main_keyboard()})
+        tg_request("sendMessage", {"chat_id": target_cid, "text": msg, "parse_mode": "HTML"})
     else:
-        send_to_targets(msg, png_bytes=png, caption=msg, reply_markup=build_main_keyboard())
+        send_to_targets(msg, png_bytes=png, caption=msg)
 
 
 def handle_telegram_command(cid: str, text: str):
     global BOT_RUNNING
     register_chat_id(cid)
-    cmd = text.strip().split()[0].lower()
+    cmd = text.strip().split()[0].split("@")[0].lower()
 
     if cmd in ("/start", "/help", "/menu"):
         msg = (
-            f"⚡ <b>Spot Pump & 24s En Yükseğe Gidenler Aktif</b>\n"
-            f"🆔 Sohbet ID: <code>{cid}</code> (otomatik kaydedildi)\n"
-            f"📈 Yalnızca Yükselenler: 0-7dk / 15dk Pump + 24s Zirve Kırılımı (LONG)\n"
-            f"🔒 Dalga Kilidi: {int(PUMP_REPEAT_HOURS)} saat\n\n"
-            f"Komutlar: /24s · /piyasa · /piyasagorsel · /test · /durum · /sifirla"
+            f"⚡ <b>SPOT ANLIK PUMP DEDEKTÖRÜ (7/24 Aktif)</b>\n"
+            f"🆔 Sohbet ID: <code>{cid}</code> (kaydedildi)\n"
+            f"Komutlar: /test · /24s · /piyasa · /piyasagorsel · /durum · /sifirla"
         )
         tg_request("sendMessage", {"chat_id": cid, "text": msg, "parse_mode": "HTML", "reply_markup": build_main_keyboard()})
     elif cmd == "/test":
@@ -1086,7 +1042,7 @@ def handle_telegram_command(cid: str, text: str):
         uptime_m = int((time.time() - STARTED_AT) // 60)
         msg = (
             f"📊 <b>Bot Durumu</b>\n"
-            f"• Durum: {'🟢 Çalışıyor' if BOT_RUNNING else '🟡 Duraklatıldı'}\n"
+            f"• Durum: {'🟢 7/24 Çalışıyor' if BOT_RUNNING else '🟡 Duraklatıldı'}\n"
             f"• Çalışma Süresi: {uptime_m} dk\n"
             f"• Aktif Spot Çift: {len(TICKER_MAP)}\n"
             f"• Tarama Turu: {PUMP_LOOPS}\n"
@@ -1124,7 +1080,7 @@ def telegram_commands_loop():
             res = tg_request("getUpdates", {"offset": offset, "timeout": 25}, timeout=32.0)
             if not res.get("ok"):
                 if res.get("error_code") == 409:
-                    log("[KRİTİK UYARI] Telegram 409 Conflict! Aynı BOT_TOKEN şu anda başka bir sunucuda daha çalışıyor. Sadece 1 sunucu açık bırakın!")
+                    log("[KRİTİK UYARI] Telegram 409 Conflict! Aynı BOT_TOKEN şu anda başka bir yerde daha çalışıyor.")
                     time.sleep(15.0)
                 else:
                     time.sleep(5.0)
@@ -1163,6 +1119,10 @@ def telegram_commands_loop():
 # ==============================================================================
 # HEALTH CHECK HTTP SUNUCUSU (HEAD + GET DESTEKLI — UPTIMEROBOT / RENDER)
 # ==============================================================================
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
@@ -1173,6 +1133,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         payload = json.dumps({
             "ok": True,
             "running": BOT_RUNNING,
+            "bot_token_present": bool(BOT_TOKEN),
             "bot_username": BOT_USERNAME,
             "telegram_ok": TELEGRAM_OK,
             "last_tg_error": LAST_TG_ERROR,
@@ -1180,8 +1141,9 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             "scanned_pairs": len(TICKER_MAP),
             "pump_loops": PUMP_LOOPS,
             "signals_count": len(SIGNALS),
+            "last_tick_age_sec": round(time.time() - LAST_TICK_TS),
             "uptime_sec": round(time.time() - STARTED_AT),
-        }).encode("utf-8")
+        }, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
@@ -1193,18 +1155,16 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_health_server():
-    socketserver.TCPServer.allow_reuse_address = True
-    srv = socketserver.ThreadingTCPServer(("0.0.0.0", PORT), HealthHandler)
+    srv = ReusableTCPServer(("0.0.0.0", PORT), HealthHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log(f"[HTTP] Health sunucusu 0.0.0.0:{PORT} üzerinde aktif (GET & HEAD 200 OK)")
 
 
 # ==============================================================================
-# ANA DÖNGÜLER & BAŞLATMA
+# 7/24 DÖNGÜLER & WATCHDOG
 # ==============================================================================
 def scanner_loop():
     last_ex_refresh = 0.0
-    catchup_done = False
     while True:
         try:
             now = time.time()
@@ -1212,22 +1172,17 @@ def scanner_loop():
                 refresh_active_trading_symbols()
                 last_ex_refresh = now
             poll_tickers_once()
-            if not catchup_done and TICKER_MAP:
-                catchup_done = True
-                top_rows = get_sorted_market("24h")
-                if top_rows:
-                    png = draw_market_radar_png(top_rows)
-                    send_to_targets(format_market_text("24h"), png_bytes=png, caption="📈 <b>ANLIK SPOT PİYASA — 24s En Yükseğe Gidenler</b>")
-                threading.Thread(target=run_boot_breakout_catchup, daemon=True).start()
         except Exception as exc:
             log(f"[Tarama HATA] {exc}")
         time.sleep(3.0)
 
 
 def aux_loop():
+    global LAST_AUX_TS
     last_ping = 0.0
     while True:
         try:
+            LAST_AUX_TS = time.time()
             poll_binance_news()
             check_daily_summaries()
             if RENDER_EXTERNAL_URL and (time.time() - last_ping) > 480.0:
@@ -1244,36 +1199,55 @@ def aux_loop():
 def startup_telegram_check():
     global BOT_USERNAME
     if not BOT_TOKEN:
-        log("[KRİTİK] BOT_TOKEN ortam değişkeni BOŞ! Render/Sunucu Environment Variables kısmına BOT_TOKEN ekleyin.")
+        log("[KRİTİK] BOT_TOKEN ortam değişkeni BOŞ! Environment Variables kısmına BOT_TOKEN ekleyin.")
         return
     me = tg_request("getMe", {})
     if not me.get("ok"):
-        log(f"[KRİTİK] Telegram getMe başarısız! BOT_TOKEN geçersiz olabilir: {me.get('description')}")
+        log(f"[KRİTİK] Telegram getMe başarısız: {me.get('description')}")
         return
     BOT_USERNAME = str(me.get("result", {}).get("username", ""))
-    log(f"[Telegram] Bağlandı -> @{BOT_USERNAME} | Hedefler: {get_target_chats()}")
+    log(f"[Telegram] 7/24 Bağlandı -> @{BOT_USERNAME} | Hedefler: {get_target_chats()}")
     tg_request("deleteWebhook", {"drop_pending_updates": False})
-    send_to_targets(
-        f"🤖 <b>Spot Pump & 24s En Yükseğe Gidenler Botu Başlatıldı</b>\n"
-        f"• Bot: @{BOT_USERNAME}\n"
-        f"• Yalnızca Yükselenler: 0-7dk / 15dk Hacimli Pump + 24s Zirveye Gidenler\n"
-        f"• Test için /test, 24s liste için /24s yazabilirsiniz.",
-        reply_markup=build_main_keyboard(),
-    )
+    send_to_targets(f"⚡ <b>Spot Anlık Pump Dedektörü 7/24 aktif</b> (@{html.escape(BOT_USERNAME)} · Test: /test)")
 
 
 def main():
     load_state()
     start_health_server()
     startup_telegram_check()
-    threading.Thread(target=scanner_loop, daemon=True).start()
-    threading.Thread(target=aux_loop, daemon=True).start()
+
+    scan_t = threading.Thread(target=scanner_loop, daemon=True)
+    aux_t = threading.Thread(target=aux_loop, daemon=True)
+    scan_t.start()
+    aux_t.start()
+
     if BOT_TOKEN:
-        telegram_commands_loop()
+        tg_t = threading.Thread(target=telegram_commands_loop, daemon=True)
+        tg_t.start()
     else:
-        while True:
-            time.sleep(60.0)
+        tg_t = None
+
+    # 7/24 Watchdog: herhangi bir iş parçacığı beklenmedik şekilde durursa otomatik yeniden başlatır
+    while True:
+        time.sleep(15.0)
+        if not scan_t.is_alive():
+            log("[WATCHDOG] scanner_loop yeniden başlatılıyor...")
+            scan_t = threading.Thread(target=scanner_loop, daemon=True)
+            scan_t.start()
+        if not aux_t.is_alive():
+            log("[WATCHDOG] aux_loop yeniden başlatılıyor...")
+            aux_t = threading.Thread(target=aux_loop, daemon=True)
+            aux_t.start()
+        if BOT_TOKEN and tg_t is not None and not tg_t.is_alive():
+            log("[WATCHDOG] telegram_commands_loop yeniden başlatılıyor...")
+            tg_t = threading.Thread(target=telegram_commands_loop, daemon=True)
+            tg_t.start()
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except Exception as fatal:
+            log(f"[7/24 RECOVER] Beklenmeyen hata: {fatal} — 5 sn sonra yeniden başlatılıyor...")
+            time.sleep(5.0)
