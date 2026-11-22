@@ -2,6 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 Spot Akis Terminali - 7/24 Render Python 3 Telegram & Futures 3x Botu (Zero-Dependency)
+
+Aktif Sinyal Motorlari (4 Bagimsiz Motor):
+  1. PUMP      : 0-7 dk Spot Anlik Pump (+4.5%+ USDT) -> Tekil Coin Kilidi + Canli PNG Grafik + FUTURES 3x LONG
+  2. PUMP15M   : 15 dk Hacimli Kirilim (+3.2%+ & RVOL>=1.4x) -> Ayri Kilit + Canli PNG Grafik + FUTURES 3x LONG
+  3. ATL       : Tum Zamanlarin En Dusugu Kesin Kirilimi -> Yalniz Bildirim (Tekrar etmez, Islem ACMAZ)
+  4. ATH       : Tum Zamanlarin En Yuksegi Kesin Kirilimi -> Yalniz Bildirim (Tekrar etmez, Islem ACMAZ)
+
+Futures 3x Otomatik Al-Sat Kurallari (En Yuksek Guvenlik):
+  - YALNIZCA PUMP (0-7 dk) ve PUMP15M (15 dk) USDT sinyallerinde Izole (ISOLATED) 3x LONG (BUY) acar.
+  - Acildigi anda otomatik +%5 Kar Al (LIMIT SELL) VE -%5 Stop-Loss (STOP_MARKET SELL, MARK_PRICE) koyar.
+  - Biri tetiklendiginde karsi emir otomatik iptal edilir (OCO mantigi).
+  - En Az Yetki (Least-Privilege): Kod ASLA bakiye, hesap, kisi bilgisi, spot/margin veya para cekme/transfer endpointlerini cagirmaz.
+
+Otomatik Ozet & Duyurular:
+  - Gunun Zaferi (21:00 TR)
+  - Top 24 Saat PNG Liderlik Karti & Madalyali Ozet (23:00 TR + /top24)
+  - Binance Resmi Duyurulari (60 sn)
 """
 
 import base64
@@ -13,7 +30,6 @@ import http.server
 import json
 import math
 import os
-import re
 import socket
 import ssl
 import struct
@@ -81,12 +97,12 @@ TR_TZ = datetime.timezone(datetime.timedelta(hours=3))
 # DURUM, KILIT VE FUTURES POZISYON YONETIMI
 # ==============================================================================
 state_lock = threading.Lock()
-tickers = {}
+tickers = {}               # sym -> dict
 active_spot_symbols = set()
-futures_filters = {}
-price_history = {}
-signals_log = []
-trades_log = []
+futures_filters = {}       # sym -> {stepSize, minQty, tickSize, minNotional}
+price_history = {}         # sym -> list[(ts_sec, price)]
+signals_log = []           # list[dict]
+trades_log = []            # list[dict]
 trade_in_flight = set()
 news_seen_ids = set()
 news_seeded = False
@@ -107,9 +123,9 @@ auto_trade = {
 }
 
 locks = {
-    "pump": {},
-    "pump15m": {},
-    "ath_atl": {},
+    "pump": {},       # base -> {"symbol": str, "locked_at": float}
+    "pump15m": {},    # base -> {"symbol": str, "locked_at": float}
+    "ath_atl": {},    # "SYM:ATL" | "SYM:ATH" -> {"level": float, "locked_at": float}
     "reports": {"victory_day": "", "top24_day": ""},
 }
 
@@ -301,6 +317,8 @@ class BinanceFuturesError(RuntimeError):
         self.msg = msg
 
 
+# GUVENLIK KISITI (ALLOWLIST): Bot yalnizca emir/kaldirac/izole marjin endpointlerini cagirir;
+# hesap bakiyesi (/fapi/v2/account), kisi bilgisi, spot veya para cekme endpointleri KESINLIKLE cagirlmaz.
 _ALLOWED_FUTURES_SIGNED_PATHS = frozenset({
     "/fapi/v1/marginType",
     "/fapi/v1/leverage",
@@ -732,6 +750,7 @@ def render_pump_png(symbol, tf_label, candles, live_price, start_price, badge="S
 
 
 def render_top24_png(ranked, total_count, hit2_pct):
+    """TOP 24 SAAT liderlik karti PNG (IMG_3145 tasarimiyla birebir)."""
     rows = ranked[:5]
     if not rows:
         return b""
@@ -842,12 +861,12 @@ def render_top24_png(ranked, total_count, hit2_pct):
 
 
 # ==============================================================================
-# TELEGRAM GONDERICILER (HATA DETAYLI VE HTML FALLBACK'LI)
+# TELEGRAM GONDERICILER (MESAJ & FOTOGRAF)
 # ==============================================================================
 def telegram_send_message(text):
     if not BOT_TOKEN:
-        print(f"[SINYAL/MESAJ] (BOT_TOKEN YOK)\n{text}\n")
-        return False
+        print(f"[SINYAL/MESAJ]\n{text}\n")
+        return
     try:
         body = json.dumps({
             "chat_id": CHAT_ID,
@@ -861,39 +880,20 @@ def telegram_send_message(text):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            return True
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode('utf-8', errors='ignore')
-        print(f"[TG sendMessage Hata] HTTP {e.code} | Detay: {err_body}")
-        if "can't parse entities" in err_body:
-            try:
-                plain_text = re.sub(r'<[^>]+>', '', text)
-                body = json.dumps({"chat_id": CHAT_ID, "text": plain_text, "disable_web_page_preview": True}).encode("utf-8")
-                req = urllib.request.Request(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                urllib.request.urlopen(req, timeout=12).read()
-                print("[TG sendMessage] HTML parse hatası nedeniyle düz metin gönderildi.")
-                return True
-            except Exception as ex:
-                print(f"[TG sendMessage Fallback Hata] {ex}")
+        urllib.request.urlopen(req, timeout=12).read()
     except Exception as e:
-        print(f"[TG sendMessage Genel Hata] {e}")
-    return False
+        print(f"[TG sendMessage hata] {e}")
 
 
 def telegram_send_photo(png_bytes, caption):
-    if len(caption) > 1020:
-        caption = caption[:1017] + "..."
+    if len(caption) > 1000:
+        caption = caption[:997] + "..."
     if not BOT_TOKEN:
-        print(f"[SINYAL/GORSEL] (BOT_TOKEN YOK) {len(png_bytes)}B\n{caption}\n")
-        return False
+        print(f"[SINYAL/GORSEL {len(png_bytes)}B]\n{caption}\n")
+        return
     if not png_bytes:
-        return telegram_send_message(caption)
+        telegram_send_message(caption)
+        return
     try:
         boundary = "----SpotPumpBoundary7e8a9b"
         parts = []
@@ -914,15 +914,10 @@ def telegram_send_photo(png_bytes, caption):
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return True
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode('utf-8', errors='ignore')
-        print(f"[TG sendPhoto Hata] HTTP {e.code} | Detay: {err_body}")
-        return telegram_send_message(caption)
+        urllib.request.urlopen(req, timeout=15).read()
     except Exception as e:
-        print(f"[TG sendPhoto Genel Hata] {e}")
-        return telegram_send_message(caption)
+        print(f"[TG sendPhoto hata] {e}")
+        telegram_send_message(caption)
 
 
 def record_signal_and_notify(engine, symbol, base, direction, entry_price, caption, png_bytes=b""):
@@ -951,9 +946,11 @@ def record_signal_and_notify(engine, symbol, base, direction, entry_price, capti
 
 
 # ==============================================================================
-# FUTURES 3X IZOLE OTOMATIK AL-SAT MOTORU
+# FUTURES 3X IZOLE OTOMATIK AL-SAT MOTORU (+%5 TP VE -%5 STOP LOSS)
 # ==============================================================================
 def should_auto_trade_signal(engine, quote):
+    # SADECE PUMP (0-7 dk) ve PUMP15M (15 dk) USDT sinyallerinde Futures 3x LONG acar!
+    # ATL ve ATH sinyalleri KESINLIKLE islem acmaz.
     if not auto_trade["enabled"] or quote != "USDT":
         return False
     return engine in ("PUMP", "PUMP15M")
@@ -1036,6 +1033,7 @@ def maybe_execute_futures_buy(engine, engine_label, symbol, base, quote, ref_pri
             )
             return
 
+        # LIVE / TESTNET: 1) ISOLATED margin, 2) 3x kaldirac, 3) MARKET BUY, 4) LIMIT TP + STOP_MARKET SL
         try:
             binance_futures_signed("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"}, mode)
         except BinanceFuturesError as m_err:
@@ -1350,7 +1348,7 @@ def poll_open_binance_trades_loop():
 
 
 # ==============================================================================
-# MOTOR 1: 0-7 DK SPOT ANLIK PUMP
+# MOTOR 1: 0-7 DK SPOT ANLIK PUMP (TEKIL COIN KILIDI + FUTURES 3X)
 # ==============================================================================
 def is_pump_locked(lock_bucket, base, now):
     rec = locks[lock_bucket].get(base)
@@ -1452,7 +1450,7 @@ def _verify_and_emit_pump(sym, base, quote, approx_cur, approx_vol, min_pt, hist
 
 
 # ==============================================================================
-# MOTOR 2, 3, 4: 15 DK KIRILIM + KESIN ATL / ATH
+# MOTOR 2, 3, 4: 15 DK KIRILIM (FUTURES 3X) + KESIN ATL / ATH (YALNIZ BILDIRIM)
 # ==============================================================================
 def structure_scan_loop():
     cursor = 0
@@ -1480,6 +1478,7 @@ def structure_scan_loop():
                 base = tk["base"]
                 now = time.time()
 
+                # --- 15 DK HACIMLI KIRILIM (PUMP15M) -> AYRI KILIT + FUTURES 3X ---
                 if not is_pump_locked("pump15m", base, now):
                     c15 = fetch_klines(sym, "15m", limit=24)
                     if len(c15) >= 10:
@@ -1510,6 +1509,7 @@ def structure_scan_loop():
                                 record_signal_and_notify("PUMP15M", sym, base, "LONG", live_p, caption, png)
                                 maybe_execute_futures_buy("PUMP15M", "15 dk Hacimli Kirilim", sym, base, "USDT", live_p)
 
+                # --- KESIN ATL & ATH TESPITI (DAHA ASAGI/YUKARI KIRILMADIKCA TEKRAR GELMEZ, ISLEM ACMAZ) ---
                 monthly = fetch_klines(sym, "1M", limit=120)
                 if len(monthly) >= 2:
                     hist_bars = monthly[:-1]
@@ -1556,7 +1556,7 @@ def structure_scan_loop():
 
 
 # ==============================================================================
-# PIK TAKIBI, GUNUN KAZANANI VE TOP 24
+# PIK TAKIBI, GUNUN ZAFERI (21:00 TR), TOP 24 SAAT (23:00 TR) & DUYURULAR (60 SN)
 # ==============================================================================
 def update_signal_peaks():
     changed = False
@@ -1595,27 +1595,13 @@ def build_victory_report(now_ts=None):
             best_by_sym[s["symbol"]] = s
     ranked = sorted(best_by_sym.values(), key=lambda x: x["peak_pct"], reverse=True)
     if not ranked:
-        return "🏆 <b>GÜNÜN KAZANANI (21:00 TR)</b>\n\nSon 24 saatte +%3 ve üzeri pik yapan Pump/Kırılım sinyali henüz oluşmadı.", None
-
-    top = ranked[0]
-    base = top["base"]
-    entry = top["entry"]
-    peak = top["peak_price"]
-    peak_pct = top["peak_pct"]
-
-    lines = [
-        f"🏆 <b>GÜNÜN KAZANANI: {html.escape(base)}</b>",
-        "",
-        "🔥 <b>24 saat içinde en çok yükselen coin!</b>",
-        "",
-        f"📉 Dip Fiyat: <b>{fmt_price(entry)}</b>",
-        f"🚀 Zirve Fiyat: <b>{fmt_price(peak)}</b>",
-        f"📈 Maksimum Yükseliş: <b>+{peak_pct:.1f}%</b>",
-        "",
-        f"💡 <b>Değerlendirme:</b> {html.escape(base)} gün içerisinde muazzam bir hacim ve fiyat patlaması yaşadı. "
-        f"Pump Dedektör verilerimize göre günün en kârlı hareketi bu coinde gerçekleşti.",
-    ]
-    return "\n".join(lines), top
+        return "🏆 <b>GUNUN ZAFERI (21:00 TR)</b>\n\nSon 24 saatte +%3 ve uzeri pik yapan Pump/Kirilim sinyali henuz olusmadi."
+    lines = ["🏆 <b>GUNUN ZAFERI — SPOT PUMP SIRALAMASI (21:00 TR)</b>\n"]
+    for i, s in enumerate(ranked[:15], 1):
+        lines.append(
+            f"{i}. <b>#{s['base']}</b> · <b>+{s['peak_pct']:.2f}%</b> | ${fmt_price(s['entry'])} ➡️ ${fmt_price(s['peak_price'])}"
+        )
+    return "\n".join(lines)
 
 
 def build_top24_report_and_png(now_ts=None):
@@ -1692,7 +1678,7 @@ def poll_binance_announcements():
 
 
 # ==============================================================================
-# TELEGRAM KOMUT DINLEYICI
+# TELEGRAM KOMUT DINLEYICI (/durum, /top24, /futures, /al_baslat, /al_durdur, /kapat, /sifirla)
 # ==============================================================================
 def handle_telegram_command(text):
     parts = text.strip().split()
@@ -1711,11 +1697,8 @@ def handle_telegram_command(text):
             "• /pozisyonlar — Acik Futures pozisyonlari ve canli K/Z\n"
             "• /kapat SYMBOL — Ornek: /kapat BTCUSDT\n"
             "• /kilitler — Kilitli coin sayilari\n"
-            "• /sifirla — Pump & 15dk kilitlerini temizle\n"
-            "• /test — Telegram baglantisini test et"
+            "• /sifirla — Pump & 15dk kilitlerini temizle"
         )
-    elif cmd == "/test":
-        telegram_send_message("✅ <b>Test Mesajı</b>\nTelegram bağlantısı başarılı. Bot çalışıyor!")
     elif cmd in ("/top24", "/ozet", "/24s"):
         cap, png = build_top24_report_and_png(time.time())
         if png:
@@ -1931,31 +1914,90 @@ def scheduler_and_news_loop():
 
         dt = tr_now()
         today = dt.strftime("%Y-%m-%d")
-
         if dt.hour == 21 and locks["reports"].get("victory_day") != today:
             locks["reports"]["victory_day"] = today
             save_state()
-            cap, winner = build_victory_report(now)
+            telegram_send_message(build_victory_report(now))
+        if dt.hour == 23 and locks["reports"].get("top24_day") != today:
+            locks["reports"]["top24_day"] = today
+            save_state()
+            cap, png = build_top24_report_and_png(now)
+            if png:
+                telegram_send_photo(png, cap)
+            else:
+                telegram_send_message(cap)
+        time.sleep(15)
 
-            telegram_send_message(cap)
 
-            if winner:
-                try:
-                    c1m = fetch_klines(winner["symbol"], "1m", limit=45)
-                    if c1m:
-                        with state_lock:
-                            tk = tickers.get(winner["symbol"])
-                        live = tk["price"] if tk and tk["price"] > 0 else winner["peak_price"]
-                        png = render_pump_png(
-                            winner["symbol"],
-                            "GUNUN KAZANANI",
-                            c1m,
-                            live,
-                            winner["entry"],
-                            badge="GUNUN KAZANANI",
-                        )
-                        if png:
-                            telegram_send_photo(
-                                png,
-                                f"🏆 <b>GÜNÜN KAZANANI — #{html.escape(winner['base'])}</b>\n"
-                                f"📈 Maksimum: <b>+{
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def _send_ok(self, include_body=True):
+        with state_lock:
+            open_cnt = sum(1 for t in trades_log if t.get("status") == "OPEN")
+            n_pairs = len(tickers)
+            n_fut = len(futures_filters)
+        body = json.dumps({
+            "ok": True,
+            "ws": ws_connected,
+            "pairs": n_pairs,
+            "futuresPairs": n_fut,
+            "engines": ["PUMP", "PUMP15M", "ATL", "ATH"],
+            "autoTrade": {
+                "enabled": auto_trade["enabled"],
+                "mode": auto_trade["mode"],
+                "leverage": auto_trade["leverage"],
+                "tpPct": auto_trade["tp_pct"],
+                "slPct": auto_trade["sl_pct"],
+                "openTrades": open_cnt,
+            },
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._send_ok(include_body=True)
+
+    def do_HEAD(self):
+        self._send_ok(include_body=False)
+
+    def log_message(self, format, *args):
+        return
+
+
+def _watchdog_runner(target_fn):
+    while True:
+        try:
+            target_fn()
+        except Exception as e:
+            print(f"[Watchdog yeniden baslatma {target_fn.__name__}] {e}")
+        time.sleep(3)
+
+
+def main():
+    load_state()
+    refresh_active_spot_symbols()
+    refresh_futures_contracts()
+    print(
+        f"[Spot Pump & Futures 3x Bot] Port={PORT}, Mode={auto_trade['mode']}, "
+        f"Enabled={auto_trade['enabled']}, TP=+{auto_trade['tp_pct']}%, SL=-{auto_trade['sl_pct']}%"
+    )
+    workers = (
+        ws_stream_loop,
+        rest_seed_loop,
+        structure_scan_loop,
+        poll_open_binance_trades_loop,
+        scheduler_and_news_loop,
+        telegram_commands_loop,
+    )
+    for fn in workers:
+        threading.Thread(target=_watchdog_runner, args=(fn,), daemon=True).start()
+
+    srv = http.server.HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
