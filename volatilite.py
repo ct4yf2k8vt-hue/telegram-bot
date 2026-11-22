@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Spot Akis Terminali - Render Python 3 Telegram Botu (Zero-Dependency)
-Aktif Sinyal Motoru (Sadece 1 Numarali Bot):
+Aktif Sinyal Motorlari:
   1. 0-7 dk Spot Anlik Pump (PUMP) - Tekil Coin Kilidi + Canli 1dk/15sn Grafik
+  2. 15 dk Yapi Kirilimi (YAPI) - Onceki tepe/dip kirilimi (MSS) + Canli 15dk Grafik
 Otomatik Ozet & Duyurular:
   - Gunun Zaferi (21:00 TR)
   - Top 24 Saat Ozeti (23:00 TR)
@@ -35,6 +36,13 @@ PORT = int(os.environ.get("PORT", "10000"))
 PUMP_REPEAT_HOURS = float(os.environ.get("PUMP_REPEAT_HOURS", "0"))
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/spot_bot_state.json")
 
+# 15 dk yapi kirilimi ayarlari
+YAPI_MIN_HACIM = float(os.environ.get("YAPI_MIN_HACIM", "5000000"))   # 24s USDT hacim alt siniri
+YAPI_MAX_COIN = int(os.environ.get("YAPI_MAX_COIN", "250"))           # hacme gore en buyuk N coin
+YAPI_TEKRAR_SAAT = float(os.environ.get("YAPI_TEKRAR_SAAT", "4"))     # ayni coin + ayni yon icin bekleme
+YAPI_SADECE_DONUS = os.environ.get("YAPI_SADECE_DONUS", "1") != "0"   # 1: sadece trend donusu (MSS), 0: devam kirilimlari da (BOS)
+YAPI_MARJ = 0.0015                                                    # seviyeyi %0.15 asinca kirilim sayilir
+
 BINANCE_MIRRORS = [
     "https://api.binance.com",
     "https://api1.binance.com",
@@ -60,6 +68,10 @@ news_seeded = False
 ws_connected = False
 ban_until_ts = 0.0
 preferred_mirror_idx = 0
+
+struct_levels = {}    # sym -> 15dk yapi seviyeleri (YAPI motoru)
+yapi_cd = {}          # (sym, yon) -> bekleme bitis zamani
+yapi_zamanlari = []   # son sinyal zamanlari (toplu hareket siniri)
 
 locks = {
     "pump": {},   # base -> {"symbol": str, "locked_at": float}
@@ -341,8 +353,46 @@ def fetch_1m_klines(sym, limit=45):
     return []
 
 
+def fetch_klines(sym, interval, limit):
+    """Genel mum cekici: Binance REST -> Binance WS-API -> Bybit (ayni yedek zinciri)."""
+    q = urllib.parse.quote(sym)
+    try:
+        raw = binance_rest_get(f"/api/v3/klines?symbol={q}&interval={interval}&limit={limit}", timeout=7)
+        if isinstance(raw, list) and raw:
+            return _parse_binance_klines(raw)
+    except Exception:
+        pass
+    try:
+        raw = ws_api_request("klines", {"symbol": sym, "interval": interval, "limit": limit}, timeout=7)
+        if isinstance(raw, list) and raw:
+            return _parse_binance_klines(raw)
+    except Exception:
+        pass
+    try:
+        by_iv = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}.get(interval)
+        if by_iv:
+            url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={q}&interval={by_iv}&limit={limit}"
+            d = http_get_json(url, timeout=6)
+            rows = d.get("result", {}).get("list", [])
+            if rows:
+                return [
+                    {
+                        "openTime": int(r[0]) // 1000,
+                        "open": float(r[1]),
+                        "high": float(r[2]),
+                        "low": float(r[3]),
+                        "close": float(r[4]),
+                        "volume": float(r[5]),
+                    }
+                    for r in reversed(rows)
+                ]
+    except Exception:
+        pass
+    return []
+
+
 # ==============================================================================
-# SIFIR BAGIMLILIKLI PNG MUM GRAFIGI OLUSTURUCU (CANLI 1DK / 15SN PUMP)
+# SIFIR BAGIMLILIKLI PNG MUM GRAFIGI OLUSTURUCU (CANLI 1DK / 15SN / 15DK)
 # ==============================================================================
 FONT_5X7 = {
     "0": [0x3E, 0x51, 0x49, 0x45, 0x3E], "1": [0x00, 0x42, 0x7F, 0x40, 0x00],
@@ -371,8 +421,8 @@ FONT_5X7 = {
 }
 
 
-def render_pump_png(symbol, tf_label, candles, live_price, start_price):
-    """Saf Python PNG mum grafigi (canli fiyat + baslangic cizgisi + hacim)."""
+def render_pump_png(symbol, tf_label, candles, live_price, start_price, tur="SPOT PUMP", cizgi="BAS"):
+    """Saf Python PNG mum grafigi (canli fiyat + baslangic/seviye cizgisi + hacim)."""
     W, H = 860, 440
     BG = (9, 13, 22)
     GRID = (28, 38, 56)
@@ -459,7 +509,7 @@ def render_pump_png(symbol, tf_label, candles, live_price, start_price):
     def y_of(p):
         return int(pad_t + ((hi_p - p) / rng_p) * price_h)
 
-    draw_text(pad_l, 14, f"{symbol} | {tf_label} | SPOT PUMP | ANLIK ${fmt_price(live_price)}", TEXT, scale=2)
+    draw_text(pad_l, 14, f"{symbol} | {tf_label} | {tur} | ANLIK ${fmt_price(live_price)}", TEXT, scale=2)
 
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         gy = int(pad_t + price_h * frac)
@@ -471,7 +521,7 @@ def render_pump_png(symbol, tf_label, candles, live_price, start_price):
         sy = y_of(start_price)
         if pad_t <= sy <= pad_t + price_h:
             draw_line(pad_l, sy, pad_l + plot_w, sy, START_COL, dashed=True)
-            draw_text(pad_l + plot_w + 8, sy - 3, f"BAS {fmt_price(start_price)}", START_COL, scale=1)
+            draw_text(pad_l + plot_w + 8, sy - 3, f"{cizgi} {fmt_price(start_price)}", START_COL, scale=1)
 
     n = len(bars)
     step = plot_w / max(1, n)
@@ -695,6 +745,189 @@ def _verify_and_emit_pump(sym, base, quote, approx_cur, approx_vol, min_pt, hist
 
 
 # ==============================================================================
+# MOTOR 2: 15 DK YAPI KIRILIMI (ONCEKI TEPE / DIP KIRILIMI - MSS)
+#  - Dusus yapisi (alcalan tepe + alcalan dip) iken onceki tepe yukari kirilirsa -> YUKARI sinyal
+#  - Yukselis yapisi (yukselen tepe + yukselen dip) iken onceki dip asagi kirilirsa -> ASAGI sinyal
+#  Seviyeler 15dk kapanmis mumlardan 15 dakikada bir hesaplanir (REST yuku cok dusuk),
+#  kirilim ise canli fiyat akisindan anlik yakalanir.
+# ==============================================================================
+def find_pivots(highs, lows, window=3):
+    pivot_highs = []
+    pivot_lows = []
+    for i in range(window, len(highs) - window):
+        if highs[i] == max(highs[i - window:i + window + 1]):
+            pivot_highs.append((i, highs[i]))
+        if lows[i] == min(lows[i - window:i + window + 1]):
+            pivot_lows.append((i, lows[i]))
+    return pivot_highs, pivot_lows
+
+
+def analyze_structure(candles, now):
+    """Kapanmis 15dk mumlardan izlenecek tepe/dip seviyelerini cikarir."""
+    if len(candles) < 30:
+        return None
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    closes = [c["close"] for c in candles]
+    n = len(candles)
+    ph, pl = find_pivots(highs, lows, 3)
+    ph = [x for x in ph if x[0] >= n - 62]
+    pl = [x for x in pl if x[0] >= n - 62]
+    if len(ph) < 2 or len(pl) < 2:
+        return None
+    if ph[-1][0] < n - 45 or pl[-1][0] < n - 45:
+        return None  # son tepe/dip cok eski, yapi guncel degil
+    h1, h2 = ph[-2][1], ph[-1][1]
+    l1, l2 = pl[-2][1], pl[-1][1]
+    last, prev = closes[-1], closes[-2]
+    if last <= 0 or (h2 - l2) / last < 0.01:
+        return None  # cok kucuk yapi, gurultu
+
+    down = h2 < h1 and l2 < l1
+    up = h2 > h1 and l2 > l1
+    up_lv = down_lv = None
+    if down:
+        up_lv = (h2, "MSS")
+        if not YAPI_SADECE_DONUS:
+            down_lv = (l2, "BOS")
+    elif up:
+        down_lv = (l2, "MSS")
+        if not YAPI_SADECE_DONUS:
+            up_lv = (h2, "BOS")
+
+    fresh_up = fresh_down = False
+    if up_lv:
+        if last > up_lv[0] * (1 + 0.0005) and prev <= up_lv[0]:
+            fresh_up = True      # son kapanista kirildi
+        elif last > up_lv[0]:
+            up_lv = None         # kirilim cok once olmus
+    if down_lv:
+        if last < down_lv[0] * (1 - 0.0005) and prev >= down_lv[0]:
+            fresh_down = True
+        elif last < down_lv[0]:
+            down_lv = None
+
+    if not up_lv and not down_lv:
+        return None
+    return {
+        "up": up_lv, "down": down_lv, "h2": h2, "l2": l2,
+        "fresh_up": fresh_up, "fresh_down": fresh_down,
+        "fired_up": False, "fired_down": False,
+        "candles": candles[-70:], "updated": now,
+    }
+
+
+def yapi_tetikle(sym, yon, level, tur, price, lv):
+    now = time.time()
+    key = (sym, yon)
+    with state_lock:
+        if now < yapi_cd.get(key, 0):
+            return
+        tk = tickers.get(sym)
+        if not tk or tk["volume24h"] < YAPI_MIN_HACIM:
+            return
+        yapi_zamanlari[:] = [t for t in yapi_zamanlari if now - t < 600]
+        if len(yapi_zamanlari) >= 8:
+            return  # piyasa genelinde toplu hareket: spam engeli
+        yapi_zamanlari.append(now)
+        yapi_cd[key] = now + YAPI_TEKRAR_SAAT * 3600
+        vol = tk["volume24h"]
+    threading.Thread(target=_yapi_gonder, args=(sym, yon, level, tur, price, lv, vol), daemon=True).start()
+
+
+def _yapi_gonder(sym, yon, level, tur, price, lv, vol):
+    try:
+        mumlar = list(lv["candles"])
+        son = mumlar[-1]
+        mumlar.append({
+            "openTime": son["openTime"] + 900, "open": son["close"],
+            "high": max(son["close"], price), "low": min(son["close"], price),
+            "close": price, "volume": 0.0,
+        })
+        png = render_pump_png(sym, "15DK CANLI", mumlar, price, level, tur="YAPI KIRILIMI", cizgi="SEVIYE")
+        pct = abs(price - level) / level * 100.0
+        if yon == "YUKARI":
+            baslik = f"🟢 <b>15DK YAPI KIRILIMI (YUKARI) — #{sym}</b>"
+            kirilan = f"📈 Onceki tepe kirildi: <b>{fmt_price(level)}</b> (+{pct:.2f}%)"
+            aciklama = ("Dusen tepe/dip yapisi bozuldu: yukari donus (MSS)" if tur == "MSS"
+                        else "Yukselis trendi devam ediyor (BOS)")
+            iptal = f"Iptal: {fmt_price(lv['l2'])} alti"
+        else:
+            baslik = f"🔴 <b>15DK YAPI KIRILIMI (ASAGI) — #{sym}</b>"
+            kirilan = f"📉 Onceki dip kirildi: <b>{fmt_price(level)}</b> (-{pct:.2f}%)"
+            aciklama = ("Yukselen tepe/dip yapisi bozuldu: asagi donus (MSS)" if tur == "MSS"
+                        else "Dusus trendi devam ediyor (BOS)")
+            iptal = f"Iptal: {fmt_price(lv['h2'])} ustu"
+        caption = (
+            f"{baslik}\n\n"
+            f"{kirilan}\n"
+            f"🔄 {aciklama}\n"
+            f"💰 Anlik: <b>{fmt_price(price)}</b> | {iptal}\n"
+            f"💧 24s Parite Hacmi: {vol:,.0f} (USDT)\n"
+            f"🔒 Ayni yon icin {YAPI_TEKRAR_SAAT:g} saat tekrar bildirim yok."
+        )
+        telegram_send_photo(png, caption)
+        print(f"[YAPI] {sym} {yon} ({tur}) {fmt_price(level)} -> {fmt_price(price)}", flush=True)
+    except Exception as e:
+        print(f"[YAPI gonderim hata] {e}", flush=True)
+
+
+def check_structure_break(sym, price, now):
+    """Her canli fiyat guncellemesinde izlenen seviyenin kirilip kirilmadigini kontrol eder."""
+    try:
+        lv = struct_levels.get(sym)
+        if not lv or now - lv["updated"] > 2400:
+            return
+        up = lv["up"]
+        if up and not lv["fired_up"] and price > up[0] * (1 + YAPI_MARJ):
+            lv["fired_up"] = True
+            yapi_tetikle(sym, "YUKARI", up[0], up[1], price, lv)
+        dn = lv["down"]
+        if dn and not lv["fired_down"] and price < dn[0] * (1 - YAPI_MARJ):
+            lv["fired_down"] = True
+            yapi_tetikle(sym, "ASAGI", dn[0], dn[1], price, lv)
+    except Exception:
+        pass
+
+
+def yapi_loop():
+    print("[YAPI] 15dk Yapi Kirilimi motoru basladi.", flush=True)
+    time.sleep(45)
+    while True:
+        try:
+            with state_lock:
+                adaylar = [(s, tk["volume24h"]) for s, tk in tickers.items()
+                           if tk["quote"] == "USDT" and tk["volume24h"] >= YAPI_MIN_HACIM]
+            adaylar.sort(key=lambda x: x[1], reverse=True)
+            for sym, _ in adaylar[:YAPI_MAX_COIN]:
+                try:
+                    kl = fetch_klines(sym, "15m", 70)
+                    if len(kl) < 40:
+                        continue
+                    kapanmis = kl[:-1]  # son mum henuz kapanmadi
+                    lv = analyze_structure(kapanmis, time.time())
+                    if not lv:
+                        struct_levels.pop(sym, None)
+                    else:
+                        struct_levels[sym] = lv
+                        tk = tickers.get(sym)
+                        px = tk["price"] if tk and tk["price"] > 0 else kapanmis[-1]["close"]
+                        if lv["fresh_up"] and lv["up"]:
+                            lv["fired_up"] = True
+                            yapi_tetikle(sym, "YUKARI", lv["up"][0], lv["up"][1], px, lv)
+                        if lv["fresh_down"] and lv["down"]:
+                            lv["fired_down"] = True
+                            yapi_tetikle(sym, "ASAGI", lv["down"][0], lv["down"][1], px, lv)
+                except Exception as e:
+                    print(f"[YAPI] {sym} hata: {e}", flush=True)
+                time.sleep(0.25)
+        except Exception as e:
+            print(f"[YAPI] dongu hata: {e}", flush=True)
+        # bir sonraki 15dk mum kapanisindan 20 sn sonra tekrar
+        time.sleep(max(30.0, 900 - (time.time() % 900) + 20))
+
+
+# ==============================================================================
 # PIK TAKIBI, GUNUN ZAFERI (21:00 TR), TOP 24 SAAT (23:00 TR) & DUYURULAR (60 SN)
 # ==============================================================================
 def update_signal_peaks():
@@ -822,6 +1055,8 @@ def process_ticker(sym, price, vol24h, now):
             "updated_at": now,
         }
     evaluate_pump(sym, price, vol24h, now)
+    if quote == "USDT":
+        check_structure_break(sym, price, now)
 
 
 def ws_stream_loop():
@@ -931,9 +1166,14 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             "ok": True,
             "ws": ws_connected,
             "pairs": len(tickers),
-            "engines": ["PUMP"],
+            "yapi_izlenen": len(struct_levels),
+            "engines": ["PUMP", "YAPI"],
         }).encode("utf-8")
         self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, format, *args):
         return
@@ -942,7 +1182,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
 def main():
     load_state()
     print(f"[Spot Pump Bot] Baslatiliyor... Port={PORT}, ChatID={CHAT_ID}")
-    for fn in (ws_stream_loop, rest_seed_loop, scheduler_and_news_loop):
+    for fn in (ws_stream_loop, rest_seed_loop, scheduler_and_news_loop, yapi_loop):
         threading.Thread(target=fn, daemon=True).start()
 
     srv = http.server.HTTPServer(("0.0.0.0", PORT), HealthHandler)
