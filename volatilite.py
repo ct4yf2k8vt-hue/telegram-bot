@@ -1,6 +1,6 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 13:41:39 · Rev #2
+# Uretim: 14:20:04 · Rev #2
 # Aktif Motorlar: Pump(%4) | 15dk(%3.2) | ATH/ATL(1M) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major)
 # Futures: 3x | $25 | TP +%10 / SL -%10 | RSI >= 70
 # ==============================================================================
@@ -68,15 +68,15 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
     "patternsEnabled": False,
-    "patternTimeframes": ["15m", "1h", "4h", "1d"],
+    "patternTimeframes": [],
     "enabledPatterns": {
-        "DOUBLE_BOTTOM": True,
-        "DOUBLE_TOP": True,
-        "HEAD_SHOULDERS": True,
-        "INV_HEAD_SHOULDERS": True,
-        "BULL_FLAG": True,
-        "BEAR_FLAG": True,
-        "BEAR_RECTANGLE": True,
+        "DOUBLE_BOTTOM": False,
+        "DOUBLE_TOP": False,
+        "HEAD_SHOULDERS": False,
+        "INV_HEAD_SHOULDERS": False,
+        "BULL_FLAG": False,
+        "BEAR_FLAG": False,
+        "BEAR_RECTANGLE": False,
     },
     "patternMinHeightPct": 1.2,
     "hourlyGainersReportEnabled": True,
