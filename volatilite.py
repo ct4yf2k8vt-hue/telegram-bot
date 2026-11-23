@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 20:10:08 · Rev #2
+# Uretim: 20:54:12 · Rev #3
 # Aktif Motorlar: Volatilite(15m,1h, Tumu) | Formasyon(1/7)
-# Futures: 3x | $25 | TP +%5 / SL -%5 | RSI >= 90
+# Futures: 3x | $25 | TP +%3 / SL -%50 | RSI >= 70
 # ==============================================================================
 import asyncio
 import concurrent.futures
@@ -102,10 +102,10 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "mode": "PAPER",
     "leverage": 3,
     "tradeUsdt": 25,
-    "tpPct": 5,
-    "slPct": 5,
+    "tpPct": 3,
+    "slPct": 50,
     "maxOpenTrades": 0,
-    "rsiMin": 90,
+    "rsiMin": 70,
     "notifyPaperTelegram": True,
 }
 
@@ -1841,4 +1841,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(l
+    asyncio.run(main())
