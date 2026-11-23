@@ -1,6 +1,7 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Aktif Motorlar: Pump(%4) | 15dk(%3.2) | ATH/ATL(1M,1w) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major) | Formasyon(2/7)
+# Uretim: 13:26:58 · Rev #2
+# Aktif Motorlar: Pump(%4) | 15dk(%3.2) | ATH/ATL(1M) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major)
 # Futures: 3x | $25 | TP +%10 / SL -%10 | RSI >= 70
 # ==============================================================================
 import asyncio
@@ -20,42 +21,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import aiohttp
 from aiohttp import web
 
-# ==============================================================================
-# ORTAM DEGISKENLERI (RENDER ENVIRONMENT VARIABLES)
-# ==============================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "1623907197").strip()
-PORT = int(os.getenv("PORT", "10000"))
-
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-BINANCE_KEYS_READY = bool(BINANCE_API_KEY and BINANCE_API_SECRET)
-
-# Istege bagli canli web senkronizasyonu (orn. https://.../api/bot-config)
-WEB_SYNC_URL = os.getenv("WEB_SYNC_URL", "").strip()
-
-TR_TZ = timezone(timedelta(hours=3))
-STATE_FILE = "/tmp/spot_bot_render_state.json"
-
-BINANCE_MIRRORS = [
-    "https://data-api.binance.vision",
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-]
-
-PATTERN_LABELS = {
-    "DOUBLE_BOTTOM": "Double Bottom (İkili Dip)",
-    "DOUBLE_TOP": "Double Top (İkili Tepe)",
-    "HEAD_SHOULDERS": "Head & Shoulders (OBO)",
-    "INV_HEAD_SHOULDERS": "Inverted H&S (TOBO)",
-    "BULL_FLAG": "Bullish Flag (Boğa Bayrağı)",
-    "BEAR_FLAG": "Bearish Flag (Ayı Bayrağı)",
-    "BEAR_RECTANGLE": "Bearish Rectangle (Ayı Dikdörtgeni)",
-}
-
-# Web panelinden secilen guncel tikler ve parametreler:
+# Web panelinden secilen guncel tikler ve parametreler (GitHub bot.py ile birebir degistirin):
 DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pumpEnabled": True,
     "pumpThresholdPct": 4,
@@ -66,7 +32,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pump15mMinRvol": 1.4,
     "athEnabled": True,
     "atlEnabled": True,
-    "athAtlTimeframes": ["1M", "1w"],
+    "athAtlTimeframes": ["1M"],
     "athAtlLockPct": 1,
     "athAtlCooldownMin": 5,
     "ma200Enabled": True,
@@ -99,16 +65,16 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityMinMovePct": 1.8,
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
-    "patternsEnabled": True,
-    "patternTimeframes": ["15m"],
+    "patternsEnabled": False,
+    "patternTimeframes": ["15m", "1h", "4h", "1d"],
     "enabledPatterns": {
         "DOUBLE_BOTTOM": True,
         "DOUBLE_TOP": True,
-        "HEAD_SHOULDERS": False,
-        "INV_HEAD_SHOULDERS": False,
-        "BULL_FLAG": False,
-        "BEAR_FLAG": False,
-        "BEAR_RECTANGLE": False,
+        "HEAD_SHOULDERS": True,
+        "INV_HEAD_SHOULDERS": True,
+        "BULL_FLAG": True,
+        "BEAR_FLAG": True,
+        "BEAR_RECTANGLE": True,
     },
     "patternMinHeightPct": 1.2,
     "hourlyGainersReportEnabled": True,
@@ -140,12 +106,48 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
+
+# ==============================================================================
+# ORTAM DEGISKENLERI (RENDER ENVIRONMENT VARIABLES)
+# ==============================================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "1623907197").strip()
+PORT = int(os.getenv("PORT", "10000"))
+
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+BINANCE_KEYS_READY = bool(BINANCE_API_KEY and BINANCE_API_SECRET)
+
 if os.getenv("AUTO_TRADE_ENABLED"):
     AUTO_TRADE["enabled"] = os.getenv("AUTO_TRADE_ENABLED", "").lower() in ("1", "true", "yes", "on")
 if os.getenv("AUTO_TRADE_MODE"):
     AUTO_TRADE["mode"] = os.getenv("AUTO_TRADE_MODE", "PAPER").upper()
 if AUTO_TRADE["mode"] in ("LIVE", "TESTNET") and not BINANCE_KEYS_READY:
     AUTO_TRADE["mode"] = "PAPER"
+
+# Istege bagli canli web senkronizasyonu (orn. https://.../api/bot-config)
+WEB_SYNC_URL = os.getenv("WEB_SYNC_URL", "").strip()
+
+TR_TZ = timezone(timedelta(hours=3))
+STATE_FILE = "/tmp/spot_bot_render_state.json"
+
+BINANCE_MIRRORS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
+
+PATTERN_LABELS = {
+    "DOUBLE_BOTTOM": "Double Bottom (İkili Dip)",
+    "DOUBLE_TOP": "Double Top (İkili Tepe)",
+    "HEAD_SHOULDERS": "Head & Shoulders (OBO)",
+    "INV_HEAD_SHOULDERS": "Inverted H&S (TOBO)",
+    "BULL_FLAG": "Bullish Flag (Boğa Bayrağı)",
+    "BEAR_FLAG": "Bearish Flag (Ayı Bayrağı)",
+    "BEAR_RECTANGLE": "Bearish Rectangle (Ayı Dikdörtgeni)",
+}
 
 # ==============================================================================
 # CANLI DURUM DEGISKENLERI
