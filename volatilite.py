@@ -1,15 +1,17 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 14:41:41 · Rev #3
+# Uretim: 17:36:24 · Rev #3
 # Aktif Motorlar: Pump(%3.5) | 15dk(%3.5) | ATH/ATL(1M) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major)
 # Futures: 3x | $25 | TP +%10 / SL -%10 | RSI >= 90
 # ==============================================================================
 import asyncio
+import concurrent.futures
 import copy
 import hashlib
 import hmac
 import json
 import os
+import re
 import struct
 import threading
 import time
@@ -23,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Web panelinden secilen guncel tikler ve parametreler (GitHub bot.py ile birebir degistirin):
+# Web panelinden secilen guncel tikler ve parametreler (GitHub volatilite.py / bot.py ile birebir degistirin):
 DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pumpEnabled": True,
     "pumpThresholdPct": 3.5,
@@ -68,15 +70,15 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
     "patternsEnabled": False,
-    "patternTimeframes": [],
+    "patternTimeframes": ["15m", "1h", "4h", "1d"],
     "enabledPatterns": {
-        "DOUBLE_BOTTOM": False,
-        "DOUBLE_TOP": False,
-        "HEAD_SHOULDERS": False,
-        "INV_HEAD_SHOULDERS": False,
-        "BULL_FLAG": False,
-        "BEAR_FLAG": False,
-        "BEAR_RECTANGLE": False,
+        "DOUBLE_BOTTOM": True,
+        "DOUBLE_TOP": True,
+        "HEAD_SHOULDERS": True,
+        "INV_HEAD_SHOULDERS": True,
+        "BULL_FLAG": True,
+        "BEAR_FLAG": True,
+        "BEAR_RECTANGLE": True,
     },
     "patternMinHeightPct": 1.2,
     "hourlyGainersReportEnabled": True,
@@ -112,12 +114,29 @@ AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
 # ==============================================================================
 # ORTAM DEGISKENLERI (RENDER ENVIRONMENT VARIABLES)
 # ==============================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "1623907197").strip()
+def _read_env_any(*keys: str, default: str = "") -> str:
+    for k in keys:
+        val = os.getenv(k, "").strip().strip('"').strip("'").strip()
+        if val:
+            return val
+    return default
+
+
+def _normalize_bot_token(raw: str) -> str:
+    cleaned = raw.strip().strip('"').strip("'").strip()
+    return re.sub(r"^bot(?=\d+:)", "", cleaned, flags=re.IGNORECASE)
+
+
+BOT_TOKEN = _normalize_bot_token(
+    _read_env_any("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TG_BOT_TOKEN")
+)
+CHAT_ID_RAW = _read_env_any("CHAT_ID", "TELEGRAM_CHAT_ID", "TG_CHAT_ID", "TELEGRAM_CHAT_IDS", default="1623907197")
+INITIAL_CHAT_IDS = [c.strip() for c in re.split(r"[\s,;]+", CHAT_ID_RAW) if c.strip()]
+CHAT_ID = INITIAL_CHAT_IDS[0] if INITIAL_CHAT_IDS else ""
 PORT = int(os.getenv("PORT", "10000"))
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+BINANCE_API_KEY = _read_env_any("BINANCE_API_KEY")
+BINANCE_API_SECRET = _read_env_any("BINANCE_API_SECRET")
 BINANCE_KEYS_READY = bool(BINANCE_API_KEY and BINANCE_API_SECRET)
 
 if os.getenv("AUTO_TRADE_ENABLED"):
@@ -128,7 +147,7 @@ if AUTO_TRADE["mode"] in ("LIVE", "TESTNET") and not BINANCE_KEYS_READY:
     AUTO_TRADE["mode"] = "PAPER"
 
 # Istege bagli canli web senkronizasyonu (orn. https://.../api/bot-config)
-WEB_SYNC_URL = os.getenv("WEB_SYNC_URL", "").strip()
+WEB_SYNC_URL = _read_env_any("WEB_SYNC_URL")
 
 TR_TZ = timezone(timedelta(hours=3))
 STATE_FILE = "/tmp/spot_bot_render_state.json"
@@ -158,6 +177,7 @@ BOT_RUNNING = True
 TICKER_MAP: Dict[str, Dict[str, Any]] = {}
 PRICE_HIST: Dict[str, deque] = {}
 ACTIVE_SPOT_SYMBOLS: Set[str] = set()
+SPOT_FILTERS: Dict[str, Dict[str, Any]] = {}
 FUTURES_FILTERS: Dict[str, Dict[str, Any]] = {}
 SIGNALS: List[Dict[str, Any]] = []
 TRADES: List[Dict[str, Any]] = []
@@ -176,12 +196,23 @@ ATH_ATL_INFLIGHT: Set[str] = set()
 MA200_COOLDOWN: Dict[str, float] = {}
 VOL_COOLDOWN: Dict[str, float] = {}
 TRADE_INFLIGHT: Set[str] = set()
-SUBSCRIBED_CHATS: Set[str] = {CHAT_ID} if CHAT_ID else set()
+SUBSCRIBED_CHATS: Set[str] = set(INITIAL_CHAT_IDS)
+
+TG_BOT_USERNAME = ""
+TG_OK = False
+LAST_TG_ERROR = ""
+TG_SENT_COUNT = 0
 
 LAST_VICTORY_DATE_TR = ""
 LAST_SUMMARY_DATE_TR = ""
 LAST_HOURLY_KEY = ""
 PREFERRED_MIRROR_IDX = 0
+HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=24, thread_name_prefix="http")
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now(TR_TZ).strftime("%H:%M:%S")
+    print(f"[{ts} TR] {msg}", flush=True)
 
 
 def fmt_price(p: float) -> str:
@@ -694,13 +725,24 @@ async def http_request(
     timeout_s: float = 12.0,
 ) -> Tuple[int, bytes]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _http_request_sync(method, url, headers, body, timeout_s))
+    return await loop.run_in_executor(HTTP_EXECUTOR, lambda: _http_request_sync(method, url, headers, body, timeout_s))
+
+
+def _safe_json_loads(raw: bytes) -> Any:
+    if not raw:
+        return {}
+    txt = raw.decode("utf-8", errors="replace").strip()
+    if not txt:
+        return {}
+    try:
+        return json.loads(txt)
+    except Exception:
+        return {"ok": False, "description": txt[:240]}
 
 
 async def http_get_json(url: str, timeout_s: float = 10.0) -> Tuple[int, Any]:
     status, raw = await http_request("GET", url, timeout_s=timeout_s)
-    data = json.loads(raw.decode("utf-8")) if raw else {}
-    return status, data
+    return status, _safe_json_loads(raw)
 
 
 async def http_post_json(url: str, payload: Dict[str, Any], timeout_s: float = 12.0) -> Tuple[int, Any]:
@@ -712,8 +754,7 @@ async def http_post_json(url: str, payload: Dict[str, Any], timeout_s: float = 1
         body=raw_body,
         timeout_s=timeout_s,
     )
-    data = json.loads(raw.decode("utf-8")) if raw else {}
-    return status, data
+    return status, _safe_json_loads(raw)
 
 
 async def fetch_binance_json(path: str, timeout_s: float = 9.0) -> Any:
@@ -725,7 +766,7 @@ async def fetch_binance_json(path: str, timeout_s: float = 9.0) -> Any:
         url = f"{BINANCE_MIRRORS[idx]}{path}"
         try:
             status, data = await http_get_json(url, timeout_s=timeout_s)
-            if status == 200:
+            if status == 200 and (isinstance(data, list) or (isinstance(data, dict) and "_raw" not in data and "code" not in data)):
                 PREFERRED_MIRROR_IDX = idx
                 return data
             last_err = f"HTTP {status}"
@@ -752,19 +793,63 @@ async def fetch_spot_klines(symbol: str, interval: str, limit: int = 120) -> Lis
     ]
 
 
-async def tg_send_text(html_text: str, explicit_cid: Optional[str] = None) -> None:
+def _strip_html_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s)
+
+
+async def tg_send_text(html_text: str, explicit_cid: Optional[str] = None) -> bool:
+    global LAST_TG_ERROR, TG_OK, TG_SENT_COUNT
     if not BOT_TOKEN:
-        return
+        LAST_TG_ERROR = "BOT_TOKEN tanımlı değil"
+        return False
     targets = [explicit_cid] if explicit_cid else list(SUBSCRIBED_CHATS)
+    if not targets:
+        LAST_TG_ERROR = "CHAT_ID / hedef sohbet tanımlı değil"
+        _log(f"[TG UYARI] {LAST_TG_ERROR}")
+        return False
+
+    any_ok = False
     for cid in targets:
         try:
-            await http_post_json(
+            payload: Dict[str, Any] = {
+                "chat_id": cid,
+                "text": html_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            status, js = await http_post_json(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                {"chat_id": cid, "text": html_text, "parse_mode": "HTML", "disable_web_page_preview": True},
-                timeout_s=12.0,
+                payload,
+                timeout_s=15.0,
             )
-        except Exception:
-            pass
+            if status == 429 and isinstance(js, dict):
+                wait_s = min(10.0, float((js.get("parameters") or {}).get("retry_after") or 2.0))
+                await asyncio.sleep(wait_s + 0.3)
+                status, js = await http_post_json(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    payload,
+                    timeout_s=15.0,
+                )
+            desc = str(js.get("description") or "") if isinstance(js, dict) else ""
+            if (status >= 400 or not isinstance(js, dict) or not js.get("ok")) and "parse entities" in desc.lower():
+                status, js = await http_post_json(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    {"chat_id": cid, "text": _strip_html_tags(html_text), "disable_web_page_preview": True},
+                    timeout_s=15.0,
+                )
+                desc = str(js.get("description") or "") if isinstance(js, dict) else ""
+            if status < 400 and isinstance(js, dict) and js.get("ok"):
+                any_ok = True
+                TG_OK = True
+                TG_SENT_COUNT += 1
+                LAST_TG_ERROR = ""
+            else:
+                LAST_TG_ERROR = f"sendMessage HTTP {status}: {desc or 'Bilinmeyen Telegram hatası'}"
+                _log(f"[TG HATA -> {cid}] {LAST_TG_ERROR}")
+        except Exception as e:
+            LAST_TG_ERROR = f"sendMessage istisna: {e}"
+            _log(f"[TG BAGLANTI HATASI -> {cid}] {LAST_TG_ERROR}")
+    return any_ok
 
 
 def build_telegram_photo_multipart(cid: str, caption: str, png: bytes) -> Tuple[bytes, str]:
@@ -790,14 +875,19 @@ def build_telegram_photo_multipart(cid: str, caption: str, png: bytes) -> Tuple[
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
-async def tg_send_photo(png: bytes, caption: str, explicit_cid: Optional[str] = None) -> None:
+async def tg_send_photo(png: bytes, caption: str, explicit_cid: Optional[str] = None) -> bool:
+    global LAST_TG_ERROR, TG_OK, TG_SENT_COUNT
     if not BOT_TOKEN:
-        return
+        LAST_TG_ERROR = "BOT_TOKEN tanımlı değil"
+        return False
     if not png:
-        await tg_send_text(caption, explicit_cid)
-        return
+        return await tg_send_text(caption, explicit_cid)
     targets = [explicit_cid] if explicit_cid else list(SUBSCRIBED_CHATS)
+    if not targets:
+        LAST_TG_ERROR = "CHAT_ID / hedef sohbet tanımlı değil"
+        return False
     safe_cap = caption[:995] + "..." if len(caption) > 1000 else caption
+    any_ok = False
     for cid in targets:
         try:
             body, ctype = build_telegram_photo_multipart(cid, safe_cap, png)
@@ -806,13 +896,26 @@ async def tg_send_photo(png: bytes, caption: str, explicit_cid: Optional[str] = 
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
                 headers={"Content-Type": ctype},
                 body=body,
-                timeout_s=18.0,
+                timeout_s=20.0,
             )
-            js = json.loads(raw.decode("utf-8")) if raw else {}
-            if status >= 400 or not js.get("ok"):
-                await tg_send_text(caption, cid)
-        except Exception:
-            await tg_send_text(caption, cid)
+            js = _safe_json_loads(raw)
+            if status < 400 and isinstance(js, dict) and js.get("ok"):
+                any_ok = True
+                TG_OK = True
+                TG_SENT_COUNT += 1
+                LAST_TG_ERROR = ""
+            else:
+                desc = str(js.get("description") or "") if isinstance(js, dict) else f"HTTP {status}"
+                LAST_TG_ERROR = f"sendPhoto HTTP {status}: {desc}"
+                _log(f"[TG PHOTO FALLBACK -> {cid}] {LAST_TG_ERROR}")
+                if await tg_send_text(caption, cid):
+                    any_ok = True
+        except Exception as e:
+            LAST_TG_ERROR = f"sendPhoto istisna: {e}"
+            _log(f"[TG PHOTO HATA -> {cid}] {LAST_TG_ERROR}")
+            if await tg_send_text(caption, cid):
+                any_ok = True
+    return any_ok
 
 
 # ==============================================================================
@@ -869,9 +972,12 @@ async def maybe_execute_auto_trade(signal: Dict[str, Any]) -> None:
         return
     if any(t["symbol"] == sym or t["base"] == signal["base"] for t in open_tr):
         return
-    flt = FUTURES_FILTERS.get(sym)
+    flt = FUTURES_FILTERS.get(sym) or SPOT_FILTERS.get(sym)
     if not flt:
-        return
+        if AUTO_TRADE["mode"] == "PAPER":
+            flt = {"stepSize": "0.0001", "minQty": 0.0, "tickSize": "0.0001", "minNotional": 5.0}
+        else:
+            return
 
     dir_side = "SHORT" if signal.get("direction") == "SHORT" else "LONG"
     entry_side = "SELL" if dir_side == "SHORT" else "BUY"
@@ -1083,8 +1189,8 @@ async def verify_and_emit_pump(t: Dict[str, Any], min7: Tuple[float, float], min
                 ],
                 "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
             })
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f"[Pump Dogrulama Hatasi ({sym})] {e}")
     finally:
         VERIFY_INFLIGHT.discard(sym)
 
@@ -1191,6 +1297,7 @@ def detect_patterns_py(bars: List[Dict[str, float]], min_height_pct: float, enab
 # ARKA PLAN DONGULERI (PIYASA, MA200, VOLATILITE, FORMASYON, ATL/ATH, SYNC)
 # ==============================================================================
 async def market_loop() -> None:
+    last_err_log = 0.0
     while True:
         try:
             raw = await fetch_binance_json("/api/v3/ticker/24hr")
@@ -1223,13 +1330,69 @@ async def market_loop() -> None:
                     w15 = STRATEGY_CONFIG["pump15mEnabled"] and p15 >= STRATEGY_CONFIG["pump15mThresholdPct"] and not is_pump_locked(LOCKS["pump15m"], t["base"], now_s)
                     if (w7 or w15) and now_s >= VERIFY_COOLDOWN.get(sym, 0):
                         asyncio.create_task(verify_and_emit_pump(t, min7, min15))
-        except Exception:
-            pass
+        except Exception as e:
+            if time.time() - last_err_log > 60:
+                last_err_log = time.time()
+                _log(f"[Market Loop Hatasi] {e}")
         await asyncio.sleep(3.5)
 
 
 async def ath_atl_loop() -> None:
     cursor = 0
+    sem = asyncio.Semaphore(6)
+
+    async def process_coin(t: Dict[str, Any], tfs: List[str], now_s: float, lock_ratio: float, cd_sec: float) -> None:
+        async with sem:
+            for tf in tfs:
+                key = f"{t['symbol']}:{tf}"
+                rec = ATH_ATL_LEVELS.get(key)
+                if not rec or (now_s - rec["syncedAt"]) > 3600:
+                    bars = await fetch_spot_klines(t["symbol"], tf, 120 if tf == "1M" else 90)
+                    if len(bars) >= 4:
+                        cl = bars[:-1]
+                        lo = min(b["low"] for b in cl if b["low"] > 0)
+                        hi = max(b["high"] for b in cl if b["high"] > 0)
+                        prev = rec or {}
+                        ATH_ATL_LEVELS[key] = {
+                            "atl": min(lo, prev.get("lastAtl", lo)),
+                            "ath": max(hi, prev.get("lastAth", hi)),
+                            "syncedAt": now_s,
+                            "lastAtl": prev.get("lastAtl"),
+                            "lastAth": prev.get("lastAth"),
+                            "lockedAt": prev.get("lockedAt", 0),
+                        }
+                        rec = ATH_ATL_LEVELS[key]
+                if not rec:
+                    continue
+                p = t["price"]
+                too_soon = (now_s - rec.get("lockedAt", 0)) < cd_sec
+                if STRATEGY_CONFIG["atlEnabled"] and rec["atl"] > 0 and p <= rec["atl"] * (1 - lock_ratio if rec.get("lastAtl") else 0.9985) and not (rec.get("lastAtl") and too_soon):
+                    prev_atl = rec["atl"]
+                    rec["atl"] = rec["lastAtl"] = p
+                    rec["lockedAt"] = now_s
+                    save_state()
+                    await emit_signal({
+                        "id": f"ATL-{t['symbol']}-{tf}-{int(now_s*1000)}", "engine": "ATL", "engineLabel": f"{tf} ATL",
+                        "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": "SHORT", "timeframe": tf,
+                        "entryPrice": p, "currentPrice": p, "peakPrice": p, "peakPct": 0.0,
+                        "headline": f"#{t['symbol']} ${fmt_price(p)} [{tf}] En Düşük Kırılımı (ATL)",
+                        "details": [f"📉 Önceki {tf} ATL (${fmt_price(prev_atl)}) aşağı kırıldı."],
+                        "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                    })
+                elif STRATEGY_CONFIG["athEnabled"] and rec["ath"] > 0 and p >= rec["ath"] * (1 + lock_ratio if rec.get("lastAth") else 1.0015) and not (rec.get("lastAth") and too_soon):
+                    prev_ath = rec["ath"]
+                    rec["ath"] = rec["lastAth"] = p
+                    rec["lockedAt"] = now_s
+                    save_state()
+                    await emit_signal({
+                        "id": f"ATH-{t['symbol']}-{tf}-{int(now_s*1000)}", "engine": "ATH", "engineLabel": f"{tf} ATH",
+                        "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": "LONG", "timeframe": tf,
+                        "entryPrice": p, "currentPrice": p, "peakPrice": p, "peakPct": 0.0,
+                        "headline": f"#{t['symbol']} ${fmt_price(p)} [{tf}] En Yüksek Kırılımı (ATH)",
+                        "details": [f"📈 Önceki {tf} ATH (${fmt_price(prev_ath)}) yukarı kırıldı."],
+                        "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                    })
+
     while True:
         try:
             tfs = STRATEGY_CONFIG["athAtlTimeframes"]
@@ -1238,62 +1401,13 @@ async def ath_atl_loop() -> None:
                 now_s = time.time()
                 lock_ratio = STRATEGY_CONFIG["athAtlLockPct"] / 100.0
                 cd_sec = STRATEGY_CONFIG["athAtlCooldownMin"] * 60.0
-                for _ in range(min(15, len(cands))):
-                    t = cands[cursor % len(cands)]
-                    cursor += 1
-                    for tf in tfs:
-                        key = f"{t['symbol']}:{tf}"
-                        rec = ATH_ATL_LEVELS.get(key)
-                        if not rec or (now_s - rec["syncedAt"]) > 3600:
-                            bars = await fetch_spot_klines(t["symbol"], tf, 120 if tf == "1M" else 90)
-                            if len(bars) >= 4:
-                                cl = bars[:-1]
-                                lo = min(b["low"] for b in cl if b["low"] > 0)
-                                hi = max(b["high"] for b in cl if b["high"] > 0)
-                                prev = rec or {}
-                                ATH_ATL_LEVELS[key] = {
-                                    "atl": min(lo, prev.get("lastAtl", lo)),
-                                    "ath": max(hi, prev.get("lastAth", hi)),
-                                    "syncedAt": now_s,
-                                    "lastAtl": prev.get("lastAtl"),
-                                    "lastAth": prev.get("lastAth"),
-                                    "lockedAt": prev.get("lockedAt", 0),
-                                }
-                                rec = ATH_ATL_LEVELS[key]
-                        if not rec:
-                            continue
-                        p = t["price"]
-                        too_soon = (now_s - rec.get("lockedAt", 0)) < cd_sec
-                        if STRATEGY_CONFIG["atlEnabled"] and rec["atl"] > 0 and p <= rec["atl"] * (1 - lock_ratio if rec.get("lastAtl") else 0.9985) and not (rec.get("lastAtl") and too_soon):
-                            prev_atl = rec["atl"]
-                            rec["atl"] = rec["lastAtl"] = p
-                            rec["lockedAt"] = now_s
-                            save_state()
-                            await emit_signal({
-                                "id": f"ATL-{t['symbol']}-{tf}-{int(now_s*1000)}", "engine": "ATL", "engineLabel": f"{tf} ATL",
-                                "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": "SHORT", "timeframe": tf,
-                                "entryPrice": p, "currentPrice": p, "peakPrice": p, "peakPct": 0.0,
-                                "headline": f"#{t['symbol']} ${fmt_price(p)} [{tf}] En Düşük Kırılımı (ATL)",
-                                "details": [f"📉 Önceki {tf} ATL (${fmt_price(prev_atl)}) aşağı kırıldı."],
-                                "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
-                            })
-                        elif STRATEGY_CONFIG["athEnabled"] and rec["ath"] > 0 and p >= rec["ath"] * (1 + lock_ratio if rec.get("lastAth") else 1.0015) and not (rec.get("lastAth") and too_soon):
-                            prev_ath = rec["ath"]
-                            rec["ath"] = rec["lastAth"] = p
-                            rec["lockedAt"] = now_s
-                            save_state()
-                            await emit_signal({
-                                "id": f"ATH-{t['symbol']}-{tf}-{int(now_s*1000)}", "engine": "ATH", "engineLabel": f"{tf} ATH",
-                                "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": "LONG", "timeframe": tf,
-                                "entryPrice": p, "currentPrice": p, "peakPrice": p, "peakPct": 0.0,
-                                "headline": f"#{t['symbol']} ${fmt_price(p)} [{tf}] En Yüksek Kırılımı (ATH)",
-                                "details": [f"📈 Önceki {tf} ATH (${fmt_price(prev_ath)}) yukarı kırıldı."],
-                                "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
-                            })
-                    await asyncio.sleep(0.1)
-        except Exception:
-            pass
-        await asyncio.sleep(10)
+                batch_sz = min(35, len(cands))
+                batch = [cands[(cursor + i) % len(cands)] for i in range(batch_sz)]
+                cursor += batch_sz
+                await asyncio.gather(*(process_coin(t, tfs, now_s, lock_ratio, cd_sec) for t in batch), return_exceptions=True)
+        except Exception as e:
+            _log(f"[ATH/ATL Loop Hatasi] {e}")
+        await asyncio.sleep(8)
 
 
 async def advanced_strategies_loop() -> None:
@@ -1391,8 +1505,8 @@ async def advanced_strategies_loop() -> None:
                             "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
                         }, png)
                         await asyncio.sleep(0.08)
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"[Gelismis Strateji Hatasi] {e}")
         await asyncio.sleep(25)
 
 
@@ -1448,16 +1562,55 @@ async def reports_loop() -> None:
                     ranked = sorted(day_sigs, key=lambda x: x["peakPct"], reverse=True)
                     h2 = round(sum(1 for s in day_sigs if s["peakPct"] >= 2.0) / len(day_sigs) * 100)
                     await tg_send_photo(render_top24_png(ranked, len(day_sigs), h2), "🔥 <b>24 Saatin TOP Hareketleri</b>")
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"[Rapor Loop Hatasi] {e}")
         await asyncio.sleep(60)
 
 
+async def telegram_startup_check() -> None:
+    global TG_BOT_USERNAME, TG_OK, LAST_TG_ERROR
+    _log(
+        f"[BOOT] BOT_TOKEN={'Var (' + str(len(BOT_TOKEN)) + ' krk)' if BOT_TOKEN else 'YOK!'} | "
+        f"Hedef Chatler={list(SUBSCRIBED_CHATS) or 'YOK!'} | Port={PORT}"
+    )
+    if not BOT_TOKEN:
+        LAST_TG_ERROR = "BOT_TOKEN environment degiskeni tanimli degil"
+        _log("[TG UYARI] Render -> Environment icinde BOT_TOKEN ve CHAT_ID tanimlayin, yoksa Telegram'a mesaj gitmez.")
+        return
+    try:
+        st, me = await http_post_json(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", {}, timeout_s=10.0)
+        if st < 400 and isinstance(me, dict) and me.get("ok"):
+            TG_BOT_USERNAME = str((me.get("result") or {}).get("username") or "")
+            TG_OK = True
+            LAST_TG_ERROR = ""
+            _log(f"[Telegram] Baglandi -> @{TG_BOT_USERNAME} | Hedefler: {', '.join(SUBSCRIBED_CHATS)}")
+            await http_post_json(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+                {"drop_pending_updates": False},
+                timeout_s=10.0,
+            )
+            await tg_send_text(
+                f"⚡ <b>7/24 Spot &amp; Futures Botu Aktif (Render)</b>\n"
+                f"• Bot: @{esc_html(TG_BOT_USERNAME)} | Futures: {AUTO_TRADE['leverage']}x (${AUTO_TRADE['tradeUsdt']})\n"
+                f"• Komutlar: /test · /durum · /saatlik · /24s · /sifirla"
+            )
+        else:
+            desc = str(me.get("description") or f"HTTP {st}") if isinstance(me, dict) else f"HTTP {st}"
+            LAST_TG_ERROR = f"getMe HTTP {st}: {desc}"
+            TG_OK = False
+            _log(f"[TG HATA] Bot token gecersiz veya erisilemedi: {LAST_TG_ERROR}")
+    except Exception as e:
+        LAST_TG_ERROR = f"getMe istisna: {e}"
+        TG_OK = False
+        _log(f"[TG BAGLANTI HATASI] {LAST_TG_ERROR}")
+
+
 async def telegram_command_loop() -> None:
-    global BOT_RUNNING, STRATEGY_CONFIG, AUTO_TRADE
+    global BOT_RUNNING, STRATEGY_CONFIG, AUTO_TRADE, LAST_TG_ERROR
     if not BOT_TOKEN:
         return
     offset = 0
+    conflict_logged = False
     while True:
         try:
             status, js = await http_post_json(
@@ -1465,9 +1618,20 @@ async def telegram_command_loop() -> None:
                 {"offset": offset, "timeout": 25},
                 timeout_s=32.0,
             )
+            if status == 409:
+                desc = str(js.get("description") or "Conflict 409") if isinstance(js, dict) else "Conflict 409"
+                LAST_TG_ERROR = f"getUpdates 409: {desc} (Ayni BOT_TOKEN baska yerde acik olabilir)"
+                if not conflict_logged:
+                    conflict_logged = True
+                    _log(f"[TG 409 UYARI] {LAST_TG_ERROR}")
+                await asyncio.sleep(15)
+                continue
             if status >= 400 or not isinstance(js, dict) or not js.get("ok"):
+                desc = str(js.get("description") or f"HTTP {status}") if isinstance(js, dict) else f"HTTP {status}"
+                LAST_TG_ERROR = f"getUpdates HTTP {status}: {desc}"
                 await asyncio.sleep(5)
                 continue
+            conflict_logged = False
             for upd in js.get("result", []):
                 offset = max(offset, int(upd["update_id"]) + 1)
                 msg = upd.get("message") or {}
@@ -1475,17 +1639,60 @@ async def telegram_command_loop() -> None:
                 cid = str((msg.get("chat") or {}).get("id") or "")
                 if not txt or not cid:
                     continue
-                SUBSCRIBED_CHATS.add(cid)
+                if cid not in SUBSCRIBED_CHATS:
+                    SUBSCRIBED_CHATS.add(cid)
+                    save_state()
                 parts = txt.split()
                 cmd = parts[0].split("@")[0].lower()
                 if cmd in ("/start", "/help"):
-                    await tg_send_text("⚡ <b>7/24 Spot & Futures Botu Aktif</b>\nKomutlar: /durum · /ayar_sync <json> · /tik <motor> ac|kapat · /varsayilan · /sifirla", cid)
+                    await tg_send_text(
+                        "⚡ <b>7/24 Spot &amp; Futures Botu Aktif</b>\n"
+                        f"🆔 Sohbet ID: <code>{esc_html(cid)}</code>\n"
+                        "Komutlar: /test · /durum · /saatlik · /24s · /islemler · /ayar_sync &lt;json&gt; · /tik &lt;motor&gt; ac|kapat · /varsayilan · /sifirla",
+                        cid,
+                    )
+                elif cmd == "/test":
+                    await tg_send_text(
+                        f"🧪 <b>TEST BİLDİRİMİ — Render Telegram Aktif!</b>\n"
+                        f"• Taranan Spot Çift: {len(TICKER_MAP)} · Üretilen Sinyal: {len(SIGNALS)}\n"
+                        f"• RSI(14) Eşiği: ≥{AUTO_TRADE['rsiMin']} · Gönderilen Mesaj: {TG_SENT_COUNT}",
+                        cid,
+                    )
+                elif cmd in ("/saatlik", "/yukselenler"):
+                    top = sorted([t for t in TICKER_MAP.values() if t["change24h"] > 0 and t["volume24h"] >= 150000], key=lambda x: x["change24h"], reverse=True)[:8]
+                    if not top:
+                        await tg_send_text("⏳ Binance verisi henüz yükleniyor, birkaç saniye sonra tekrar deneyin.", cid)
+                    else:
+                        tr_now = datetime.now(TR_TZ)
+                        cap = f"📈 <b>24 SAATİN EN YÜKSEKLERİ ({tr_now.strftime('%H:%M')} TR)</b>\n\n" + "\n".join(
+                            f"{i+1}. <b>#{esc_html(t['base'])}</b> · ${fmt_price(t['price'])} · <b>+%{t['change24h']:.2f}</b>" for i, t in enumerate(top)
+                        )
+                        await tg_send_photo(render_hourly_gainers_png(top, tr_now.strftime("%H:%M TR")), cap, cid)
+                elif cmd in ("/24s", "/piyasa"):
+                    top = sorted([t for t in TICKER_MAP.values() if t["change24h"] > 0], key=lambda x: x["change24h"], reverse=True)[:15]
+                    if not top:
+                        await tg_send_text("⏳ Piyasa verisi yükleniyor...", cid)
+                    else:
+                        lines = ["📈 <b>24 SAATİN EN ÇOK YÜKSELENLERİ</b>\n"] + [
+                            f"{i+1:02d}. <b>{esc_html(t['symbol'])}</b> · ${fmt_price(t['price'])} · <b>+%{t['change24h']:.2f}</b>" for i, t in enumerate(top)
+                        ]
+                        await tg_send_text("\n".join(lines), cid)
+                elif cmd in ("/islemler", "/bakiye"):
+                    open_tr = [t for t in TRADES if t["status"] == "OPEN"]
+                    lines = [
+                        f"🤖 <b>FUTURES {AUTO_TRADE['leverage']}x ({AUTO_TRADE['mode']})</b> · Bakiye: ${PAPER_BALANCE_USDT:.2f} · Açık: {len(open_tr)}"
+                    ]
+                    for tr in open_tr[:10]:
+                        lines.append(f"• #{esc_html(tr['symbol'])} ({tr['direction']}) · Giriş ${fmt_price(tr['entryPrice'])}")
+                    await tg_send_text("\n".join(lines), cid)
                 elif cmd == "/durum":
                     await tg_send_text(
                         f"📊 <b>Bot Durumu</b> ({'🟢 Aktif' if BOT_RUNNING else '🔴 Durdu'})\n"
+                        f"• Çift: {len(TICKER_MAP)} · Sinyal: {len(SIGNALS)} · TG Gönderim: {TG_SENT_COUNT}\n"
                         f"• Pump: {STRATEGY_CONFIG['pumpEnabled']} | 15m: {STRATEGY_CONFIG['pump15mEnabled']} | RSI≥{AUTO_TRADE['rsiMin']}\n"
                         f"• ATL/ATH ({','.join(STRATEGY_CONFIG['athAtlTimeframes'])}): {STRATEGY_CONFIG['atlEnabled']}/{STRATEGY_CONFIG['athEnabled']}\n"
-                        f"• 4s MA200: {STRATEGY_CONFIG['ma200Enabled']} | Vol ({','.join(STRATEGY_CONFIG['volatilityTimeframes'])}): {STRATEGY_CONFIG['volatilityEnabled']} | Formasyon: {STRATEGY_CONFIG['patternsEnabled']}",
+                        f"• 4s MA200: {STRATEGY_CONFIG['ma200Enabled']} | Vol ({','.join(STRATEGY_CONFIG['volatilityTimeframes'])}): {STRATEGY_CONFIG['volatilityEnabled']} | Formasyon: {STRATEGY_CONFIG['patternsEnabled']}"
+                        + (f"\n• Son TG Hata: {esc_html(LAST_TG_ERROR)}" if LAST_TG_ERROR else ""),
                         cid,
                     )
                 elif cmd == "/ayar_sync":
@@ -1517,41 +1724,82 @@ async def telegram_command_loop() -> None:
                     LOCKS["patterns"].clear()
                     save_state()
                     await tg_send_text("🔓 Kilitler sıfırlandı.", cid)
-        except Exception:
+        except Exception as e:
+            LAST_TG_ERROR = f"getUpdates loop: {e}"
             await asyncio.sleep(4)
 
 
 async def refresh_symbols_loop() -> None:
+    fapi_warned = False
     while True:
         try:
             sp = await fetch_binance_json("/api/v3/exchangeInfo")
             ACTIVE_SPOT_SYMBOLS.clear()
             for s in sp.get("symbols", []):
                 if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", True):
-                    ACTIVE_SPOT_SYMBOLS.add(s["symbol"])
-            f_status, fp = await http_get_json("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout_s=12.0)
-            if f_status == 200 and isinstance(fp, dict):
-                for s in fp.get("symbols", []):
-                    if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL":
-                        info = {"stepSize": "0.001", "minQty": 0.0, "tickSize": "0.0001", "minNotional": 5.0}
-                        for f in s.get("filters", []):
-                            if f.get("filterType") == "LOT_SIZE":
-                                info["stepSize"] = f.get("stepSize", "0.001")
-                                info["minQty"] = float(f.get("minQty") or 0)
-                            elif f.get("filterType") == "PRICE_FILTER":
-                                info["tickSize"] = f.get("tickSize", "0.0001")
-                            elif f.get("filterType") == "MIN_NOTIONAL":
-                                info["minNotional"] = float(f.get("notional") or 5)
-                        FUTURES_FILTERS[s["symbol"]] = info
-        except Exception:
-            pass
+                    sym = s["symbol"]
+                    ACTIVE_SPOT_SYMBOLS.add(sym)
+                    s_info = {"stepSize": "0.001", "minQty": 0.0, "tickSize": "0.0001", "minNotional": 5.0}
+                    for f in s.get("filters", []):
+                        if f.get("filterType") == "LOT_SIZE":
+                            s_info["stepSize"] = f.get("stepSize", "0.001")
+                            s_info["minQty"] = float(f.get("minQty") or 0)
+                        elif f.get("filterType") == "PRICE_FILTER":
+                            s_info["tickSize"] = f.get("tickSize", "0.0001")
+                    SPOT_FILTERS[sym] = s_info
+            for fbase in ("https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"):
+                f_status, fp = await http_get_json(f"{fbase}/fapi/v1/exchangeInfo", timeout_s=10.0)
+                if f_status == 200 and isinstance(fp, dict) and fp.get("symbols"):
+                    for s in fp.get("symbols", []):
+                        if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL":
+                            info = {"stepSize": "0.001", "minQty": 0.0, "tickSize": "0.0001", "minNotional": 5.0}
+                            for f in s.get("filters", []):
+                                if f.get("filterType") == "LOT_SIZE":
+                                    info["stepSize"] = f.get("stepSize", "0.001")
+                                    info["minQty"] = float(f.get("minQty") or 0)
+                                elif f.get("filterType") == "PRICE_FILTER":
+                                    info["tickSize"] = f.get("tickSize", "0.0001")
+                                elif f.get("filterType") == "MIN_NOTIONAL":
+                                    info["minNotional"] = float(f.get("notional") or 5)
+                            FUTURES_FILTERS[s["symbol"]] = info
+                    break
+            else:
+                if not fapi_warned:
+                    fapi_warned = True
+                    _log("[Futures Info] fapi.binance.com erisimi kisitli (PAPER modunda Spot filtreleri kullanilacak).")
+        except Exception as e:
+            _log(f"[Sembol Yenileme Hatasi] {e}")
         await asyncio.sleep(900)
+
+
+async def heartbeat_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        _log(
+            f"[DURUM] Ciftler={len(TICKER_MAP)} | Sinyaller={len(SIGNALS)} | "
+            f"TG={'@' + TG_BOT_USERNAME if TG_BOT_USERNAME else ('Aktif' if BOT_TOKEN else 'Kapali')} "
+            f"(Gonderilen={TG_SENT_COUNT}) | Chatler={len(SUBSCRIBED_CHATS)}"
+            + (f" | SonHata={LAST_TG_ERROR}" if LAST_TG_ERROR else "")
+        )
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.startswith("/health"):
-            payload = json.dumps({"ok": True, "pairs": len(TICKER_MAP), "strategyConfig": STRATEGY_CONFIG}).encode("utf-8")
+            payload = json.dumps({
+                "ok": True,
+                "botRunning": BOT_RUNNING,
+                "telegramEnabled": bool(BOT_TOKEN),
+                "tgOk": TG_OK,
+                "tgBotUsername": TG_BOT_USERNAME,
+                "tgSentCount": TG_SENT_COUNT,
+                "lastTgError": LAST_TG_ERROR,
+                "subscribedChatsCount": len(SUBSCRIBED_CHATS),
+                "pairs": len(TICKER_MAP),
+                "signalsCount": len(SIGNALS),
+                "futuresPairs": len(FUTURES_FILTERS),
+                "strategyConfig": STRATEGY_CONFIG,
+            }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
@@ -1579,6 +1827,7 @@ def start_health_server(port: int = PORT) -> ThreadingHTTPServer:
 async def main() -> None:
     load_state()
     start_health_server(PORT)
+    await telegram_startup_check()
     await asyncio.gather(
         refresh_symbols_loop(),
         market_loop(),
@@ -1587,6 +1836,7 @@ async def main() -> None:
         web_config_sync_loop(),
         reports_loop(),
         telegram_command_loop(),
+        heartbeat_loop(),
     )
 
 
