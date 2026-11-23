@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 17:36:24 · Rev #3
-# Aktif Motorlar: Pump(%3.5) | 15dk(%3.5) | ATH/ATL(1M) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major)
-# Futures: 3x | $25 | TP +%10 / SL -%10 | RSI >= 90
+# Uretim: 18:51:32 · Rev #2
+# Aktif Motorlar: Pump(%3.5) | 15dk(%3.5) | ATH/ATL(1M) | 4H MA200(L:1/S:1)
+# Futures: 3x | $25 | TP +%5 / SL -%5 | RSI >= 90
 # ==============================================================================
 import asyncio
 import concurrent.futures
@@ -44,9 +44,9 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "ma200ShortEnabled": True,
     "ma200Timeframe": "4h",
     "ma200Period": 200,
-    "volatilityEnabled": True,
+    "volatilityEnabled": False,
     "volatilityTimeframes": ["15m", "1h"],
-    "volatilityMajorOnly": True,
+    "volatilityMajorOnly": False,
     "volatilityMajorCoins": [
         "BTC",
         "ETH",
@@ -102,8 +102,8 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "mode": "PAPER",
     "leverage": 3,
     "tradeUsdt": 25,
-    "tpPct": 10,
-    "slPct": 10,
+    "tpPct": 5,
+    "slPct": 5,
     "maxOpenTrades": 0,
     "rsiMin": 90,
     "notifyPaperTelegram": False,
