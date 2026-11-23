@@ -1,511 +1,689 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-TOBO 1H LONG FORMASYON BOTU
-- Yalnizca TOBO (Ters Omuz Bas Omuz) tarar.
-- Yalnizca 1 saatlik kapanmis mumlari kullanir.
-- Minimum formasyon yuksekligi: %1.2
-- Sadece boyun cizgisi yukari kirildiginda LONG sinyali gonderir.
-- Otomatik islem, pump, ATH/ATL, MA200, volatilite ve diger formasyonlar yoktur.
-- Render icin aiohttp health endpoint'i 10000 portunda calisir.
-
-Render Environment:
-  BOT_TOKEN       = Telegram bot tokeniniz
-  CHAT_ID         = Telegram chat ID (varsayilan asagidaki deger)
-  PORT            = 10000 (Render otomatik verir)
-  MAX_SCAN_SYMBOLS= 40 (istege bagli)
-"""
-
 import asyncio
 import json
 import os
+import struct
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+import zlib
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 from aiohttp import web
 
-
-# =============================================================================
+# =====================================================
 # AYARLAR
-# =============================================================================
+# =====================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "1623907197").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
-TIMEFRAME = "1h"
-KLINE_LIMIT = 100
-MIN_FORMATION_HEIGHT_PCT = 1.2
-MAX_SHOULDER_DIFFERENCE_PCT = 3.0
-MIN_PIVOT_DISTANCE = 5
-MAX_PIVOT_DISTANCE = 35
-MAX_RIGHT_SHOULDER_AGE = 20
-MAX_SCAN_SYMBOLS = max(10, min(100, int(os.getenv("MAX_SCAN_SYMBOLS", "40"))))
-SCAN_INTERVAL_SECONDS = 300
-CONCURRENT_REQUESTS = 8
-MIN_24H_QUOTE_VOLUME = 500_000
-STATE_FILE = "/tmp/tobo_1h_bot_state.json"
+TR_TZ = timezone(timedelta(hours=3))
+STATE_FILE = os.getenv("STATE_FILE", "/tmp/tobo_state.json")
 
-BINANCE_BASES = [
+TOBO_TIMEFRAME = "1h"
+TOBO_MIN_HEIGHT_PCT = 1.2         # Baş derinliği min %
+TOBO_SHOULDER_TOLERANCE = 0.03    # Omuz fark toleransı (%3)
+TOBO_MAX_BARS_SINCE_RS = 12       # Sağ omuzdan sonra max bar
+TOBO_BREAK_BUFFER = 0.005         # Boyun kırılım tamponu (%0.5)
+TOBO_COOLDOWN_HOURS = 4.0         # Aynı coin için cooldown
+TOBO_MIN_VOL_USDT = 500_000       # 24s hacim filtresi
+
+SCAN_INTERVAL_S = 20              # Tur arası bekleme
+SCAN_BATCH = 12                   # Tur başına taranan coin
+TRACK_DURATION_S = 300            # Sinyal takip süresi (5 dk)
+TRACK_INTERVAL_S = 30             # Güncelleme sıklığı
+
+BINANCE_MIRRORS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
+    "https://api3.binance.com",
 ]
 
-TR_TZ = timezone(timedelta(hours=3))
-SEEN_SIGNALS: set = set()
-ACTIVE_SYMBOLS: set = set()
-LAST_SCAN = 0.0
-LAST_ERROR = ""
-SCAN_LOCK = asyncio.Lock()
+# =====================================================
+# DURUM
+# =====================================================
+BOT_RUNNING = True
+TICKER_MAP: Dict[str, Dict[str, Any]] = {}
+ACTIVE_SPOT_SYMBOLS: Set[str] = set()
+SIGNALS: List[Dict[str, Any]] = []
+TOBO_LOCKS: Dict[str, float] = {}
+SUBSCRIBED_CHATS: Set[str] = {CHAT_ID} if CHAT_ID else set()
+PREFERRED_MIRROR_IDX = 0
 
 
-# =============================================================================
-# DURUM KAYDI
-# =============================================================================
+# =====================================================
+# YARDIMCILAR
+# =====================================================
+def fmt_price(p: float) -> str:
+    if p <= 0 or p != p:
+        return "0"
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 10:
+        return f"{p:.3f}".rstrip("0").rstrip(".")
+    if p >= 1:
+        return f"{p:.4f}".rstrip("0").rstrip(".")
+    if p >= 0.01:
+        return f"{p:.5f}".rstrip("0").rstrip(".")
+    if p >= 0.0001:
+        return f"{p:.6f}".rstrip("0").rstrip(".")
+    return f"{p:.8f}".rstrip("0").rstrip(".")
+
+
+def esc_html(s: str) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now(TR_TZ).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def load_state() -> None:
-    global SEEN_SIGNALS
+    global SIGNALS, TOBO_LOCKS, SUBSCRIBED_CHATS
+    if not os.path.exists(STATE_FILE):
+        return
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        SEEN_SIGNALS = set(str(x) for x in data.get("seenSignals", []))
+            raw = json.load(f)
+        if isinstance(raw.get("signals"), list):
+            SIGNALS = raw["signals"][:100]
+        if isinstance(raw.get("locks"), dict):
+            TOBO_LOCKS = {k: float(v) for k, v in raw["locks"].items()}
+        for cid in raw.get("chats", []):
+            if str(cid).strip():
+                SUBSCRIBED_CHATS.add(str(cid).strip())
     except Exception:
-        SEEN_SIGNALS = set()
+        pass
 
 
 def save_state() -> None:
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"seenSignals": list(SEEN_SIGNALS)[-2000:]}, f)
+            json.dump({
+                "signals": SIGNALS[:100],
+                "locks": TOBO_LOCKS,
+                "chats": list(SUBSCRIBED_CHATS),
+            }, f)
         os.replace(tmp, STATE_FILE)
-    except Exception as exc:
-        print(f"[STATE] Kayit hatasi: {exc}", flush=True)
+    except Exception:
+        pass
 
 
-# =============================================================================
-# BINANCE ERISIMI
-# =============================================================================
-async def binance_json(
-    session: aiohttp.ClientSession,
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-) -> Any:
-    last_error = None
-    for base in BINANCE_BASES:
+# =====================================================
+# PNG OLUŞTURUCU
+# =====================================================
+FONT_5X7 = {
+    "0": [0x3E, 0x51, 0x49, 0x45, 0x3E], "1": [0x00, 0x42, 0x7F, 0x40, 0x00],
+    "2": [0x42, 0x61, 0x51, 0x49, 0x46], "3": [0x21, 0x41, 0x45, 0x4B, 0x31],
+    "4": [0x18, 0x14, 0x12, 0x7F, 0x10], "5": [0x27, 0x45, 0x45, 0x45, 0x39],
+    "6": [0x3C, 0x4A, 0x49, 0x49, 0x30], "7": [0x01, 0x71, 0x09, 0x05, 0x03],
+    "8": [0x36, 0x49, 0x49, 0x49, 0x36], "9": [0x06, 0x49, 0x49, 0x29, 0x1E],
+    "A": [0x7E, 0x11, 0x11, 0x11, 0x7E], "B": [0x7F, 0x49, 0x49, 0x49, 0x36],
+    "C": [0x3E, 0x41, 0x41, 0x41, 0x22], "D": [0x7F, 0x41, 0x41, 0x22, 0x1C],
+    "E": [0x7F, 0x49, 0x49, 0x49, 0x41], "F": [0x7F, 0x09, 0x09, 0x09, 0x01],
+    "G": [0x3E, 0x41, 0x49, 0x49, 0x7A], "H": [0x7F, 0x08, 0x08, 0x08, 0x7F],
+    "I": [0x00, 0x41, 0x7F, 0x41, 0x00], "J": [0x20, 0x40, 0x41, 0x3F, 0x01],
+    "K": [0x7F, 0x08, 0x14, 0x22, 0x41], "L": [0x7F, 0x40, 0x40, 0x40, 0x40],
+    "M": [0x7F, 0x02, 0x0C, 0x02, 0x7F], "N": [0x7F, 0x04, 0x08, 0x10, 0x7F],
+    "O": [0x3E, 0x41, 0x41, 0x41, 0x3E], "P": [0x7F, 0x09, 0x09, 0x09, 0x06],
+    "Q": [0x3E, 0x41, 0x51, 0x21, 0x5E], "R": [0x7F, 0x09, 0x19, 0x29, 0x46],
+    "S": [0x46, 0x49, 0x49, 0x49, 0x31], "T": [0x01, 0x01, 0x7F, 0x01, 0x01],
+    "U": [0x3F, 0x40, 0x40, 0x40, 0x3F], "V": [0x1F, 0x20, 0x40, 0x20, 0x1F],
+    "W": [0x3F, 0x40, 0x38, 0x40, 0x3F], "X": [0x63, 0x14, 0x08, 0x14, 0x63],
+    "Y": [0x07, 0x08, 0x70, 0x08, 0x07], "Z": [0x61, 0x51, 0x49, 0x45, 0x43],
+    ".": [0x00, 0x60, 0x60, 0x00, 0x00], ",": [0x00, 0x50, 0x30, 0x00, 0x00],
+    ":": [0x00, 0x36, 0x36, 0x00, 0x00], "-": [0x08, 0x08, 0x08, 0x08, 0x08],
+    "+": [0x08, 0x08, 0x3E, 0x08, 0x08], "/": [0x20, 0x10, 0x08, 0x04, 0x02],
+    "%": [0x23, 0x13, 0x08, 0x64, 0x62], "$": [0x24, 0x2A, 0x7F, 0x2A, 0x12],
+    "|": [0x00, 0x00, 0x7F, 0x00, 0x00], "*": [0x14, 0x08, 0x3E, 0x08, 0x14],
+    " ": [0x00, 0x00, 0x00, 0x00, 0x00],
+}
+
+
+def encode_png(w: int, h: int, buf: bytearray) -> bytes:
+    stride = w * 3
+    raw = bytearray((stride + 1) * h)
+    for y in range(h):
+        raw[y * (stride + 1)] = 0
+        raw[y * (stride + 1) + 1: y * (stride + 1) + 1 + stride] = buf[y * stride: (y + 1) * stride]
+    comp = zlib.compress(bytes(raw), 6)
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", comp) + chunk(b"IEND", b"")
+
+
+def _canvas(w: int, h: int, bg):
+    buf = bytearray(bytes(bg) * (w * h))
+
+    def set_px(x, y, col):
+        if 0 <= x < w and 0 <= y < h:
+            i = (y * w + x) * 3
+            buf[i], buf[i + 1], buf[i + 2] = col
+
+    def fill_rect(x0, y0, x1, y1, col):
+        a0, a1 = max(0, min(x0, x1)), min(w - 1, max(x0, x1))
+        b0, b1 = max(0, min(y0, y1)), min(h - 1, max(y0, y1))
+        row = bytes(col) * (a1 - a0 + 1)
+        for y in range(b0, b1 + 1):
+            st = (y * w + a0) * 3
+            buf[st:st + len(row)] = row
+
+    def fill_circle(cx, cy, r, col):
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx * dx + dy * dy <= r * r:
+                    set_px(cx + dx, cy + dy, col)
+
+    def draw_line(x0, y0, x1, y1, col, dashed=False):
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        n = 0
+        cx, cy = x0, y0
+        while True:
+            if not dashed or (n % 8) < 5:
+                set_px(cx, cy, col)
+            if cx == x1 and cy == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                cx += sx
+            if e2 <= dx:
+                err += dx
+                cy += sy
+            n += 1
+
+    def draw_text(x, y, text, col, scale=1):
+        cx = x
+        for ch in text.upper():
+            g = FONT_5X7.get(ch, FONT_5X7[" "])
+            for gx in range(5):
+                bits = g[gx]
+                for gy in range(7):
+                    if bits & (1 << gy):
+                        if scale == 1:
+                            set_px(cx + gx, y + gy, col)
+                        else:
+                            fill_rect(cx + gx * scale, y + gy * scale,
+                                      cx + (gx + 1) * scale - 1, y + (gy + 1) * scale - 1, col)
+            cx += 6 * scale
+
+    return buf, set_px, fill_rect, fill_circle, draw_line, draw_text
+
+
+def render_tobo_png(symbol, bars, live_price, head, neckline, target):
+    if not bars:
+        return b""
+    sl = bars[-50:]
+    w, h = 860, 440
+    buf, set_px, fill_rect, fill_circle, draw_line, draw_text = _canvas(w, h, (11, 16, 27))
+    pad_l, pad_r, pad_t, pad_b, vol_h, gap = 18, 118, 44, 22, 58, 12
+    plot_w = w - pad_l - pad_r
+    price_h = h - pad_t - pad_b - vol_h - gap
+
+    prices = [b["high"] for b in sl] + [b["low"] for b in sl]
+    for extra in (live_price, head, neckline, target):
+        if extra and extra > 0:
+            prices.append(extra)
+    lo_p = min(prices) * 0.993
+    hi_p = max(prices) * 1.007
+    rng_p = max(hi_p - lo_p, lo_p * 0.004)
+    max_vol = max((b["volume"] for b in sl), default=1.0) or 1.0
+
+    def y_of(p):
+        return round(pad_t + ((hi_p - p) / rng_p) * price_h)
+
+    draw_text(pad_l, 14, f"{symbol} | 1H TOBO (INVERTED H&S) | ${fmt_price(live_price)}", (248, 250, 252), 2)
+
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        gy = round(pad_t + price_h * frac)
+        draw_line(pad_l, gy, pad_l + plot_w, gy, (30, 41, 59), True)
+        draw_text(pad_l + plot_w + 8, gy - 3, fmt_price(hi_p - rng_p * frac), (148, 163, 184), 1)
+
+    if head > 0:
+        hy = y_of(head)
+        draw_line(pad_l, hy, pad_l + plot_w, hy, (244, 63, 94), True)
+        draw_text(pad_l + plot_w + 8, hy - 3, f"BAS {fmt_price(head)}", (244, 63, 94), 1)
+
+    if neckline > 0:
+        ny = y_of(neckline)
+        draw_line(pad_l, ny, pad_l + plot_w, ny, (245, 158, 11), True)
+        draw_text(pad_l + plot_w + 8, ny - 3, f"BOYUN {fmt_price(neckline)}", (245, 158, 11), 1)
+
+    if target > 0:
+        ty = y_of(target)
+        draw_line(pad_l, ty, pad_l + plot_w, ty, (52, 211, 153), True)
+        draw_text(pad_l + plot_w + 8, ty - 3, f"HDF {fmt_price(target)}", (52, 211, 153), 1)
+
+    step = plot_w / len(sl)
+    bw = max(3, int(step * 0.62))
+    vol_top = pad_t + price_h + gap
+    for idx, b in enumerate(sl):
+        cx = round(pad_l + (idx + 0.5) * step)
+        col = (16, 185, 129) if b["close"] >= b["open"] else (244, 63, 94)
+        yo, yc = y_of(b["open"]), y_of(b["close"])
+        yh, yl = y_of(b["high"]), y_of(b["low"])
+        draw_line(cx, yh, cx, yl, col)
+        fill_rect(cx - bw // 2, min(yo, yc), cx + bw // 2,
+                  max(min(yo, yc) + 1, max(yo, yc)), col)
+        vh = max(1, round((b["volume"] / max_vol) * vol_h))
+        fill_rect(cx - bw // 2, vol_top + vol_h - vh, cx + bw // 2, vol_top + vol_h,
+                  (col[0] // 2, col[1] // 2, col[2] // 2))
+
+    if live_price > 0:
+        ly = y_of(live_price)
+        draw_line(pad_l, ly, pad_l + plot_w, ly, (56, 189, 248), True)
+        fill_rect(pad_l + plot_w + 4, ly - 7, w - 4, ly + 7, (2, 132, 199))
+        draw_text(pad_l + plot_w + 8, ly - 3, fmt_price(live_price), (248, 250, 252), 1)
+
+    return encode_png(w, h, buf)
+
+
+# =====================================================
+# BINANCE
+# =====================================================
+async def fetch_binance_json(session: aiohttp.ClientSession, path: str, timeout_s: float = 9.0) -> Any:
+    global PREFERRED_MIRROR_IDX
+    n = len(BINANCE_MIRRORS)
+    last_err = None
+    for off in range(n):
+        idx = (PREFERRED_MIRROR_IDX + off) % n
+        url = f"{BINANCE_MIRRORS[idx]}{path}"
         try:
-            async with session.get(
-                base + path,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                body = await response.text()
-                last_error = f"HTTP {response.status}: {body[:180]}"
-                if response.status in (418, 429):
-                    raise RuntimeError(last_error)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            last_error = str(exc)
-        except RuntimeError:
-            raise
-    raise RuntimeError(last_error or "Binance API erisimi basarisiz")
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as r:
+                if r.status == 200:
+                    PREFERRED_MIRROR_IDX = idx
+                    return await r.json()
+                last_err = f"HTTP {r.status}"
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Binance erisilemedi: {last_err}")
 
 
-async def get_spot_symbols(session: aiohttp.ClientSession) -> set:
-    data = await binance_json(session, "/api/v3/exchangeInfo")
-    symbols = set()
-    for item in data.get("symbols", []):
-        symbol = str(item.get("symbol", ""))
-        if (
-            item.get("status") == "TRADING"
-            and item.get("quoteAsset") == "USDT"
-            and item.get("isSpotTradingAllowed", True)
-            and not symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"))
-        ):
-            symbols.add(symbol)
-    return symbols
-
-
-async def get_top_symbols(session: aiohttp.ClientSession) -> List[str]:
-    global ACTIVE_SYMBOLS
-    if not ACTIVE_SYMBOLS:
-        ACTIVE_SYMBOLS = await get_spot_symbols(session)
-
-    tickers = await binance_json(session, "/api/v3/ticker/24hr")
-    ranked = []
-    for item in tickers:
-        symbol = str(item.get("symbol", ""))
-        if symbol not in ACTIVE_SYMBOLS:
-            continue
-        try:
-            quote_volume = float(item.get("quoteVolume") or 0)
-            price = float(item.get("lastPrice") or 0)
-        except (TypeError, ValueError):
-            continue
-        if price > 0 and quote_volume >= MIN_24H_QUOTE_VOLUME:
-            ranked.append((quote_volume, symbol))
-    ranked.sort(reverse=True)
-    return [symbol for _, symbol in ranked[:MAX_SCAN_SYMBOLS]]
-
-
-async def get_hourly_klines(
-    session: aiohttp.ClientSession,
-    symbol: str,
-) -> List[Dict[str, float]]:
-    raw = await binance_json(
-        session,
-        "/api/v3/klines",
-        {"symbol": symbol, "interval": TIMEFRAME, "limit": KLINE_LIMIT},
-    )
-    if not isinstance(raw, list) or len(raw) < 50:
+async def fetch_spot_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 120) -> List[Dict[str, float]]:
+    raw = await fetch_binance_json(session, f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
+    if not isinstance(raw, list):
         return []
-
-    # Binance son elemani halen acik olan saatlik mumdur.
-    # Yalnizca kapanmis mumlar formasyon analizine girer.
-    closed = raw[:-1]
-    result = []
-    for candle in closed:
-        result.append({
-            "open_time": int(candle[0]),
-            "open": float(candle[1]),
-            "high": float(candle[2]),
-            "low": float(candle[3]),
-            "close": float(candle[4]),
-            "volume": float(candle[5]),
-            "close_time": int(candle[6]),
-        })
-    return result
+    return [{
+        "openTime": int(k[0]) // 1000,
+        "open": float(k[1]),
+        "high": float(k[2]),
+        "low": float(k[3]),
+        "close": float(k[4]),
+        "volume": float(k[5]),
+        "quoteVol": float(k[7]),
+    } for k in raw]
 
 
-# =============================================================================
-# TOBO TESPITI
-# =============================================================================
-def find_pivot_lows(
-    bars: List[Dict[str, float]],
-    left_right: int = 3,
-) -> List[Tuple[int, float]]:
-    pivots = []
-    for i in range(left_right, len(bars) - left_right):
-        value = bars[i]["low"]
-        left_ok = all(bars[j]["low"] > value for j in range(i - left_right, i))
-        right_ok = all(bars[j]["low"] > value for j in range(i + 1, i + left_right + 1))
-        if left_ok and right_ok:
-            pivots.append((i, value))
-    return pivots
-
-
-def detect_tobo(bars: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
-    """
-    TOBO:
-      - Uc pivot dip: sol omuz, bas, sag omuz
-      - Bas iki omuzdan belirgin sekilde asagida
-      - Omuzlar arasi fark en fazla %3
-      - Boyun cizgisi kirilimi kapanmis mumla teyit edilir
-      - Formasyon yuksekligi en az %1.2
-    """
-    if len(bars) < 45:
-        return None
-
-    pivots = find_pivot_lows(bars[-85:], 3)
-    if len(pivots) < 3:
-        return None
-
-    offset = max(0, len(bars) - 85)
-    pivots = [(i + offset, price) for i, price in pivots]
-
-    # En guncel olasi omuz dizilimlerinden baslayarak kontrol et.
-    for k in range(len(pivots) - 3, -1, -1):
-        left_shoulder = pivots[k]
-        head = pivots[k + 1]
-        right_shoulder = pivots[k + 2]
-
-        ls_i, ls_p = left_shoulder
-        hd_i, hd_p = head
-        rs_i, rs_p = right_shoulder
-
-        if not (MIN_PIVOT_DISTANCE <= hd_i - ls_i <= MAX_PIVOT_DISTANCE):
-            continue
-        if not (MIN_PIVOT_DISTANCE <= rs_i - hd_i <= MAX_PIVOT_DISTANCE):
-            continue
-        if len(bars) - 1 - rs_i > MAX_RIGHT_SHOULDER_AGE:
-            continue
-
-        shoulder_diff = abs(ls_p - rs_p) / max(ls_p, rs_p) * 100.0
-        if shoulder_diff > MAX_SHOULDER_DIFFERENCE_PCT:
-            continue
-
-        # Bas, iki omuzdan da en az %0.6 daha asagida olmali.
-        if not (hd_p < ls_p * 0.994 and hd_p < rs_p * 0.994):
-            continue
-
-        # Boyun cizgisinin iki omuz arasindaki tepe noktalarini bul.
-        left_peak = max(b["high"] for b in bars[ls_i + 1:hd_i])
-        right_peak = max(b["high"] for b in bars[hd_i + 1:rs_i])
-        if left_peak <= 0 or right_peak <= 0:
-            continue
-
-        # Egimli boyun cizgisi: sag omuzdan sonraki mum konumuna dogru uzatilir.
-        left_peak_i = max(
-            range(ls_i + 1, hd_i),
-            key=lambda idx: bars[idx]["high"],
-        )
-        right_peak_i = max(
-            range(hd_i + 1, rs_i),
-            key=lambda idx: bars[idx]["high"],
-        )
-        if right_peak_i == left_peak_i:
-            neckline_now = max(left_peak, right_peak)
-        else:
-            slope = (right_peak - left_peak) / (right_peak_i - left_peak_i)
-            neckline_now = right_peak + slope * (len(bars) - 1 - right_peak_i)
-
-        # Formasyonun minimum yuksekligi boyun cizgisine gore hesaplanir.
-        formation_height = (min(left_peak, right_peak) - hd_p) / hd_p * 100.0
-        if formation_height < MIN_FORMATION_HEIGHT_PCT:
-            continue
-
-        if neckline_now <= hd_p:
-            continue
-
-        previous_close = bars[-2]["close"]
-        last_close = bars[-1]["close"]
-
-        # Sinyal yalnizca son kapanmis mum boyun cizgisini asagi taraftan
-        # yukari kesti ise uretilir.
-        if previous_close <= neckline_now and last_close > neckline_now:
-            return {
-                "left_shoulder": ls_p,
-                "head": hd_p,
-                "right_shoulder": rs_p,
-                "neckline": neckline_now,
-                "height_pct": formation_height,
-                "shoulder_diff_pct": shoulder_diff,
-                "breakout_price": last_close,
-                "breakout_time": bars[-1]["close_time"],
-                "left_time": bars[ls_i]["open_time"],
-                "head_time": bars[hd_i]["open_time"],
-                "right_time": bars[rs_i]["open_time"],
-                "target": last_close + (neckline_now - hd_p),
-            }
-
-    return None
-
-
-# =============================================================================
+# =====================================================
 # TELEGRAM
-# =============================================================================
-def fmt_price(value: float) -> str:
-    if value >= 1000:
-        return f"{value:,.2f}"
-    if value >= 1:
-        return f"{value:.4f}".rstrip("0").rstrip(".")
-    if value >= 0.01:
-        return f"{value:.6f}".rstrip("0").rstrip(".")
-    return f"{value:.8f}".rstrip("0").rstrip(".")
+# =====================================================
+async def tg_send_text(session, text: str, explicit_cid: Optional[str] = None) -> None:
+    if not BOT_TOKEN:
+        return
+    targets = [explicit_cid] if explicit_cid else list(SUBSCRIBED_CHATS)
+    for cid in targets:
+        try:
+            async with session.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as r:
+                await r.read()
+        except Exception:
+            pass
 
 
-async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("[TELEGRAM] BOT_TOKEN veya CHAT_ID eksik.", flush=True)
-        return False
+async def tg_send_photo(session, png: bytes, caption: str, explicit_cid: Optional[str] = None) -> Optional[int]:
+    if not BOT_TOKEN:
+        return None
+    targets = [explicit_cid] if explicit_cid else list(SUBSCRIBED_CHATS)
+    safe_cap = caption[:995] + "..." if len(caption) > 1000 else caption
+    last_id = None
+    for cid in targets:
+        try:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", cid)
+            data.add_field("caption", safe_cap)
+            data.add_field("parse_mode", "HTML")
+            data.add_field("photo", png, filename="chart.png", content_type="image/png")
+            async with session.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data=data, timeout=aiohttp.ClientTimeout(total=18),
+            ) as r:
+                js = await r.json()
+                if js.get("ok"):
+                    last_id = js["result"]["message_id"]
+                else:
+                    await tg_send_text(session, caption, cid)
+        except Exception:
+            await tg_send_text(session, caption, cid)
+    return last_id
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+async def tg_edit_caption(session, cid: str, msg_id: int, caption: str) -> None:
+    if not BOT_TOKEN or not msg_id:
+        return
     try:
         async with session.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as response:
-            data = await response.json()
-            if not data.get("ok"):
-                print(f"[TELEGRAM] Gonderim hatasi: {data}", flush=True)
-                return False
-            return True
-    except Exception as exc:
-        print(f"[TELEGRAM] Baglanti hatasi: {exc}", flush=True)
-        return False
+            f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageCaption",
+            json={"chat_id": cid, "message_id": msg_id, "caption": caption[:1000], "parse_mode": "HTML"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            await r.read()
+    except Exception:
+        pass
 
 
-async def send_tobo_signal(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    hit: Dict[str, Any],
-) -> None:
-    close_dt = datetime.fromtimestamp(
-        hit["breakout_time"] / 1000,
-        tz=timezone.utc,
-    ).astimezone(TR_TZ)
+# =====================================================
+# TOBO TESPİT
+# =====================================================
+def detect_tobo(bars: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
+    if len(bars) < 40:
+        return None
+    rec = bars[-75:]
+    n = len(rec)
+    break_bar = rec[n - 2]
+    cur = rec[n - 1]["close"]
 
-    message = (
-        "🟢 <b>1 SAATLİK TOBO — LONG SİNYALİ</b>\n\n"
-        f"🪙 <b>Coin:</b> #{symbol}\n"
-        f"⏱ <b>Zaman dilimi:</b> 1H\n"
-        f"💰 <b>Kırılım fiyatı:</b> ${fmt_price(hit['breakout_price'])}\n"
-        f"📏 <b>Formasyon yüksekliği:</b> %{hit['height_pct']:.2f}\n"
-        f"〰️ <b>Boyun çizgisi:</b> ${fmt_price(hit['neckline'])}\n\n"
-        f"👈 <b>Sol omuz:</b> ${fmt_price(hit['left_shoulder'])}\n"
-        f"🧠 <b>Baş:</b> ${fmt_price(hit['head'])}\n"
-        f"👉 <b>Sağ omuz:</b> ${fmt_price(hit['right_shoulder'])}\n"
-        f"📐 <b>Omuz farkı:</b> %{hit['shoulder_diff_pct']:.2f}\n\n"
-        f"🎯 <b>Teorik hedef:</b> ${fmt_price(hit['target'])}\n"
-        f"🕒 <b>Mum kapanışı:</b> {close_dt.strftime('%d.%m.%Y %H:%M')} TR\n\n"
-        "✅ Boyun çizgisi yukarı kırıldı; 1 saatlik kapanışla teyit edildi.\n"
-        "<i>Bu bir işlem emri değil, teknik analiz sinyalidir.</i>"
+    lows: List[tuple] = []
+    for i in range(3, n - 3):
+        if all(rec[j]["low"] > rec[i]["low"] for j in range(i - 3, i + 3) if j != i):
+            lows.append((i, rec[i]["low"]))
+
+    if len(lows) < 3:
+        return None
+
+    ls, hd, rs = lows[-3], lows[-2], lows[-1]
+
+    # Baş, iki omuzdan daha düşük olmalı
+    if not (hd[1] < ls[1] * 0.994 and hd[1] < rs[1] * 0.994):
+        return None
+    # Omuzlar birbirine yakın seviyede olmalı
+    if abs(ls[1] - rs[1]) / max(ls[1], 1e-9) > TOBO_SHOULDER_TOLERANCE:
+        return None
+    # Sağ omuzdan sonra çok bar geçmemeli
+    if (n - 2 - rs[0]) > TOBO_MAX_BARS_SINCE_RS:
+        return None
+
+    # Boyun çizgisi: baş ile sağ omuz arasındaki en yüksek tepe
+    neckline = max(b["high"] for b in rec[hd[0]: rs[0] + 1])
+    head_depth = (neckline - hd[1]) / hd[1] * 100.0
+    if head_depth < TOBO_MIN_HEIGHT_PCT:
+        return None
+
+    # Kırılım kontrolü: son kapanış ve önceki bar boyun üstünde
+    if not (cur > neckline and break_bar["close"] > neckline * (1 - TOBO_BREAK_BUFFER)):
+        return None
+
+    return {
+        "head": hd[1],
+        "neckline": neckline,
+        "target": neckline + (neckline - hd[1]),
+        "head_depth_pct": head_depth,
+        "ls": ls[1],
+        "rs": rs[1],
+    }
+
+
+# =====================================================
+# CAPTION
+# =====================================================
+def build_caption(symbol: str, entry: float, live: float,
+                  peak_pct: float, cur_pct: float,
+                  info: Dict[str, float], ts: str) -> str:
+    head = info["head"]
+    neckline = info["neckline"]
+    target = info["target"]
+
+    return (
+        f"🔷 <b>Inverted H&S (TOBO) · {TOBO_TIMEFRAME} · LONG</b>\n\n"
+        f"🕐 {ts}\n"
+        f"💰 Giriş: <b>${fmt_price(entry)}</b>\n"
+        f"📊 Anlık: ${fmt_price(live)} ({cur_pct:+.2f}%)\n"
+        f"⬆️ Zirve: {peak_pct:+.2f}%\n\n"
+        f"📐 <b>#{esc_html(symbol)}</b> [LONG]\n"
+        f"Baş (${fmt_price(head)}) & Boyun (${fmt_price(neckline)}) yukarı kırıldı.\n"
+        f"🎯 Hedef: <b>${fmt_price(target)}</b> · Destek: ${fmt_price(head)}"
     )
-    await telegram_send(session, message)
 
 
-# =============================================================================
-# TARAMA DONGUSU
-# =============================================================================
-async def scan_symbol(
-    session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
-    symbol: str,
-) -> None:
-    async with semaphore:
-        try:
-            bars = await get_hourly_klines(session, symbol)
-            if not bars:
-                return
-
-            hit = detect_tobo(bars)
-            if not hit:
-                return
-
-            # Ayni sembol ve ayni TOBO omuz dizilimi icin tek sinyal.
-            signal_id = (
-                f"{symbol}:{hit['left_time']}:"
-                f"{hit['head_time']}:{hit['right_time']}"
-            )
-            if signal_id in SEEN_SIGNALS:
-                return
-
-            # Once kaydet: gecici Telegram hatasinda ayni formasyonun
-            # arka arkaya mesaj yagdirilmasini engeller.
-            SEEN_SIGNALS.add(signal_id)
-            save_state()
-
-            print(
-                f"[TOBO] {symbol} | 1H LONG | "
-                f"yukseklik=%{hit['height_pct']:.2f}",
-                flush=True,
-            )
-            await send_tobo_signal(session, symbol, hit)
-
-        except Exception as exc:
-            print(f"[SCAN] {symbol}: {exc}", flush=True)
+# =====================================================
+# SİNYAL TAKİBİ (edit message)
+# =====================================================
+async def track_signal(session, signal, cid, msg_id):
+    entry = signal["entryPrice"]
+    peak = entry
+    end_t = time.time() + TRACK_DURATION_S
+    while time.time() < end_t and BOT_RUNNING:
+        await asyncio.sleep(TRACK_INTERVAL_S)
+        tick = TICKER_MAP.get(signal["symbol"])
+        if not tick:
+            continue
+        cur = tick["price"]
+        if cur > peak:
+            peak = cur
+        peak_pct = (peak - entry) / entry * 100.0
+        cur_pct = (cur - entry) / entry * 100.0
+        cap = build_caption(signal["symbol"], entry, cur, peak_pct, cur_pct,
+                            signal["info"], signal["ts"])
+        await tg_edit_caption(session, cid, msg_id, cap)
 
 
-async def scanner_loop(session: aiohttp.ClientSession) -> None:
-    global LAST_SCAN, LAST_ERROR
-    semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+# =====================================================
+# SİNYAL EMIT
+# =====================================================
+async def emit_tobo_signal(session, ticker, info):
+    symbol = ticker["symbol"]
+    now_s = time.time()
+    ts = datetime.now(TR_TZ).strftime("%H:%M:%S")
+    entry = ticker["price"]
 
+    signal = {
+        "id": f"TOBO-{symbol}-{int(now_s * 1000)}",
+        "symbol": symbol,
+        "entryPrice": entry,
+        "info": info,
+        "ts": ts,
+        "createdAt": int(now_s * 1000),
+    }
+    SIGNALS.insert(0, signal)
+    del SIGNALS[100:]
+    TOBO_LOCKS[symbol] = now_s
+    save_state()
+
+    log(f"TOBO: {symbol} entry=${fmt_price(entry)} target=${fmt_price(info['target'])} head_depth={info['head_depth_pct']:.2f}%")
+
+    try:
+        bars = await fetch_spot_klines(session, symbol, TOBO_TIMEFRAME, 80)
+    except Exception:
+        bars = []
+    png = render_tobo_png(symbol, bars, entry, info["head"], info["neckline"], info["target"])
+    cap = build_caption(symbol, entry, entry, 0.0, 0.0, info, ts)
+
+    for cid in list(SUBSCRIBED_CHATS):
+        msg_id = await tg_send_photo(session, png, cap, cid)
+        if msg_id:
+            asyncio.create_task(track_signal(session, signal, cid, msg_id))
+
+
+# =====================================================
+# DÖNGÜLER
+# =====================================================
+async def market_loop(session):
     while True:
-        started = time.time()
         try:
-            async with SCAN_LOCK:
-                symbols = await get_top_symbols(session)
-                if not symbols:
-                    raise RuntimeError("Taranacak uygun USDT spot paritesi bulunamadi")
-
-                print(
-                    f"[SCAN] {len(symbols)} parite taraniyor. "
-                    f"Zaman dilimi={TIMEFRAME}, formasyon=TOBO, yon=LONG",
-                    flush=True,
-                )
-                await asyncio.gather(
-                    *(scan_symbol(session, semaphore, symbol) for symbol in symbols)
-                )
-
-                LAST_SCAN = time.time()
-                LAST_ERROR = ""
-                print(
-                    f"[SCAN] Tamamlandi: {len(symbols)} parite, "
-                    f"{time.time() - started:.1f} saniye",
-                    flush=True,
-                )
-
-        except Exception as exc:
-            LAST_ERROR = str(exc)
-            print(f"[SCAN HATASI] {LAST_ERROR}", flush=True)
-            if "418" in LAST_ERROR or "429" in LAST_ERROR:
-                await asyncio.sleep(60)
-
-        elapsed = time.time() - started
-        await asyncio.sleep(max(10, SCAN_INTERVAL_SECONDS - elapsed))
+            raw = await fetch_binance_json(session, "/api/v3/ticker/24hr")
+            for item in raw:
+                sym = str(item.get("symbol", ""))
+                if not sym.endswith("USDT") or (ACTIVE_SPOT_SYMBOLS and sym not in ACTIVE_SPOT_SYMBOLS):
+                    continue
+                price = float(item.get("lastPrice") or 0)
+                vol = float(item.get("quoteVolume") or 0)
+                if price <= 0:
+                    continue
+                TICKER_MAP[sym] = {
+                    "symbol": sym, "base": sym[:-4], "quote": "USDT",
+                    "price": price,
+                    "change24h": float(item.get("priceChangePercent") or 0),
+                    "volume24h": vol,
+                    "high24h": float(item.get("highPrice") or price),
+                    "low24h": float(item.get("lowPrice") or price),
+                }
+        except Exception as e:
+            log(f"market_loop: {e}")
+        await asyncio.sleep(4)
 
 
-# =============================================================================
-# RENDER WEB SUNUCUSU
-# =============================================================================
-async def health(_request: web.Request) -> web.Response:
-    return web.json_response({
-        "ok": True,
-        "bot": "TOBO 1H LONG",
-        "timeframe": TIMEFRAME,
-        "pattern": "TOBO",
-        "direction": "LONG",
-        "minimumFormationHeightPct": MIN_FORMATION_HEIGHT_PCT,
-        "maxScanSymbols": MAX_SCAN_SYMBOLS,
-        "lastScan": int(LAST_SCAN) if LAST_SCAN else None,
-        "lastError": LAST_ERROR,
-        "telegramConfigured": bool(BOT_TOKEN and CHAT_ID),
-    })
+async def tobo_loop(session):
+    cursor = 0
+    while True:
+        try:
+            if not BOT_RUNNING or not TICKER_MAP:
+                await asyncio.sleep(SCAN_INTERVAL_S)
+                continue
+
+            now_s = time.time()
+            cands = sorted(
+                [t for t in TICKER_MAP.values() if t["volume24h"] >= TOBO_MIN_VOL_USDT],
+                key=lambda x: x["volume24h"], reverse=True,
+            )
+            if not cands:
+                await asyncio.sleep(SCAN_INTERVAL_S)
+                continue
+
+            for _ in range(min(SCAN_BATCH, len(cands))):
+                t = cands[cursor % len(cands)]
+                cursor += 1
+                sym = t["symbol"]
+
+                if now_s - TOBO_LOCKS.get(sym, 0) < TOBO_COOLDOWN_HOURS * 3600:
+                    continue
+
+                try:
+                    bars = await fetch_spot_klines(session, sym, TOBO_TIMEFRAME, 80)
+                except Exception:
+                    continue
+
+                info = detect_tobo(bars)
+                if info:
+                    await emit_tobo_signal(session, t, info)
+                await asyncio.sleep(0.1)
+
+        except Exception as e:
+            log(f"tobo_loop: {e}")
+        await asyncio.sleep(SCAN_INTERVAL_S)
 
 
-async def index(_request: web.Request) -> web.Response:
-    return web.Response(
-        text="OK - TOBO 1H LONG Bot Running",
-        content_type="text/plain",
-    )
+async def refresh_symbols_loop(session):
+    while True:
+        try:
+            sp = await fetch_binance_json(session, "/api/v3/exchangeInfo")
+            ACTIVE_SPOT_SYMBOLS.clear()
+            for s in sp.get("symbols", []):
+                if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", True):
+                    ACTIVE_SPOT_SYMBOLS.add(s["symbol"])
+            log(f"Symbols: {len(ACTIVE_SPOT_SYMBOLS)}")
+        except Exception as e:
+            log(f"refresh_symbols: {e}")
+        await asyncio.sleep(900)
 
 
-async def main() -> None:
+async def telegram_command_loop(session):
+    if not BOT_TOKEN:
+        return
+    offset = 0
+    while True:
+        try:
+            async with session.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                json={"offset": offset, "timeout": 25},
+                timeout=aiohttp.ClientTimeout(total=32),
+            ) as r:
+                js = await r.json()
+            if not js.get("ok"):
+                await asyncio.sleep(5)
+                continue
+            for upd in js.get("result", []):
+                offset = max(offset, int(upd["update_id"]) + 1)
+                msg = upd.get("message") or {}
+                txt = str(msg.get("text") or "").strip()
+                cid = str((msg.get("chat") or {}).get("id") or "")
+                if not txt or not cid:
+                    continue
+                SUBSCRIBED_CHATS.add(cid)
+                cmd = txt.split()[0].split("@")[0].lower()
+                if cmd in ("/start", "/help"):
+                    await tg_send_text(session,
+                        f"⚡ <b>TOBO 1h LONG Botu</b>\n"
+                        f"Durum: {'🟢 Aktif' if BOT_RUNNING else '🔴 Durdu'}\n\n"
+                        f"/durum - motor durumu\n"
+                        f"/son - son 5 sinyal", cid)
+                elif cmd == "/durum":
+                    await tg_send_text(session,
+                        f"📊 <b>Durum</b>\n"
+                        f"Motor: Inverted H&S (TOBO) · {TOBO_TIMEFRAME} · LONG\n"
+                        f"Taranan coin: {len(TICKER_MAP)}\n"
+                        f"Kilitli coin: {len(TOBO_LOCKS)}\n"
+                        f"Toplam sinyal: {len(SIGNALS)}", cid)
+                elif cmd == "/son":
+                    if not SIGNALS:
+                        await tg_send_text(session, "Henüz sinyal yok.", cid)
+                    else:
+                        lines = []
+                        for s in SIGNALS[:5]:
+                            ts = datetime.fromtimestamp(s["createdAt"] / 1000, TR_TZ).strftime("%H:%M")
+                            lines.append(f"{ts} · <b>#{esc_html(s['symbol'])}</b> · ${fmt_price(s['entryPrice'])}")
+                        await tg_send_text(session, "📜 <b>Son Sinyaller</b>\n" + "\n".join(lines), cid)
+        except Exception as e:
+            log(f"tg_cmd: {e}")
+            await asyncio.sleep(4)
+
+
+# =====================================================
+# MAIN
+# =====================================================
+async def main():
     load_state()
+    log(f"TOBO 1h LONG Botu başlıyor...")
+    log(f"BOT_TOKEN: {'✓' if BOT_TOKEN else '✗'} | CHAT_ID: {CHAT_ID}")
+    log(f"STATE_FILE: {STATE_FILE}")
 
     app = web.Application()
-    app.router.add_get("/", index)
-    app.router.add_get("/health", health)
-
+    app.router.add_get("/", lambda _: web.Response(text="TOBO Bot Running"))
+    app.router.add_get("/health", lambda _: web.json_response({
+        "ok": True, "pairs": len(TICKER_MAP), "signals": len(SIGNALS),
+    }))
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log(f"Web server: {PORT}")
 
-    print(
-        f"[START] TOBO 1H LONG bot aktif. Port={PORT} | "
-        f"Minimum yukseklik=%{MIN_FORMATION_HEIGHT_PCT:.1f}",
-        flush=True,
-    )
+    if BOT_TOKEN and CHAT_ID:
+        async with aiohttp.ClientSession() as s:
+            await tg_send_text(s,
+                f"🤖 <b>TOBO 1h LONG Botu başladı</b>\n"
+                f"Motor: Inverted H&S (TOBO) · {TOBO_TIMEFRAME} · LONG\n"
+                f"Her turda ~{SCAN_BATCH} coin taranacak.", CHAT_ID)
 
-    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=timeout,
-        headers={"User-Agent": "TOBO-1H-LONG-Bot/1.0"},
-    ) as session:
-        await telegram_send(
-            session,
-            "🟢 <b>TOBO 1H LONG BOT AKTİF</b>\n"
-            "Yalnızca TOBO formasyonu taranıyor.\n"
-            "Minimum formasyon yüksekliği: <b>%1.2</b>\n"
-            "Sinyal: kapanmış 1 saatlik mumda boyun çizgisi yukarı kırılımı.",
+    async with aiohttp.ClientSession() as session:
+        await asyncio.gather(
+            refresh_symbols_loop(session),
+            market_loop(session),
+            tobo_loop(session),
+            telegram_command_loop(session),
         )
-        await scanner_loop(session)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Bot durduruldu.", flush=True)
+    asyncio.run(main())
