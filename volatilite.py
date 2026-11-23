@@ -1,24 +1,27 @@
-import asyncio
+import urllib.request
+import urllib.error
+import urllib.parse
 import json
+import math
 import os
+import ssl
 import struct
+import threading
 import time
 import zlib
+import http.server
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
-
-import aiohttp
-from aiohttp import web
 
 # =====================================================
 # AYARLAR
 # =====================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "1623907197").strip()
-PORT = int(os.getenv("PORT", "10000"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
+PORT = int(os.environ.get("PORT", "10000"))
+STATE_FILE = os.environ.get("STATE_FILE", "/tmp/tobo_state.json")
 
 TR_TZ = timezone(timedelta(hours=3))
-STATE_FILE = os.getenv("STATE_FILE", "/tmp/tobo_state.json")
 
 TOBO_TIMEFRAME = "1h"
 TOBO_MIN_HEIGHT_PCT = 1.2
@@ -27,14 +30,14 @@ TOBO_MAX_BARS_SINCE_RS = 12
 TOBO_BREAK_BUFFER = 0.005
 TOBO_COOLDOWN_HOURS = 4.0
 TOBO_MIN_VOL_USDT = 500_000
+TOBO_KLINES_LIMIT = 80
 
 SCAN_INTERVAL_S = 25
 SCAN_BATCH = 10
-TRACK_DURATION_S = 300
-TRACK_INTERVAL_S = 30
-
 MARKET_POLL_S = 10
 SYMBOLS_REFRESH_S = 1800
+TRACK_DURATION_S = 300
+TRACK_INTERVAL_S = 30
 
 BINANCE_MIRRORS = [
     "https://data-api.binance.vision",
@@ -45,23 +48,27 @@ BINANCE_MIRRORS = [
 ]
 
 # =====================================================
-# DURUM
+# GLOBAL DURUM
 # =====================================================
-BOT_RUNNING = True
-TICKER_MAP: Dict[str, Dict[str, Any]] = {}
-ACTIVE_SPOT_SYMBOLS: Set[str] = set()
-SIGNALS: List[Dict[str, Any]] = []
-TOBO_LOCKS: Dict[str, float] = {}
-SUBSCRIBED_CHATS: Set[str] = {CHAT_ID} if CHAT_ID else set()
-PREFERRED_MIRROR_IDX = 0
+TICKER_MAP = {}          # symbol -> ticker dict
+ACTIVE_SPOT = set()
+SIGNALS = []
+TOBO_LOCKS = {}
+SUBSCRIBED_CHATS = {CHAT_ID} if CHAT_ID else set()
+MIRROR_IDX = 0
 RATE_LIMITED_UNTIL = 0.0
+STATE_LOCK = threading.Lock()
 
 
 # =====================================================
 # YARDIMCILAR
 # =====================================================
-def fmt_price(p: float) -> str:
-    if p <= 0 or p != p:
+def log(msg):
+    print(f"[{datetime.now(TR_TZ).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def fmt_price(p):
+    if not p or p <= 0 or p != p or math.isinf(p):
         return "0"
     if p >= 1000:
         return f"{p:,.2f}"
@@ -76,15 +83,11 @@ def fmt_price(p: float) -> str:
     return f"{p:.8f}".rstrip("0").rstrip(".")
 
 
-def esc_html(s: str) -> str:
+def esc_html(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def log(msg: str) -> None:
-    print(f"[{datetime.now(TR_TZ).strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def load_state() -> None:
+def load_state():
     global SIGNALS, TOBO_LOCKS, SUBSCRIBED_CHATS
     if not os.path.exists(STATE_FILE):
         return
@@ -102,22 +105,163 @@ def load_state() -> None:
         pass
 
 
-def save_state() -> None:
+def save_state():
     try:
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "signals": SIGNALS[:100],
-                "locks": TOBO_LOCKS,
-                "chats": list(SUBSCRIBED_CHATS),
-            }, f)
-        os.replace(tmp, STATE_FILE)
+        with STATE_LOCK:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "signals": SIGNALS[:100],
+                    "locks": TOBO_LOCKS,
+                    "chats": list(SUBSCRIBED_CHATS),
+                }, f)
+            os.replace(tmp, STATE_FILE)
     except Exception:
         pass
 
 
 # =====================================================
-# PNG OLUŞTURUCU
+# BINANCE İSTEKLERİ (mirror + rate limit koruması)
+# =====================================================
+def _http_get_json(url, timeout=12):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def fetch_binance_json(path, timeout=12):
+    global MIRROR_IDX, RATE_LIMITED_UNTIL
+    now = time.time()
+    if now < RATE_LIMITED_UNTIL:
+        time.sleep(RATE_LIMITED_UNTIL - now)
+
+    n = len(BINANCE_MIRRORS)
+    last_err = None
+    for off in range(n):
+        idx = (MIRROR_IDX + off) % n
+        url = f"{BINANCE_MIRRORS[idx]}{path}"
+        try:
+            return _http_get_json(url, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (418, 429):
+                ra = 60
+                try:
+                    ra_hdr = e.headers.get("Retry-After")
+                    if ra_hdr:
+                        ra = int(ra_hdr)
+                except Exception:
+                    ra = 60
+                RATE_LIMITED_UNTIL = max(RATE_LIMITED_UNTIL, time.time() + ra + 2)
+                log(f"RATE LIMIT {e.code} | {ra}s bekleniyor")
+                last_err = f"HTTP {e.code}"
+                continue
+            last_err = f"HTTP {e.code}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+    raise RuntimeError(f"Binance erisilemedi: {last_err}")
+
+
+def fetch_spot_klines(symbol, interval, limit):
+    raw = fetch_binance_json(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for k in raw:
+        try:
+            out.append({
+                "openTime": int(k[0]) // 1000,
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "quoteVol": float(k[7]),
+            })
+        except Exception:
+            continue
+    return out
+
+
+# =====================================================
+# TELEGRAM
+# =====================================================
+def tg_api(method, payload=None, files=None):
+    if not BOT_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        if files:
+            boundary = f"----BotBoundary{os.urandom(8).hex()}"
+            body = bytearray()
+            for k, v in payload.items():
+                body += f"--{boundary}\r\n".encode()
+                body += f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode()
+                body += str(v).encode("utf-8") + b"\r\n"
+            for field_name, (filename, content, ctype) in files.items():
+                body += f"--{boundary}\r\n".encode()
+                body += f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode()
+                body += f"Content-Type: {ctype}\r\n\r\n".encode()
+                body += content + b"\r\n"
+            body += f"--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                url, data=bytes(body),
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+            )
+        else:
+            data = urllib.parse.urlencode(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8")
+            log(f"TG {method} HTTP {e.code}: {body[:200]}")
+        except Exception:
+            log(f"TG {method} HTTP {e.code}")
+        return None
+    except Exception as e:
+        log(f"TG {method} hata: {e}")
+        return None
+
+
+def tg_send_text(text, cid=None):
+    targets = [cid] if cid else list(SUBSCRIBED_CHATS)
+    for c in targets:
+        tg_api("sendMessage", {
+            "chat_id": c, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        })
+
+
+def tg_send_photo(png, caption, cid=None):
+    targets = [cid] if cid else list(SUBSCRIBED_CHATS)
+    safe_cap = caption[:1000]
+    last_msg_id = None
+    for c in targets:
+        if not png:
+            tg_send_text(caption, c)
+            continue
+        r = tg_api("sendPhoto",
+                   {"chat_id": c, "caption": safe_cap, "parse_mode": "HTML"},
+                   {"photo": ("chart.png", png, "image/png")})
+        if r and r.get("ok"):
+            last_msg_id = r["result"]["message_id"]
+        else:
+            tg_send_text(caption, c)
+    return last_msg_id
+
+
+def tg_edit_caption(cid, msg_id, caption):
+    if not msg_id:
+        return
+    tg_api("editMessageCaption", {
+        "chat_id": cid, "message_id": msg_id,
+        "caption": caption[:1000], "parse_mode": "HTML",
+    })
+
+
+# =====================================================
+# PNG ÇİZİM
 # =====================================================
 FONT_5X7 = {
     "0": [0x3E, 0x51, 0x49, 0x45, 0x3E], "1": [0x00, 0x42, 0x7F, 0x40, 0x00],
@@ -143,11 +287,12 @@ FONT_5X7 = {
     "+": [0x08, 0x08, 0x3E, 0x08, 0x08], "/": [0x20, 0x10, 0x08, 0x04, 0x02],
     "%": [0x23, 0x13, 0x08, 0x64, 0x62], "$": [0x24, 0x2A, 0x7F, 0x2A, 0x12],
     "|": [0x00, 0x00, 0x7F, 0x00, 0x00], "*": [0x14, 0x08, 0x3E, 0x08, 0x14],
+    "(": [0x00, 0x1C, 0x22, 0x41, 0x00], ")": [0x00, 0x41, 0x22, 0x1C, 0x00],
     " ": [0x00, 0x00, 0x00, 0x00, 0x00],
 }
 
 
-def encode_png(w: int, h: int, buf: bytearray) -> bytes:
+def encode_png(w, h, buf):
     stride = w * 3
     raw = bytearray((stride + 1) * h)
     for y in range(h):
@@ -155,7 +300,7 @@ def encode_png(w: int, h: int, buf: bytearray) -> bytes:
         raw[y * (stride + 1) + 1: y * (stride + 1) + 1 + stride] = buf[y * stride: (y + 1) * stride]
     comp = zlib.compress(bytes(raw), 6)
 
-    def chunk(tag: bytes, payload: bytes) -> bytes:
+    def chunk(tag, payload):
         crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
         return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
 
@@ -163,8 +308,23 @@ def encode_png(w: int, h: int, buf: bytearray) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", comp) + chunk(b"IEND", b"")
 
 
-def _canvas(w: int, h: int, bg):
-    buf = bytearray(bytes(bg) * (w * h))
+def render_tobo_png(symbol, bars, live_price, head, neckline, target):
+    if not bars:
+        return b""
+    sl = bars[-50:]
+    w, h = 860, 440
+    BG = (11, 16, 27)
+    GRID = (30, 41, 59)
+    TEXT = (248, 250, 252)
+    MUTED = (148, 163, 184)
+    BULL = (16, 185, 129)
+    BEAR = (244, 63, 94)
+    HEAD_COL = (244, 63, 94)
+    NECK_COL = (245, 158, 11)
+    TGT_COL = (52, 211, 153)
+    LIVE_COL = (56, 189, 248)
+
+    buf = bytearray(bytes(BG) * (w * h))
 
     def set_px(x, y, col):
         if 0 <= x < w and 0 <= y < h:
@@ -174,16 +334,12 @@ def _canvas(w: int, h: int, bg):
     def fill_rect(x0, y0, x1, y1, col):
         a0, a1 = max(0, min(x0, x1)), min(w - 1, max(x0, x1))
         b0, b1 = max(0, min(y0, y1)), min(h - 1, max(y0, y1))
+        if a1 < a0 or b1 < b0:
+            return
         row = bytes(col) * (a1 - a0 + 1)
         for y in range(b0, b1 + 1):
             st = (y * w + a0) * 3
             buf[st:st + len(row)] = row
-
-    def fill_circle(cx, cy, r, col):
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dx * dx + dy * dy <= r * r:
-                    set_px(cx + dx, cy + dy, col)
 
     def draw_line(x0, y0, x1, y1, col, dashed=False):
         dx = abs(x1 - x0)
@@ -222,23 +378,15 @@ def _canvas(w: int, h: int, bg):
                                       cx + (gx + 1) * scale - 1, y + (gy + 1) * scale - 1, col)
             cx += 6 * scale
 
-    return buf, set_px, fill_rect, fill_circle, draw_line, draw_text
-
-
-def render_tobo_png(symbol, bars, live_price, head, neckline, target):
-    if not bars:
-        return b""
-    sl = bars[-50:]
-    w, h = 860, 440
-    buf, set_px, fill_rect, fill_circle, draw_line, draw_text = _canvas(w, h, (11, 16, 27))
-    pad_l, pad_r, pad_t, pad_b, vol_h, gap = 18, 118, 44, 22, 58, 12
+    pad_l, pad_r, pad_t, pad_b = 18, 118, 44, 22
+    vol_h, gap = 58, 12
     plot_w = w - pad_l - pad_r
     price_h = h - pad_t - pad_b - vol_h - gap
 
     prices = [b["high"] for b in sl] + [b["low"] for b in sl]
-    for extra in (live_price, head, neckline, target):
-        if extra and extra > 0:
-            prices.append(extra)
+    for v in (live_price, head, neckline, target):
+        if v and v > 0:
+            prices.append(v)
     lo_p = min(prices) * 0.993
     hi_p = max(prices) * 1.007
     rng_p = max(hi_p - lo_p, lo_p * 0.004)
@@ -247,34 +395,34 @@ def render_tobo_png(symbol, bars, live_price, head, neckline, target):
     def y_of(p):
         return round(pad_t + ((hi_p - p) / rng_p) * price_h)
 
-    draw_text(pad_l, 14, f"{symbol} | 1H TOBO (INVERTED H&S) | ${fmt_price(live_price)}", (248, 250, 252), 2)
+    draw_text(pad_l, 14, f"{symbol} | 1H TOBO | ${fmt_price(live_price)}", TEXT, 2)
 
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         gy = round(pad_t + price_h * frac)
-        draw_line(pad_l, gy, pad_l + plot_w, gy, (30, 41, 59), True)
-        draw_text(pad_l + plot_w + 8, gy - 3, fmt_price(hi_p - rng_p * frac), (148, 163, 184), 1)
+        draw_line(pad_l, gy, pad_l + plot_w, gy, GRID, True)
+        draw_text(pad_l + plot_w + 8, gy - 3, fmt_price(hi_p - rng_p * frac), MUTED, 1)
 
     if head > 0:
         hy = y_of(head)
-        draw_line(pad_l, hy, pad_l + plot_w, hy, (244, 63, 94), True)
-        draw_text(pad_l + plot_w + 8, hy - 3, f"BAS {fmt_price(head)}", (244, 63, 94), 1)
+        draw_line(pad_l, hy, pad_l + plot_w, hy, HEAD_COL, True)
+        draw_text(pad_l + plot_w + 8, hy - 3, f"BAS {fmt_price(head)}", HEAD_COL, 1)
 
     if neckline > 0:
         ny = y_of(neckline)
-        draw_line(pad_l, ny, pad_l + plot_w, ny, (245, 158, 11), True)
-        draw_text(pad_l + plot_w + 8, ny - 3, f"BOYUN {fmt_price(neckline)}", (245, 158, 11), 1)
+        draw_line(pad_l, ny, pad_l + plot_w, ny, NECK_COL, True)
+        draw_text(pad_l + plot_w + 8, ny - 3, f"BOYUN {fmt_price(neckline)}", NECK_COL, 1)
 
     if target > 0:
         ty = y_of(target)
-        draw_line(pad_l, ty, pad_l + plot_w, ty, (52, 211, 153), True)
-        draw_text(pad_l + plot_w + 8, ty - 3, f"HDF {fmt_price(target)}", (52, 211, 153), 1)
+        draw_line(pad_l, ty, pad_l + plot_w, ty, TGT_COL, True)
+        draw_text(pad_l + plot_w + 8, ty - 3, f"HDF {fmt_price(target)}", TGT_COL, 1)
 
     step = plot_w / len(sl)
     bw = max(3, int(step * 0.62))
     vol_top = pad_t + price_h + gap
     for idx, b in enumerate(sl):
         cx = round(pad_l + (idx + 0.5) * step)
-        col = (16, 185, 129) if b["close"] >= b["open"] else (244, 63, 94)
+        col = BULL if b["close"] >= b["open"] else BEAR
         yo, yc = y_of(b["open"]), y_of(b["close"])
         yh, yl = y_of(b["high"]), y_of(b["low"])
         draw_line(cx, yh, cx, yl, col)
@@ -286,128 +434,17 @@ def render_tobo_png(symbol, bars, live_price, head, neckline, target):
 
     if live_price > 0:
         ly = y_of(live_price)
-        draw_line(pad_l, ly, pad_l + plot_w, ly, (56, 189, 248), True)
+        draw_line(pad_l, ly, pad_l + plot_w, ly, LIVE_COL, True)
         fill_rect(pad_l + plot_w + 4, ly - 7, w - 4, ly + 7, (2, 132, 199))
-        draw_text(pad_l + plot_w + 8, ly - 3, fmt_price(live_price), (248, 250, 252), 1)
+        draw_text(pad_l + plot_w + 8, ly - 3, fmt_price(live_price), TEXT, 1)
 
     return encode_png(w, h, buf)
 
 
 # =====================================================
-# BINANCE (rate limit korumalı)
-# =====================================================
-async def fetch_binance_json(session: aiohttp.ClientSession, path: str, timeout_s: float = 9.0) -> Any:
-    global PREFERRED_MIRROR_IDX, RATE_LIMITED_UNTIL
-    now = time.time()
-    if now < RATE_LIMITED_UNTIL:
-        await asyncio.sleep(RATE_LIMITED_UNTIL - now)
-
-    n = len(BINANCE_MIRRORS)
-    last_err = None
-    for off in range(n):
-        idx = (PREFERRED_MIRROR_IDX + off) % n
-        url = f"{BINANCE_MIRRORS[idx]}{path}"
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as r:
-                if r.status == 200:
-                    PREFERRED_MIRROR_IDX = idx
-                    return await r.json()
-                if r.status in (418, 429):
-                    try:
-                        ra = int(r.headers.get("Retry-After", "60"))
-                    except Exception:
-                        ra = 60
-                    RATE_LIMITED_UNTIL = max(RATE_LIMITED_UNTIL, time.time() + ra + 2)
-                    log(f"RATE LIMIT {r.status} | {ra}s bekleniyor")
-                    last_err = f"HTTP {r.status}"
-                    continue
-                last_err = f"HTTP {r.status}"
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"Binance erisilemedi: {last_err}")
-
-
-async def fetch_spot_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 120) -> List[Dict[str, float]]:
-    raw = await fetch_binance_json(session, f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
-    if not isinstance(raw, list):
-        return []
-    return [{
-        "openTime": int(k[0]) // 1000,
-        "open": float(k[1]),
-        "high": float(k[2]),
-        "low": float(k[3]),
-        "close": float(k[4]),
-        "volume": float(k[5]),
-        "quoteVol": float(k[7]),
-    } for k in raw]
-
-
-# =====================================================
-# TELEGRAM
-# =====================================================
-async def tg_send_text(session, text: str, explicit_cid: Optional[str] = None) -> None:
-    if not BOT_TOKEN:
-        return
-    targets = [explicit_cid] if explicit_cid else list(SUBSCRIBED_CHATS)
-    for cid in targets:
-        try:
-            async with session.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as r:
-                await r.read()
-        except Exception:
-            pass
-
-
-async def tg_send_photo(session, png: bytes, caption: str, explicit_cid: Optional[str] = None) -> Optional[int]:
-    if not BOT_TOKEN:
-        return None
-    targets = [explicit_cid] if explicit_cid else list(SUBSCRIBED_CHATS)
-    safe_cap = caption[:995] + "..." if len(caption) > 1000 else caption
-    last_id = None
-    for cid in targets:
-        try:
-            data = aiohttp.FormData()
-            data.add_field("chat_id", cid)
-            data.add_field("caption", safe_cap)
-            data.add_field("parse_mode", "HTML")
-            data.add_field("photo", png, filename="chart.png", content_type="image/png")
-            async with session.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data=data, timeout=aiohttp.ClientTimeout(total=18),
-            ) as r:
-                js = await r.json()
-                if js.get("ok"):
-                    last_id = js["result"]["message_id"]
-                else:
-                    await tg_send_text(session, caption, cid)
-        except Exception:
-            await tg_send_text(session, caption, cid)
-    return last_id
-
-
-async def tg_edit_caption(session, cid: str, msg_id: int, caption: str) -> None:
-    if not BOT_TOKEN or not msg_id:
-        return
-    try:
-        async with session.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageCaption",
-            json={"chat_id": cid, "message_id": msg_id, "caption": caption[:1000], "parse_mode": "HTML"},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            await r.read()
-    except Exception:
-        pass
-
-
-# =====================================================
 # TOBO TESPİT
 # =====================================================
-def detect_tobo(bars: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
+def detect_tobo(bars):
     if len(bars) < 40:
         return None
     rec = bars[-75:]
@@ -415,7 +452,7 @@ def detect_tobo(bars: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
     break_bar = rec[n - 2]
     cur = rec[n - 1]["close"]
 
-    lows: List[tuple] = []
+    lows = []
     for i in range(3, n - 3):
         if all(rec[j]["low"] > rec[i]["low"] for j in range(i - 3, i + 3) if j != i):
             lows.append((i, rec[i]["low"]))
@@ -453,55 +490,29 @@ def detect_tobo(bars: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
 # =====================================================
 # CAPTION
 # =====================================================
-def build_caption(symbol: str, entry: float, live: float,
-                  peak_pct: float, cur_pct: float,
-                  info: Dict[str, float], ts: str) -> str:
+def build_caption(symbol, entry, live, peak_pct, cur_pct, info, ts):
     head = info["head"]
     neckline = info["neckline"]
     target = info["target"]
 
     return (
-        f"🔷 <b>Inverted H&S (TOBO) · {TOBO_TIMEFRAME} · LONG</b>\n\n"
-        f"🕐 {ts}\n"
-        f"💰 Giriş: <b>${fmt_price(entry)}</b>\n"
-        f"📊 Anlık: ${fmt_price(live)} ({cur_pct:+.2f}%)\n"
-        f"⬆️ Zirve: {peak_pct:+.2f}%\n\n"
-        f"📐 <b>#{esc_html(symbol)}</b> [LONG]\n"
-        f"Baş (${fmt_price(head)}) & Boyun (${fmt_price(neckline)}) yukarı kırıldı.\n"
-        f"🎯 Hedef: <b>${fmt_price(target)}</b> · Destek: ${fmt_price(head)}"
+        f"<b>Inverted H&amp;S (TOBO) ({TOBO_TIMEFRAME}) · LONG</b>\n\n"
+        f"{ts}\n"
+        f"Giriş: ${fmt_price(entry)}\n"
+        f"Anlık: ${fmt_price(live)}\n"
+        f"Zirve: {peak_pct:+.2f}%\n\n"
+        f"Inverted H&amp;S (TOBO) ({TOBO_TIMEFRAME}) — #{esc_html(symbol)} [LONG]\n"
+        f"📐 TOBO Baş (${fmt_price(head)}) &amp; boyun (${fmt_price(neckline)}) yukarı kırıldı.\n"
+        f"🎯 Formasyon Hedefi: ${fmt_price(target)} ({cur_pct:+.2f}%) · Boyun/Destek: ${fmt_price(head)}"
     )
 
 
 # =====================================================
-# SİNYAL TAKİBİ
+# SİNYAL EMIT + TAKİP
 # =====================================================
-async def track_signal(session, signal, cid, msg_id):
-    entry = signal["entryPrice"]
-    peak = entry
-    end_t = time.time() + TRACK_DURATION_S
-    while time.time() < end_t and BOT_RUNNING:
-        await asyncio.sleep(TRACK_INTERVAL_S)
-        tick = TICKER_MAP.get(signal["symbol"])
-        if not tick:
-            continue
-        cur = tick["price"]
-        if cur > peak:
-            peak = cur
-        peak_pct = (peak - entry) / entry * 100.0
-        cur_pct = (cur - entry) / entry * 100.0
-        cap = build_caption(signal["symbol"], entry, cur, peak_pct, cur_pct,
-                            signal["info"], signal["ts"])
-        await tg_edit_caption(session, cid, msg_id, cap)
-
-
-# =====================================================
-# SİNYAL EMIT
-# =====================================================
-async def emit_tobo_signal(session, ticker, info):
-    symbol = ticker["symbol"]
+def emit_tobo_signal(symbol, entry, info):
     now_s = time.time()
     ts = datetime.now(TR_TZ).strftime("%H:%M:%S")
-    entry = ticker["price"]
 
     signal = {
         "id": f"TOBO-{symbol}-{int(now_s * 1000)}",
@@ -516,55 +527,78 @@ async def emit_tobo_signal(session, ticker, info):
     TOBO_LOCKS[symbol] = now_s
     save_state()
 
-    log(f"TOBO SINYAL: {symbol} entry=${fmt_price(entry)} neckline=${fmt_price(info['neckline'])} target=${fmt_price(info['target'])} depth={info['head_depth_pct']:.2f}%")
+    log(f"TOBO SİNYAL: {symbol} entry=${fmt_price(entry)} neckline=${fmt_price(info['neckline'])} target=${fmt_price(info['target'])} depth={info['head_depth_pct']:.2f}%")
 
     try:
-        bars = await fetch_spot_klines(session, symbol, TOBO_TIMEFRAME, 80)
+        bars = fetch_spot_klines(symbol, TOBO_TIMEFRAME, TOBO_KLINES_LIMIT)
     except Exception:
         bars = []
     png = render_tobo_png(symbol, bars, entry, info["head"], info["neckline"], info["target"])
     cap = build_caption(symbol, entry, entry, 0.0, 0.0, info, ts)
 
     for cid in list(SUBSCRIBED_CHATS):
-        msg_id = await tg_send_photo(session, png, cap, cid)
+        msg_id = tg_send_photo(png, cap, cid)
         if msg_id:
-            asyncio.create_task(track_signal(session, signal, cid, msg_id))
+            threading.Thread(
+                target=track_signal, args=(signal, cid, msg_id), daemon=True
+            ).start()
+
+
+def track_signal(signal, cid, msg_id):
+    entry = signal["entryPrice"]
+    peak = entry
+    end_t = time.time() + TRACK_DURATION_S
+    while time.time() < end_t:
+        time.sleep(TRACK_INTERVAL_S)
+        tick = TICKER_MAP.get(signal["symbol"])
+        if not tick:
+            continue
+        cur = tick["price"]
+        if cur > peak:
+            peak = cur
+        peak_pct = (peak - entry) / entry * 100.0
+        cur_pct = (cur - entry) / entry * 100.0
+        cap = build_caption(signal["symbol"], entry, cur, peak_pct, cur_pct,
+                            signal["info"], signal["ts"])
+        tg_edit_caption(cid, msg_id, cap)
 
 
 # =====================================================
 # DÖNGÜLER
 # =====================================================
-async def market_loop(session):
+def market_loop():
     while True:
         try:
-            raw = await fetch_binance_json(session, "/api/v3/ticker/24hr")
+            raw = fetch_binance_json("/api/v3/ticker/24hr")
             for item in raw:
                 sym = str(item.get("symbol", ""))
-                if not sym.endswith("USDT") or (ACTIVE_SPOT_SYMBOLS and sym not in ACTIVE_SPOT_SYMBOLS):
+                if not sym.endswith("USDT"):
+                    continue
+                if ACTIVE_SPOT and sym not in ACTIVE_SPOT:
                     continue
                 price = float(item.get("lastPrice") or 0)
-                vol = float(item.get("quoteVolume") or 0)
                 if price <= 0:
                     continue
                 TICKER_MAP[sym] = {
-                    "symbol": sym, "base": sym[:-4], "quote": "USDT",
+                    "symbol": sym,
+                    "base": sym[:-4],
                     "price": price,
                     "change24h": float(item.get("priceChangePercent") or 0),
-                    "volume24h": vol,
+                    "volume24h": float(item.get("quoteVolume") or 0),
                     "high24h": float(item.get("highPrice") or price),
                     "low24h": float(item.get("lowPrice") or price),
                 }
         except Exception as e:
             log(f"market_loop: {e}")
-        await asyncio.sleep(MARKET_POLL_S)
+        time.sleep(MARKET_POLL_S)
 
 
-async def tobo_loop(session):
+def tobo_loop():
     cursor = 0
     while True:
         try:
-            if not BOT_RUNNING or not TICKER_MAP:
-                await asyncio.sleep(SCAN_INTERVAL_S)
+            if not TICKER_MAP:
+                time.sleep(SCAN_INTERVAL_S)
                 continue
 
             now_s = time.time()
@@ -573,7 +607,7 @@ async def tobo_loop(session):
                 key=lambda x: x["volume24h"], reverse=True,
             )
             if not cands:
-                await asyncio.sleep(SCAN_INTERVAL_S)
+                time.sleep(SCAN_INTERVAL_S)
                 continue
 
             for _ in range(min(SCAN_BATCH, len(cands))):
@@ -585,50 +619,50 @@ async def tobo_loop(session):
                     continue
 
                 try:
-                    bars = await fetch_spot_klines(session, sym, TOBO_TIMEFRAME, 80)
+                    bars = fetch_spot_klines(sym, TOBO_TIMEFRAME, TOBO_KLINES_LIMIT)
                 except Exception:
                     continue
 
                 info = detect_tobo(bars)
                 if info:
-                    await emit_tobo_signal(session, t, info)
-                await asyncio.sleep(0.15)
+                    try:
+                        emit_tobo_signal(sym, t["price"], info)
+                    except Exception as e:
+                        log(f"emit hata {sym}: {e}")
+                time.sleep(0.2)
 
         except Exception as e:
             log(f"tobo_loop: {e}")
-        await asyncio.sleep(SCAN_INTERVAL_S)
+        time.sleep(SCAN_INTERVAL_S)
 
 
-async def refresh_symbols_loop(session):
+def refresh_symbols_loop():
     while True:
         try:
-            sp = await fetch_binance_json(session, "/api/v3/exchangeInfo")
-            ACTIVE_SPOT_SYMBOLS.clear()
+            sp = fetch_binance_json("/api/v3/exchangeInfo")
+            tmp = set()
             for s in sp.get("symbols", []):
                 if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", True):
-                    ACTIVE_SPOT_SYMBOLS.add(s["symbol"])
-            log(f"Symbols: {len(ACTIVE_SPOT_SYMBOLS)}")
+                    tmp.add(s["symbol"])
+            ACTIVE_SPOT.clear()
+            ACTIVE_SPOT.update(tmp)
+            log(f"Symbols: {len(ACTIVE_SPOT)}")
         except Exception as e:
             log(f"refresh_symbols: {e}")
-        await asyncio.sleep(SYMBOLS_REFRESH_S)
+        time.sleep(SYMBOLS_REFRESH_S)
 
 
-async def telegram_command_loop(session):
+def telegram_command_loop():
     if not BOT_TOKEN:
         return
     offset = 0
     while True:
         try:
-            async with session.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                json={"offset": offset, "timeout": 25},
-                timeout=aiohttp.ClientTimeout(total=32),
-            ) as r:
-                js = await r.json()
-            if not js.get("ok"):
-                await asyncio.sleep(5)
+            r = tg_api("getUpdates", {"offset": offset, "timeout": 25})
+            if not r or not r.get("ok"):
+                time.sleep(5)
                 continue
-            for upd in js.get("result", []):
+            for upd in r.get("result", []):
                 offset = max(offset, int(upd["update_id"]) + 1)
                 msg = upd.get("message") or {}
                 txt = str(msg.get("text") or "").strip()
@@ -636,72 +670,119 @@ async def telegram_command_loop(session):
                 if not txt or not cid:
                     continue
                 SUBSCRIBED_CHATS.add(cid)
+                save_state()
                 cmd = txt.split()[0].split("@")[0].lower()
                 if cmd in ("/start", "/help"):
-                    await tg_send_text(session,
-                        f"⚡ <b>TOBO 1h LONG Botu</b>\n"
-                        f"Durum: {'🟢 Aktif' if BOT_RUNNING else '🔴 Durdu'}\n\n"
-                        f"/durum - motor durumu\n"
-                        f"/son - son 5 sinyal", cid)
+                    tg_send_text(
+                        "<b>TOBO 1h LONG Botu</b>\n"
+                        "/durum - motor durumu\n"
+                        "/son - son 5 sinyal",
+                        cid,
+                    )
                 elif cmd == "/durum":
-                    await tg_send_text(session,
-                        f"📊 <b>Durum</b>\n"
-                        f"Motor: Inverted H&S (TOBO) · {TOBO_TIMEFRAME} · LONG\n"
+                    tg_send_text(
+                        f"<b>Durum</b>\n"
+                        f"Motor: TOBO · {TOBO_TIMEFRAME} · LONG\n"
                         f"Taranan coin: {len(TICKER_MAP)}\n"
                         f"Kilitli coin: {len(TOBO_LOCKS)}\n"
-                        f"Toplam sinyal: {len(SIGNALS)}", cid)
+                        f"Toplam sinyal: {len(SIGNALS)}",
+                        cid,
+                    )
                 elif cmd == "/son":
                     if not SIGNALS:
-                        await tg_send_text(session, "Henüz sinyal yok.", cid)
+                        tg_send_text("Henüz sinyal yok.", cid)
                     else:
                         lines = []
                         for s in SIGNALS[:5]:
                             ts = datetime.fromtimestamp(s["createdAt"] / 1000, TR_TZ).strftime("%H:%M")
                             lines.append(f"{ts} · <b>#{esc_html(s['symbol'])}</b> · ${fmt_price(s['entryPrice'])}")
-                        await tg_send_text(session, "📜 <b>Son Sinyaller</b>\n" + "\n".join(lines), cid)
+                        tg_send_text("<b>Son Sinyaller</b>\n" + "\n".join(lines), cid)
         except Exception as e:
             log(f"tg_cmd: {e}")
-            await asyncio.sleep(4)
+            time.sleep(4)
+
+
+# =====================================================
+# WEB SUNUCU
+# =====================================================
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            body = json.dumps({
+                "ok": True,
+                "pairs": len(TICKER_MAP),
+                "signals": len(SIGNALS),
+                "locked": len(TOBO_LOCKS),
+                "rate_limited": time.time() < RATE_LIMITED_UNTIL,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = b"TOBO Bot Running"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a):
+        return
+
+
+def run_web_server():
+    try:
+        server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+        log(f"Web server aktif: port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        log(f"Web server hata: {e}")
+
+
+def gozetmen(fn, name):
+    while True:
+        try:
+            fn()
+            return
+        except Exception as e:
+            log(f"GÖZETMEN {name} çöktü: {e}, 30s sonra tekrar")
+            time.sleep(30)
 
 
 # =====================================================
 # MAIN
 # =====================================================
-async def main():
+if __name__ == "__main__":
     load_state()
     log("=" * 50)
-    log("TOBO 1h LONG Botu baslatiliyor...")
+    log("TOBO 1h LONG Botu baslatiliyor (saf Python)")
     log(f"BOT_TOKEN: {'VAR' if BOT_TOKEN else 'YOK!'} | CHAT_ID: {CHAT_ID}")
     log(f"STATE_FILE: {STATE_FILE}")
-    log(f"Web Port: {PORT}")
+    log(f"Port: {PORT}")
     log("=" * 50)
 
-    app = web.Application()
-    app.router.add_get("/", lambda _: web.Response(text="TOBO Bot Running"))
-    app.router.add_get("/health", lambda _: web.json_response({
-        "ok": True, "pairs": len(TICKER_MAP), "signals": len(SIGNALS),
-        "locked": len(TOBO_LOCKS), "rate_limited": time.time() < RATE_LIMITED_UNTIL,
-    }))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log(f"Web server aktif: port {PORT}")
+    threading.Thread(target=run_web_server, daemon=True).start()
 
     if BOT_TOKEN and CHAT_ID:
-        async with aiohttp.ClientSession() as s:
-            await tg_send_text(s,
-                f"🤖 <b>TOBO 1h LONG Botu başladı</b>\n"
-                f"Motor: Inverted H&S (TOBO) · {TOBO_TIMEFRAME} · LONG\n"
-                f"Her turda ~{SCAN_BATCH} coin taranacak.", CHAT_ID)
-
-    async with aiohttp.ClientSession() as session:
-        await asyncio.gather(
-            refresh_symbols_loop(session),
-            market_loop(session),
-            tobo_loop(session),
-            telegram_command_loop(session),
+        tg_send_text(
+            f"<b>TOBO 1h LONG Botu başladı</b>\n"
+            f"Motor: Inverted H&S · {TOBO_TIMEFRAME} · LONG",
+            CHAT_ID,
         )
 
+    for fn, name in [
+        (refresh_symbols_loop, "symbols"),
+        (market_loop, "market"),
+        (tobo_loop, "tobo"),
+        (telegram_command_loop, "tg_cmd"),
+    ]:
+        threading.Thread(target=gozetmen, args=(fn, name), daemon=True).start()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    while True:
+        time.sleep(3600)
