@@ -1,7 +1,7 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 18:51:32 · Rev #2
-# Aktif Motorlar: Pump(%3.5) | 15dk(%3.5) | ATH/ATL(1M) | 4H MA200(L:1/S:1)
+# Uretim: 20:10:08 · Rev #2
+# Aktif Motorlar: Volatilite(15m,1h, Tumu) | Formasyon(1/7)
 # Futures: 3x | $25 | TP +%5 / SL -%5 | RSI >= 90
 # ==============================================================================
 import asyncio
@@ -27,24 +27,24 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Web panelinden secilen guncel tikler ve parametreler (GitHub volatilite.py / bot.py ile birebir degistirin):
 DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
-    "pumpEnabled": True,
-    "pumpThresholdPct": 3.5,
+    "pumpEnabled": False,
+    "pumpThresholdPct": 4,
     "pumpMinVolUsdt": 150000,
     "pumpRepeatHours": 2,
-    "pump15mEnabled": True,
-    "pump15mThresholdPct": 3.5,
+    "pump15mEnabled": False,
+    "pump15mThresholdPct": 3.2,
     "pump15mMinRvol": 1.4,
-    "athEnabled": True,
-    "atlEnabled": True,
+    "athEnabled": False,
+    "atlEnabled": False,
     "athAtlTimeframes": ["1M"],
-    "athAtlLockPct": 0.5,
-    "athAtlCooldownMin": 5,
-    "ma200Enabled": True,
+    "athAtlLockPct": 2.5,
+    "athAtlCooldownMin": 15,
+    "ma200Enabled": False,
     "ma200LongEnabled": True,
     "ma200ShortEnabled": True,
-    "ma200Timeframe": "4h",
-    "ma200Period": 200,
-    "volatilityEnabled": False,
+    "ma200Timeframe": "1d",
+    "ma200Period": 25,
+    "volatilityEnabled": True,
     "volatilityTimeframes": ["15m", "1h"],
     "volatilityMajorOnly": False,
     "volatilityMajorCoins": [
@@ -65,22 +65,22 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "NEAR",
         "PEPE",
     ],
-    "volatilityAtrMult": 2.2,
-    "volatilityMinMovePct": 1.8,
-    "volatilityLongEnabled": True,
+    "volatilityAtrMult": 1.5,
+    "volatilityMinMovePct": 5,
+    "volatilityLongEnabled": False,
     "volatilityShortEnabled": True,
-    "patternsEnabled": False,
-    "patternTimeframes": ["15m", "1h", "4h", "1d"],
+    "patternsEnabled": True,
+    "patternTimeframes": ["1h"],
     "enabledPatterns": {
-        "DOUBLE_BOTTOM": True,
-        "DOUBLE_TOP": True,
-        "HEAD_SHOULDERS": True,
+        "DOUBLE_BOTTOM": False,
+        "DOUBLE_TOP": False,
+        "HEAD_SHOULDERS": False,
         "INV_HEAD_SHOULDERS": True,
-        "BULL_FLAG": True,
-        "BEAR_FLAG": True,
-        "BEAR_RECTANGLE": True,
+        "BULL_FLAG": False,
+        "BEAR_FLAG": False,
+        "BEAR_RECTANGLE": False,
     },
-    "patternMinHeightPct": 1.2,
+    "patternMinHeightPct": 0.5,
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
@@ -106,7 +106,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "slPct": 5,
     "maxOpenTrades": 0,
     "rsiMin": 90,
-    "notifyPaperTelegram": False,
+    "notifyPaperTelegram": True,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
