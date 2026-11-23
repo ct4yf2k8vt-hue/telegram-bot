@@ -46,6 +46,7 @@ def _env_int(name, default, lo, hi):
     return int(default)
 
 
+TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "1623907197").strip()
 PORT = _env_int("PORT", 10000, 1, 65535)
@@ -559,7 +560,7 @@ def fetch_klines(sym, interval="1m", limit=45):
 
 
 # ==============================================================================
-# SIFIR BAGIMLILIKLI PNG OLUSTURUCU (MUM GRAFIGI + TOP 24 SAAT LIDERLIK KARTI)
+# SIFIR BAGIMLILIKLI PNG OLUSTURUCU
 # ==============================================================================
 FONT_5X7 = {
     "0": [0x3E, 0x51, 0x49, 0x45, 0x3E], "1": [0x00, 0x42, 0x7F, 0x40, 0x00],
@@ -731,122 +732,12 @@ def render_pump_png(symbol, tf_label, candles, live_price, start_price, badge="S
     return _encode_rgb_png(W, H, buf)
 
 
-def render_top24_png(ranked, total_count, hit2_pct):
-    rows = ranked[:5]
-    if not rows:
-        return b""
-    W, H = 860, 700
-    BG = (11, 15, 35)
-    CARD = (16, 21, 45)
-    BORDER = (45, 54, 99)
-    ROW1_BG = (23, 29, 61)
-    ROW1_BD = (99, 102, 241)
-    ROW_BG = (14, 19, 41)
-    DIVIDER = (30, 38, 74)
-    TEXT = (255, 255, 255)
-    MUTED = (148, 163, 184)
-    GREEN = (52, 211, 153)
-    GOLD = (251, 191, 36)
-
-    buf = bytearray(bytes(BG) * (W * H))
-
-    def set_px(x, y, col):
-        if 0 <= x < W and 0 <= y < H:
-            i = (y * W + x) * 3
-            buf[i] = col[0]
-            buf[i + 1] = col[1]
-            buf[i + 2] = col[2]
-
-    def fill_rect(x0, y0, x1, y1, col):
-        x0, x1 = max(0, min(x0, x1)), min(W - 1, max(x0, x1))
-        y0, y1 = max(0, min(y0, y1)), min(H - 1, max(y0, y1))
-        row_bytes = bytes(col) * (x1 - x0 + 1)
-        for y in range(y0, y1 + 1):
-            s = (y * W + x0) * 3
-            buf[s:s + len(row_bytes)] = row_bytes
-
-    def draw_box(x0, y0, x1, y1, fill, border):
-        fill_rect(x0, y0, x1, y1, fill)
-        fill_rect(x0, y0, x1, y0 + 1, border)
-        fill_rect(x0, y1 - 1, x1, y1, border)
-        fill_rect(x0, y0, x0 + 1, y1, border)
-        fill_rect(x1 - 1, y0, x1, y1, border)
-
-    def fill_circle(cx, cy, r, col):
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dx * dx + dy * dy <= r * r:
-                    set_px(cx + dx, cy + dy, col)
-
-    def draw_text(x, y, text, col, scale=1):
-        cx = x
-        for ch in text.upper():
-            glyph = FONT_5X7.get(ch, FONT_5X7[" "])
-            for gx in range(5):
-                bits = glyph[gx]
-                for gy in range(7):
-                    if bits & (1 << gy):
-                        if scale == 1:
-                            set_px(cx + gx, y + gy, col)
-                        else:
-                            fill_rect(cx + gx * scale, y + gy * scale, cx + (gx + 1) * scale - 1, y + (gy + 1) * scale - 1, col)
-            cx += 6 * scale
-
-    draw_box(24, 20, W - 24, H - 20, CARD, BORDER)
-    fill_rect(54, 46, 98, 90, (99, 102, 241))
-    draw_text(66, 61, "SF", TEXT, scale=2)
-    draw_text(114, 48, "SPOT AKIS TERMINALI", (248, 250, 252), scale=2)
-    draw_text(114, 72, "CANLI TARAYICI | FUTURES 3X", MUTED, scale=1)
-    draw_box(W - 220, 48, W - 52, 86, (26, 31, 68), (79, 70, 229))
-    draw_text(W - 196, 61, "TOP * 24 SAAT", (199, 210, 254), scale=2)
-
-    draw_text(54, 120, "24 SAATIN EN IYI HAREKETLERI", TEXT, scale=2)
-    draw_text(54, 148, "SINYAL YONUNDEKI MAKSIMUM YUKSELIS", MUTED, scale=1)
-
-    badge_cols = (
-        (236, 72, 153),
-        (249, 115, 22),
-        (6, 182, 212),
-        (139, 92, 246),
-        (16, 185, 129),
-    )
-
-    for idx, s in enumerate(rows):
-        ry0 = 180 + idx * 80
-        ry1 = ry0 + 68
-        if idx == 0:
-            draw_box(48, ry0, W - 48, ry1, ROW1_BG, ROW1_BD)
-        else:
-            fill_rect(48, ry0, W - 48, ry1, ROW_BG)
-            fill_rect(48, ry1, W - 48, ry1, DIVIDER)
-        draw_text(66, ry0 + 25, str(idx + 1), GOLD if idx == 0 else MUTED, scale=2)
-        fill_circle(122, ry0 + 34, 18, badge_cols[idx % len(badge_cols)])
-        draw_text(111, ry0 + 27, s["base"][:2], TEXT, scale=2)
-
-        draw_text(158, ry0 + 16, s["base"], TEXT, scale=2)
-        dur = fmt_peak_dur(s["created_at"], s.get("peak_at", s["created_at"]), ascii_only=True)
-        draw_text(158, ry0 + 42, f"PIK {dur} ICINDE", MUTED, scale=1)
-
-        pk = s.get("peak_pct", 0.0)
-        pct_txt = f"+{pk:.0f}%" if pk >= 10 else f"+{pk:.1f}%"
-        sc = 3 if idx == 0 else 2
-        tw = len(pct_txt) * 6 * sc
-        draw_text(W - 68 - tw, ry0 + (22 if idx == 0 else 26), pct_txt, GREEN, scale=sc)
-
-    draw_box(48, 594, W - 48, 646, (19, 25, 54), (39, 49, 90))
-    draw_text(68, 608, "SPOT AKIS TERMINALI  |  CANLI SINYAL & FUTURES 3X", (226, 232, 240), scale=1)
-    draw_text(68, 626, "PUMP & KIRILIM OTOMATIK +5% TP / -5% SL", (129, 140, 248), scale=1)
-    draw_text(54, 658, f"{total_count} SINYAL TAKIPTE  |  %{hit2_pct} +2% ULASTI  |  HAREKET != KAR GARANTISI", (100, 116, 139), scale=1)
-
-    return _encode_rgb_png(W, H, buf)
-
-
 # ==============================================================================
-# TELEGRAM GONDERICILER (HATA KONTROLLU VE DUZ METIN FALLBACK'LI)
+# TELEGRAM GONDERICILER (SADECE METIN, GORSEL YOK)
 # ==============================================================================
 def telegram_send_message(text):
-    if not BOT_TOKEN:
-        print(f"[SINYAL/MESAJ] (BOT_TOKEN EKSIK)\n{text}\n")
+    if not TELEGRAM_ENABLED or not BOT_TOKEN:
+        print(f"[SINYAL/MESAJ - TELEGRAM KAPALI]\n{text}\n")
         return False
     try:
         body = json.dumps({
@@ -866,6 +757,7 @@ def telegram_send_message(text):
     except urllib.error.HTTPError as e:
         err_body = e.read().decode('utf-8', errors='ignore')
         print(f"[TG sendMessage Hata] HTTP {e.code} | Detay: {err_body}")
+        
         # HTML Hatasi Alirsak Duz Metin Olarak Tekrar Gonder (Fallback)
         if "can't parse entities" in err_body:
             try:
@@ -888,42 +780,12 @@ def telegram_send_message(text):
 
 
 def telegram_send_photo(png_bytes, caption):
-    if len(caption) > 1020:
-        caption = caption[:1017] + "..."
-    if not BOT_TOKEN:
-        print(f"[SINYAL/GORSEL] (BOT_TOKEN EKSIK) {len(png_bytes)}B\n{caption}\n")
-        return False
-    if not png_bytes:
-        return telegram_send_message(caption)
-    try:
-        boundary = "----SpotPumpBoundary7e8a9b"
-        parts = []
-        for k, v in (("chat_id", CHAT_ID), ("caption", caption), ("parse_mode", "HTML")):
-            parts.append(
-                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
-            )
-        parts.append(
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"chart.png\"\r\nContent-Type: image/png\r\n\r\n".encode("utf-8")
-            + png_bytes
-            + b"\r\n"
-        )
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        body = b"".join(parts)
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-            data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return True
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode('utf-8', errors='ignore')
-        print(f"[TG sendPhoto Hata] HTTP {e.code} | Detay: {err_body}")
-        return telegram_send_message(caption)
-    except Exception as e:
-        print(f"[TG sendPhoto Genel Hata] {e}")
-        return telegram_send_message(caption)
+    """
+    Kullanici istegi uzerine GORSEL GONDERIMI KAPATILDI.
+    Bu fonksiyon cagrildiginda sadece icindeki metni (caption) gonderir.
+    """
+    # Gorsel yuklemek yerine direkt metin gonderiyoruz
+    return telegram_send_message(caption)
 
 
 def record_signal_and_notify(engine, symbol, base, direction, entry_price, caption, png_bytes=b""):
@@ -945,6 +807,8 @@ def record_signal_and_notify(engine, symbol, base, direction, entry_price, capti
         if len(signals_log) > 300:
             del signals_log[:-300]
     save_state()
+    
+    # png_bytes dolu olsa bile, telegram_send_photo artik sadece metin gonderiyor
     if png_bytes:
         telegram_send_photo(png_bytes, caption)
     else:
@@ -1445,6 +1309,7 @@ def _verify_and_emit_pump(sym, base, quote, approx_cur, approx_vol, min_pt, hist
             f"💧 24s Parite Hacmi: {vol_str} ({quote})\n"
             f"🔒 Tekil coin kilidi aktif."
         )
+        # png gonderilse bile telegram_send_photo sadece caption'i yollar
         record_signal_and_notify("PUMP", sym, base, "LONG", live_cur, caption, png)
         maybe_execute_futures_buy("PUMP", "0-7 dk Ani Pump", sym, base, quote, live_cur)
     except Exception:
@@ -1642,7 +1507,7 @@ def build_top24_report_and_png(now_ts=None):
         dur = fmt_peak_dur(s["created_at"], s.get("peak_at", s["created_at"]), ascii_only=False)
         lines.append(f"{medals[i]} <b>#{s['base']}</b> +{pct_str}% · pik {dur}")
     lines.append(f"\n📊 {len(recent)} sinyal takipte · %{hit2_pct} en az +2% ulasti")
-    png = render_top24_png(ranked, len(recent), hit2_pct)
+    png = b"" # Top24 icin gorsel olusturmuyoruz
     return "\n".join(lines), png
 
 
@@ -1668,6 +1533,9 @@ def translate_binance_title_tr(title):
 
 def poll_binance_announcements():
     global news_seeded
+    if not TELEGRAM_ENABLED:
+        return
+        
     catalogs = ((48, "Yeni Listeleme"), (49, "Binance Duyuru"), (161, "Delist / Kaldirma"))
     newly = []
     for cat_id, cat_label in catalogs:
@@ -1696,6 +1564,9 @@ def poll_binance_announcements():
 # TELEGRAM KOMUT DINLEYICI
 # ==============================================================================
 def handle_telegram_command(text):
+    if not TELEGRAM_ENABLED:
+        return
+        
     parts = text.strip().split()
     if not parts:
         return
@@ -1704,7 +1575,7 @@ def handle_telegram_command(text):
     if cmd in ("/start", "/help", "/yardim"):
         telegram_send_message(
             "🤖 <b>Spot Pump & Futures 3x Bot Komutlari</b>\n"
-            "• /top24 — TOP 24 Saat PNG Liderlik Karti & madalyali ozet\n"
+            "• /top24 — TOP 24 Saat ozeti\n"
             "• /durum — Aktif pariteler, kilitler ve Futures 3x ozeti\n"
             "• /futures — Oto Futures ayarlari (+%5 TP / -%5 SL)\n"
             "• /al_baslat — PUMP & PUMP15M oto 3x LONG'u baslat\n"
@@ -1795,8 +1666,8 @@ def telegram_commands_loop():
     global last_tg_update_id
     while True:
         try:
-            if not BOT_TOKEN:
-                time.sleep(10)
+            if not TELEGRAM_ENABLED or not BOT_TOKEN:
+                time.sleep(60)
                 continue
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_tg_update_id + 1}&timeout=20"
             data = http_get_json(url, timeout=28)
@@ -1926,54 +1797,27 @@ def scheduler_and_news_loop():
     last_news_ts = 0.0
     while True:
         now = time.time()
-        if now - last_news_ts >= 60:
+        if TELEGRAM_ENABLED and (now - last_news_ts >= 60):
             poll_binance_announcements()
             last_news_ts = now
 
         dt = tr_now()
         today = dt.strftime("%Y-%m-%d")
 
-        # 21:00 TR - GUNUN KAZANANI (ONCE METIN, SONRA GORSEL)
-        if dt.hour == 21 and locks["reports"].get("victory_day") != today:
+        # 21:00 TR - GUNUN KAZANANI (SADECE METIN)
+        if TELEGRAM_ENABLED and dt.hour == 21 and locks["reports"].get("victory_day") != today:
             locks["reports"]["victory_day"] = today
             save_state()
             cap, winner = build_victory_report(now)
             telegram_send_message(cap)
 
-            if winner:
-                try:
-                    c1m = fetch_klines(winner["symbol"], "1m", limit=45)
-                    if c1m:
-                        with state_lock:
-                            tk = tickers.get(winner["symbol"])
-                        live = tk["price"] if tk and tk["price"] > 0 else winner["peak_price"]
-                        png = render_pump_png(
-                            winner["symbol"],
-                            "GUNUN KAZANANI",
-                            c1m,
-                            live,
-                            winner["entry"],
-                            badge="GUNUN KAZANANI",
-                        )
-                        if png:
-                            telegram_send_photo(
-                                png,
-                                f"🏆 <b>GÜNÜN KAZANANI — #{html.escape(winner['base'])}</b>\n"
-                                f"📈 Maksimum: <b>+{winner['peak_pct']:.1f}%</b> · "
-                                f"${fmt_price(winner['entry'])} ➡️ ${fmt_price(winner['peak_price'])}",
-                            )
-                except Exception as e:
-                    print(f"[Gunun kazanani gorsel hata] {e}")
-
-        # 23:00 TR - TOP 24 SAAT
-        if dt.hour == 23 and locks["reports"].get("top24_day") != today:
+        # 23:00 TR - TOP 24 SAAT (SADECE METIN)
+        if TELEGRAM_ENABLED and dt.hour == 23 and locks["reports"].get("top24_day") != today:
             locks["reports"]["top24_day"] = today
             save_state()
             cap, png = build_top24_report_and_png(now)
-            if png:
-                telegram_send_photo(png, cap)
-            else:
-                telegram_send_message(cap)
+            telegram_send_message(cap)
+            
         time.sleep(15)
 
 
@@ -1997,6 +1841,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
                 "slPct": auto_trade["sl_pct"],
                 "openTrades": open_cnt,
             },
+            "telegramEnabled": TELEGRAM_ENABLED,
         }).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -2033,8 +1878,10 @@ def main():
         f"Enabled={auto_trade['enabled']}, TP=+{auto_trade['tp_pct']}%, SL=-{auto_trade['sl_pct']}%"
     )
     
-    # BOT BAŞLANGIÇ TEST MESAJI
-    telegram_send_message("✅ <b>Sistem Başlatıldı</b>\nBot başarıyla Render üzerinde çalışıyor. Sinyaller bekleniyor...")
+    if TELEGRAM_ENABLED:
+        telegram_send_message("✅ <b>Sistem Başlatıldı</b>\nBot başarıyla çalışıyor. (Görseller kapatıldı, sadece metin gelecek).")
+    else:
+        print("[SISTEM] Telegram gonderimi KAPALI. Sadece konsol (log) uzerinden calisiyor.")
 
     workers = (
         ws_stream_loop,
