@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 14:20:04 · Rev #2
-# Aktif Motorlar: Pump(%4) | 15dk(%3.2) | ATH/ATL(1M) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major)
-# Futures: 3x | $25 | TP +%10 / SL -%10 | RSI >= 70
+# Uretim: 14:41:41 · Rev #3
+# Aktif Motorlar: Pump(%3.5) | 15dk(%3.5) | ATH/ATL(1M) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major)
+# Futures: 3x | $25 | TP +%10 / SL -%10 | RSI >= 90
 # ==============================================================================
 import asyncio
 import copy
@@ -26,16 +26,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # Web panelinden secilen guncel tikler ve parametreler (GitHub bot.py ile birebir degistirin):
 DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pumpEnabled": True,
-    "pumpThresholdPct": 4,
+    "pumpThresholdPct": 3.5,
     "pumpMinVolUsdt": 150000,
     "pumpRepeatHours": 2,
     "pump15mEnabled": True,
-    "pump15mThresholdPct": 3.2,
+    "pump15mThresholdPct": 3.5,
     "pump15mMinRvol": 1.4,
     "athEnabled": True,
     "atlEnabled": True,
     "athAtlTimeframes": ["1M"],
-    "athAtlLockPct": 1,
+    "athAtlLockPct": 0.5,
     "athAtlCooldownMin": 5,
     "ma200Enabled": True,
     "ma200LongEnabled": True,
@@ -103,7 +103,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "tpPct": 10,
     "slPct": 10,
     "maxOpenTrades": 0,
-    "rsiMin": 70,
+    "rsiMin": 90,
     "notifyPaperTelegram": False,
 }
 
