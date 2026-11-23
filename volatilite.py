@@ -21,17 +21,20 @@ TR_TZ = timezone(timedelta(hours=3))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/tobo_state.json")
 
 TOBO_TIMEFRAME = "1h"
-TOBO_MIN_HEIGHT_PCT = 1.2         # Baş derinliği min %
-TOBO_SHOULDER_TOLERANCE = 0.03    # Omuz fark toleransı (%3)
-TOBO_MAX_BARS_SINCE_RS = 12       # Sağ omuzdan sonra max bar
-TOBO_BREAK_BUFFER = 0.005         # Boyun kırılım tamponu (%0.5)
-TOBO_COOLDOWN_HOURS = 4.0         # Aynı coin için cooldown
-TOBO_MIN_VOL_USDT = 500_000       # 24s hacim filtresi
+TOBO_MIN_HEIGHT_PCT = 1.2
+TOBO_SHOULDER_TOLERANCE = 0.03
+TOBO_MAX_BARS_SINCE_RS = 12
+TOBO_BREAK_BUFFER = 0.005
+TOBO_COOLDOWN_HOURS = 4.0
+TOBO_MIN_VOL_USDT = 500_000
 
-SCAN_INTERVAL_S = 20              # Tur arası bekleme
-SCAN_BATCH = 12                   # Tur başına taranan coin
-TRACK_DURATION_S = 300            # Sinyal takip süresi (5 dk)
-TRACK_INTERVAL_S = 30             # Güncelleme sıklığı
+SCAN_INTERVAL_S = 25
+SCAN_BATCH = 10
+TRACK_DURATION_S = 300
+TRACK_INTERVAL_S = 30
+
+MARKET_POLL_S = 10
+SYMBOLS_REFRESH_S = 1800
 
 BINANCE_MIRRORS = [
     "https://data-api.binance.vision",
@@ -51,6 +54,7 @@ SIGNALS: List[Dict[str, Any]] = []
 TOBO_LOCKS: Dict[str, float] = {}
 SUBSCRIBED_CHATS: Set[str] = {CHAT_ID} if CHAT_ID else set()
 PREFERRED_MIRROR_IDX = 0
+RATE_LIMITED_UNTIL = 0.0
 
 
 # =====================================================
@@ -290,10 +294,14 @@ def render_tobo_png(symbol, bars, live_price, head, neckline, target):
 
 
 # =====================================================
-# BINANCE
+# BINANCE (rate limit korumalı)
 # =====================================================
 async def fetch_binance_json(session: aiohttp.ClientSession, path: str, timeout_s: float = 9.0) -> Any:
-    global PREFERRED_MIRROR_IDX
+    global PREFERRED_MIRROR_IDX, RATE_LIMITED_UNTIL
+    now = time.time()
+    if now < RATE_LIMITED_UNTIL:
+        await asyncio.sleep(RATE_LIMITED_UNTIL - now)
+
     n = len(BINANCE_MIRRORS)
     last_err = None
     for off in range(n):
@@ -304,7 +312,18 @@ async def fetch_binance_json(session: aiohttp.ClientSession, path: str, timeout_
                 if r.status == 200:
                     PREFERRED_MIRROR_IDX = idx
                     return await r.json()
+                if r.status in (418, 429):
+                    try:
+                        ra = int(r.headers.get("Retry-After", "60"))
+                    except Exception:
+                        ra = 60
+                    RATE_LIMITED_UNTIL = max(RATE_LIMITED_UNTIL, time.time() + ra + 2)
+                    log(f"RATE LIMIT {r.status} | {ra}s bekleniyor")
+                    last_err = f"HTTP {r.status}"
+                    continue
                 last_err = f"HTTP {r.status}"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             last_err = e
     raise RuntimeError(f"Binance erisilemedi: {last_err}")
@@ -406,23 +425,18 @@ def detect_tobo(bars: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
 
     ls, hd, rs = lows[-3], lows[-2], lows[-1]
 
-    # Baş, iki omuzdan daha düşük olmalı
     if not (hd[1] < ls[1] * 0.994 and hd[1] < rs[1] * 0.994):
         return None
-    # Omuzlar birbirine yakın seviyede olmalı
     if abs(ls[1] - rs[1]) / max(ls[1], 1e-9) > TOBO_SHOULDER_TOLERANCE:
         return None
-    # Sağ omuzdan sonra çok bar geçmemeli
     if (n - 2 - rs[0]) > TOBO_MAX_BARS_SINCE_RS:
         return None
 
-    # Boyun çizgisi: baş ile sağ omuz arasındaki en yüksek tepe
     neckline = max(b["high"] for b in rec[hd[0]: rs[0] + 1])
     head_depth = (neckline - hd[1]) / hd[1] * 100.0
     if head_depth < TOBO_MIN_HEIGHT_PCT:
         return None
 
-    # Kırılım kontrolü: son kapanış ve önceki bar boyun üstünde
     if not (cur > neckline and break_bar["close"] > neckline * (1 - TOBO_BREAK_BUFFER)):
         return None
 
@@ -459,7 +473,7 @@ def build_caption(symbol: str, entry: float, live: float,
 
 
 # =====================================================
-# SİNYAL TAKİBİ (edit message)
+# SİNYAL TAKİBİ
 # =====================================================
 async def track_signal(session, signal, cid, msg_id):
     entry = signal["entryPrice"]
@@ -502,7 +516,7 @@ async def emit_tobo_signal(session, ticker, info):
     TOBO_LOCKS[symbol] = now_s
     save_state()
 
-    log(f"TOBO: {symbol} entry=${fmt_price(entry)} target=${fmt_price(info['target'])} head_depth={info['head_depth_pct']:.2f}%")
+    log(f"TOBO SINYAL: {symbol} entry=${fmt_price(entry)} neckline=${fmt_price(info['neckline'])} target=${fmt_price(info['target'])} depth={info['head_depth_pct']:.2f}%")
 
     try:
         bars = await fetch_spot_klines(session, symbol, TOBO_TIMEFRAME, 80)
@@ -542,7 +556,7 @@ async def market_loop(session):
                 }
         except Exception as e:
             log(f"market_loop: {e}")
-        await asyncio.sleep(4)
+        await asyncio.sleep(MARKET_POLL_S)
 
 
 async def tobo_loop(session):
@@ -578,7 +592,7 @@ async def tobo_loop(session):
                 info = detect_tobo(bars)
                 if info:
                     await emit_tobo_signal(session, t, info)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.15)
 
         except Exception as e:
             log(f"tobo_loop: {e}")
@@ -596,7 +610,7 @@ async def refresh_symbols_loop(session):
             log(f"Symbols: {len(ACTIVE_SPOT_SYMBOLS)}")
         except Exception as e:
             log(f"refresh_symbols: {e}")
-        await asyncio.sleep(900)
+        await asyncio.sleep(SYMBOLS_REFRESH_S)
 
 
 async def telegram_command_loop(session):
@@ -655,19 +669,23 @@ async def telegram_command_loop(session):
 # =====================================================
 async def main():
     load_state()
-    log(f"TOBO 1h LONG Botu başlıyor...")
-    log(f"BOT_TOKEN: {'✓' if BOT_TOKEN else '✗'} | CHAT_ID: {CHAT_ID}")
+    log("=" * 50)
+    log("TOBO 1h LONG Botu baslatiliyor...")
+    log(f"BOT_TOKEN: {'VAR' if BOT_TOKEN else 'YOK!'} | CHAT_ID: {CHAT_ID}")
     log(f"STATE_FILE: {STATE_FILE}")
+    log(f"Web Port: {PORT}")
+    log("=" * 50)
 
     app = web.Application()
     app.router.add_get("/", lambda _: web.Response(text="TOBO Bot Running"))
     app.router.add_get("/health", lambda _: web.json_response({
         "ok": True, "pairs": len(TICKER_MAP), "signals": len(SIGNALS),
+        "locked": len(TOBO_LOCKS), "rate_limited": time.time() < RATE_LIMITED_UNTIL,
     }))
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log(f"Web server: {PORT}")
+    log(f"Web server aktif: port {PORT}")
 
     if BOT_TOKEN and CHAT_ID:
         async with aiohttp.ClientSession() as s:
