@@ -1,7 +1,7 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 13:49:20 · Rev #3
-# Aktif Motorlar: 4H MA200(L:1/S:1) | Formasyon(1/7)
+# Uretim: 14:31:57 · Rev #3
+# Aktif Motorlar: 4H MA200(L:1/S:1) | Formasyon(2/7)
 # Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%5): PATTERN
 # ==============================================================================
 import asyncio
@@ -78,7 +78,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "enabledPatterns": {
         "DOUBLE_BOTTOM": False,
         "DOUBLE_TOP": False,
-        "HEAD_SHOULDERS": False,
+        "HEAD_SHOULDERS": True,
         "INV_HEAD_SHOULDERS": True,
         "BULL_FLAG": False,
         "BEAR_FLAG": False,
@@ -129,7 +129,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "tpPct": 5,
     "slPct": 5,
     "maxOpenTrades": 999,
-    "rsiMin": 70,
+    "rsiMin": 50,
     "notifyPaperTelegram": True,
 }
 
