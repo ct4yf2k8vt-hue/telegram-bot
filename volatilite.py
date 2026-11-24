@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 12:27:02 · Rev #12
-# Aktif Motorlar: 4H MA200(L:1/S:1) | Formasyon(2/7)
-# Oto Futures (AKTIF · 3x · $25 · TP +%5 / SL -%5): PATTERN
+# Uretim: 13:49:20 · Rev #3
+# Aktif Motorlar: 4H MA200(L:1/S:1) | Formasyon(1/7)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%5): PATTERN
 # ==============================================================================
 import asyncio
 import base64
@@ -78,7 +78,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "enabledPatterns": {
         "DOUBLE_BOTTOM": False,
         "DOUBLE_TOP": False,
-        "HEAD_SHOULDERS": True,
+        "HEAD_SHOULDERS": False,
         "INV_HEAD_SHOULDERS": True,
         "BULL_FLAG": False,
         "BEAR_FLAG": False,
@@ -123,6 +123,7 @@ STRATEGY_CONFIG: Dict[str, Any] = copy.deepcopy(DEFAULT_STRATEGY_CONFIG)
 DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "enabled": True,
     "mode": "PAPER",
+    "directionMode": "BOTH",
     "leverage": 3,
     "tradeUsdt": 25,
     "tpPct": 5,
@@ -357,6 +358,8 @@ def apply_autotrade_patch(raw: Any) -> None:
     if raw.get("mode") in ("PAPER", "TESTNET", "LIVE"):
         if raw["mode"] == "PAPER" or BINANCE_KEYS_READY:
             AUTO_TRADE["mode"] = raw["mode"]
+    if str(raw.get("directionMode") or "").upper() in ("BOTH", "LONG", "SHORT"):
+        AUTO_TRADE["directionMode"] = str(raw["directionMode"]).upper()
     for key, lo, hi, as_int in [
         ("leverage", 1, 125, True),
         ("tradeUsdt", 1, 1_000_000, False),
@@ -1198,6 +1201,13 @@ async def maybe_execute_auto_trade(signal: Dict[str, Any]) -> None:
             return
 
     dir_side = "SHORT" if signal.get("direction") == "SHORT" else "LONG"
+    dir_mode = str(AUTO_TRADE.get("directionMode") or "BOTH").upper()
+    if dir_mode == "LONG" and dir_side != "LONG":
+        _log(f"[OTO FUTURES] {sym} ({dir_side}) atlandi: yon tercihi yalnizca LONG.")
+        return
+    if dir_mode == "SHORT" and dir_side != "SHORT":
+        _log(f"[OTO FUTURES] {sym} ({dir_side}) atlandi: yon tercihi yalnizca SHORT.")
+        return
     entry_side = "SELL" if dir_side == "SHORT" else "BUY"
     close_side = "BUY" if dir_side == "SHORT" else "SELL"
     mode = AUTO_TRADE["mode"]
