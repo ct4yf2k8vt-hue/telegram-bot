@@ -1,7 +1,7 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 22:20:04 · Rev #5
-# Aktif Motorlar: ATH/ATL(1M,1d) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,2b)
+# Uretim: 22:23:01 · Rev #8
+# Aktif Motorlar: Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,2b)
 # Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP, PUMP15M, AI_MARKET
 # ==============================================================================
 import asyncio
@@ -39,7 +39,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pump15mThresholdPct": 3.2,
     "pump15mMinRvol": 1.4,
     "athEnabled": False,
-    "atlEnabled": True,
+    "atlEnabled": False,
     "athAtlTimeframes": ["1M", "1d"],
     "athAtlLockPct": 1,
     "athAtlCooldownMin": 5,
