@@ -1,17 +1,21 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 08:21:39 · Rev #3
-# Aktif Motorlar: Pump(%4) | 15dk(%3.2) | ATH/ATL(1M,1d) | 4H MA200(L:1/S:1) | Volatilite(15m,1h, Major) | Formasyon(7/7)
-# Futures: 3x | $25 | TP +%10 / SL -%10 | RSI >= 70
+# Uretim: 12:17:58 · Rev #5
+# Aktif Motorlar: ATH/ATL(1M,1d,1w) | 4H MA200(L:1/S:1) | Formasyon(1/7)
+# Oto Futures (AKTIF · 3x · $25 · TP +%5 / SL -%5): PATTERN
 # ==============================================================================
 import asyncio
+import base64
 import concurrent.futures
 import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
+import socket
+import ssl
 import struct
 import threading
 import time
@@ -27,16 +31,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Web panelinden secilen guncel tikler ve parametreler (GitHub volatilite.py / bot.py ile birebir degistirin):
 DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
-    "pumpEnabled": True,
+    "pumpEnabled": False,
     "pumpThresholdPct": 4,
     "pumpMinVolUsdt": 150000,
     "pumpRepeatHours": 2,
-    "pump15mEnabled": True,
+    "pump15mEnabled": False,
     "pump15mThresholdPct": 3.2,
     "pump15mMinRvol": 1.4,
     "athEnabled": True,
     "atlEnabled": True,
-    "athAtlTimeframes": ["1M", "1d"],
+    "athAtlTimeframes": ["1M", "1d", "1w"],
     "athAtlLockPct": 1,
     "athAtlCooldownMin": 5,
     "ma200Enabled": True,
@@ -44,7 +48,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "ma200ShortEnabled": True,
     "ma200Timeframe": "4h",
     "ma200Period": 200,
-    "volatilityEnabled": True,
+    "volatilityEnabled": False,
     "volatilityTimeframes": ["15m", "1h"],
     "volatilityMajorOnly": True,
     "volatilityMajorCoins": [
@@ -70,28 +74,47 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
     "patternsEnabled": True,
-    "patternTimeframes": ["15m", "1h", "4h", "1d"],
+    "patternTimeframes": ["1h"],
     "enabledPatterns": {
-        "DOUBLE_BOTTOM": True,
-        "DOUBLE_TOP": True,
-        "HEAD_SHOULDERS": True,
+        "DOUBLE_BOTTOM": False,
+        "DOUBLE_TOP": False,
+        "HEAD_SHOULDERS": False,
         "INV_HEAD_SHOULDERS": True,
-        "BULL_FLAG": True,
-        "BEAR_FLAG": True,
-        "BEAR_RECTANGLE": True,
+        "BULL_FLAG": False,
+        "BEAR_FLAG": False,
+        "BEAR_RECTANGLE": False,
     },
     "patternMinHeightPct": 1.2,
+    "bollingerEnabled": False,
+    "bollingerTimeframes": ["15m", "1h", "4h"],
+    "bollingerPeriod": 20,
+    "bollingerStdDev": 2,
+    "bollingerLongEnabled": True,
+    "bollingerShortEnabled": True,
+    "ichimokuEnabled": False,
+    "ichimokuTimeframes": ["15m", "1h", "4h"],
+    "ichimokuLongEnabled": True,
+    "ichimokuShortEnabled": True,
+    "supertrendEnabled": False,
+    "supertrendTimeframes": ["15m", "1h", "4h"],
+    "supertrendAtrPeriod": 10,
+    "supertrendMultiplier": 3,
+    "supertrendLongEnabled": True,
+    "supertrendShortEnabled": True,
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": True,
-        "PUMP15M": True,
+        "PUMP": False,
+        "PUMP15M": False,
         "ATL": False,
         "ATH": False,
         "MA200_4H": False,
         "VOLATILITY": False,
-        "PATTERN": False,
+        "PATTERN": True,
+        "BOLLINGER": False,
+        "ICHIMOKU": False,
+        "SUPERTREND": False,
     },
 }
 
@@ -102,11 +125,11 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "mode": "PAPER",
     "leverage": 3,
     "tradeUsdt": 25,
-    "tpPct": 10,
-    "slPct": 10,
-    "maxOpenTrades": 0,
+    "tpPct": 5,
+    "slPct": 5,
+    "maxOpenTrades": 999,
     "rsiMin": 70,
-    "notifyPaperTelegram": False,
+    "notifyPaperTelegram": True,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
@@ -195,6 +218,7 @@ ATH_ATL_COOLDOWN: Dict[str, float] = {}
 ATH_ATL_INFLIGHT: Set[str] = set()
 MA200_COOLDOWN: Dict[str, float] = {}
 VOL_COOLDOWN: Dict[str, float] = {}
+IND_COOLDOWN: Dict[str, float] = {}
 TRADE_INFLIGHT: Set[str] = set()
 SUBSCRIBED_CHATS: Set[str] = set(INITIAL_CHAT_IDS)
 
@@ -207,6 +231,10 @@ LAST_VICTORY_DATE_TR = ""
 LAST_SUMMARY_DATE_TR = ""
 LAST_HOURLY_KEY = ""
 PREFERRED_MIRROR_IDX = 0
+BINANCE_BAN_UNTIL = 0.0
+WS_CONNECTED = False
+WS_LAST_MSG = 0.0
+ACTIVE_FEED_SOURCE = "Binance"
 HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=24, thread_name_prefix="http")
 
 
@@ -242,7 +270,11 @@ def apply_strategy_patch(raw: Any) -> None:
         "pumpEnabled", "pump15mEnabled", "athEnabled", "atlEnabled",
         "ma200Enabled", "ma200LongEnabled", "ma200ShortEnabled",
         "volatilityEnabled", "volatilityMajorOnly", "volatilityLongEnabled", "volatilityShortEnabled",
-        "patternsEnabled", "hourlyGainersReportEnabled", "dailyWinnerReportEnabled", "top24SummaryReportEnabled",
+        "patternsEnabled",
+        "bollingerEnabled", "bollingerLongEnabled", "bollingerShortEnabled",
+        "ichimokuEnabled", "ichimokuLongEnabled", "ichimokuShortEnabled",
+        "supertrendEnabled", "supertrendLongEnabled", "supertrendShortEnabled",
+        "hourlyGainersReportEnabled", "dailyWinnerReportEnabled", "top24SummaryReportEnabled",
     ]
     for bk in bool_keys:
         if isinstance(raw.get(bk), bool):
@@ -259,6 +291,8 @@ def apply_strategy_patch(raw: Any) -> None:
         "volatilityAtrMult": (1.1, 10.0),
         "volatilityMinMovePct": (0.3, 30.0),
         "patternMinHeightPct": (0.4, 25.0),
+        "bollingerStdDev": (1.0, 4.0),
+        "supertrendMultiplier": (1.0, 7.0),
     }
     for nk, (lo, hi) in num_bounds.items():
         if nk in raw:
@@ -268,11 +302,16 @@ def apply_strategy_patch(raw: Any) -> None:
             except (TypeError, ValueError):
                 pass
 
-    if "ma200Period" in raw:
-        try:
-            STRATEGY_CONFIG["ma200Period"] = max(20, min(400, int(raw["ma200Period"])))
-        except (TypeError, ValueError):
-            pass
+    for ik, lo, hi in [
+        ("ma200Period", 20, 400),
+        ("bollingerPeriod", 10, 50),
+        ("supertrendAtrPeriod", 5, 30),
+    ]:
+        if ik in raw:
+            try:
+                STRATEGY_CONFIG[ik] = max(lo, min(hi, int(raw[ik])))
+            except (TypeError, ValueError):
+                pass
 
     if raw.get("ma200Timeframe") in ("1h", "4h", "1d"):
         STRATEGY_CONFIG["ma200Timeframe"] = raw["ma200Timeframe"]
@@ -294,13 +333,18 @@ def apply_strategy_patch(raw: Any) -> None:
         valid_p = [tf for tf in raw["patternTimeframes"] if tf in ("15m", "1h", "4h", "1d")]
         STRATEGY_CONFIG["patternTimeframes"] = list(dict.fromkeys(valid_p))
 
+    for tf_field in ("bollingerTimeframes", "ichimokuTimeframes", "supertrendTimeframes"):
+        if isinstance(raw.get(tf_field), list):
+            valid_i = [tf for tf in raw[tf_field] if tf in ("15m", "1h", "4h", "1d", "1w", "1M")]
+            STRATEGY_CONFIG[tf_field] = list(dict.fromkeys(valid_i))
+
     if isinstance(raw.get("enabledPatterns"), dict):
         for pk in PATTERN_LABELS:
             if isinstance(raw["enabledPatterns"].get(pk), bool):
                 STRATEGY_CONFIG["enabledPatterns"][pk] = raw["enabledPatterns"][pk]
 
     if isinstance(raw.get("autoTradeEngines"), dict):
-        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN"):
+        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN", "BOLLINGER", "ICHIMOKU", "SUPERTREND"):
             if isinstance(raw["autoTradeEngines"].get(ek), bool):
                 STRATEGY_CONFIG["autoTradeEngines"][ek] = raw["autoTradeEngines"][ek]
 
@@ -758,7 +802,11 @@ async def http_post_json(url: str, payload: Dict[str, Any], timeout_s: float = 1
 
 
 async def fetch_binance_json(path: str, timeout_s: float = 9.0) -> Any:
-    global PREFERRED_MIRROR_IDX
+    global PREFERRED_MIRROR_IDX, BINANCE_BAN_UNTIL
+    now_s = time.time()
+    if now_s < BINANCE_BAN_UNTIL:
+        rem = int(BINANCE_BAN_UNTIL - now_s)
+        raise RuntimeError(f"Binance cooldown aktif ({rem}sn sonra tekrar denenir)")
     n = len(BINANCE_MIRRORS)
     last_err: Any = None
     for off in range(n):
@@ -770,27 +818,190 @@ async def fetch_binance_json(path: str, timeout_s: float = 9.0) -> Any:
                 PREFERRED_MIRROR_IDX = idx
                 return data
             last_err = f"HTTP {status}"
+            if status == 418:
+                BINANCE_BAN_UNTIL = time.time() + 180.0
+                _log("[Binance 418] IP hiz limiti algilandi -> 180sn Binance REST bekleme, MEXC/Bybit/WS yedegine geciliyor.")
+                break
+            if status == 429:
+                BINANCE_BAN_UNTIL = time.time() + 45.0
+                break
         except Exception as e:
             last_err = e
     raise RuntimeError(f"Binance erisilemedi: {last_err}")
 
 
 async def fetch_spot_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str, float]]:
-    raw = await fetch_binance_json(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
-    if not isinstance(raw, list):
-        return []
-    return [
-        {
-            "openTime": int(k[0]) // 1000,
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
-            "quoteVol": float(k[7]),
-        }
-        for k in raw
-    ]
+    if time.time() >= BINANCE_BAN_UNTIL:
+        try:
+            raw = await fetch_binance_json(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
+            if isinstance(raw, list) and raw:
+                return [
+                    {
+                        "openTime": int(k[0]) // 1000,
+                        "open": float(k[1]),
+                        "high": float(k[2]),
+                        "low": float(k[3]),
+                        "close": float(k[4]),
+                        "volume": float(k[5]),
+                        "quoteVol": float(k[7]),
+                    }
+                    for k in raw
+                ]
+        except Exception:
+            pass
+
+    # Fallback 1: MEXC Spot Klines
+    try:
+        mexc_iv = "60m" if interval == "1h" else ("1W" if interval == "1w" else interval)
+        st, raw = await http_get_json(
+            f"https://api.mexc.com/api/v3/klines?symbol={urllib.parse.quote(symbol)}&interval={urllib.parse.quote(mexc_iv)}&limit={limit}",
+            timeout_s=8.0,
+        )
+        if st == 200 and isinstance(raw, list) and raw:
+            return [
+                {
+                    "openTime": int(k[0]) // 1000,
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                    "quoteVol": float(k[7]) if len(k) > 7 else float(k[5]) * float(k[4]),
+                }
+                for k in raw
+            ]
+    except Exception:
+        pass
+
+    # Fallback 2: Bybit v5 Spot Klines
+    try:
+        bybit_map = {"1m": "1", "15m": "15", "1h": "60", "4h": "240", "1d": "D", "1w": "W", "1M": "M"}
+        b_iv = bybit_map.get(interval, interval)
+        st, res = await http_get_json(
+            f"https://api.bybit.com/v5/market/kline?category=spot&symbol={urllib.parse.quote(symbol)}&interval={urllib.parse.quote(b_iv)}&limit={limit}",
+            timeout_s=8.0,
+        )
+        lst = ((res.get("result") or {}).get("list")) if isinstance(res, dict) else None
+        if st == 200 and isinstance(lst, list) and lst:
+            return [
+                {
+                    "openTime": int(k[0]) // 1000,
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                    "quoteVol": float(k[6]) if len(k) > 6 else float(k[5]) * float(k[4]),
+                }
+                for k in reversed(lst)
+            ]
+    except Exception:
+        pass
+
+    # Fallback 3: Gate.io Spot Candlesticks
+    try:
+        if symbol.endswith("USDT"):
+            pair = f"{symbol[:-4]}_USDT"
+            g_iv = "30d" if interval == "1M" else ("7d" if interval == "1w" else interval)
+            st, raw = await http_get_json(
+                f"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair={urllib.parse.quote(pair)}&interval={urllib.parse.quote(g_iv)}&limit={limit}",
+                timeout_s=8.0,
+            )
+            if st == 200 and isinstance(raw, list) and raw:
+                return [
+                    {
+                        "openTime": int(float(k[0])),
+                        "open": float(k[5]),
+                        "high": float(k[3]),
+                        "low": float(k[4]),
+                        "close": float(k[2]),
+                        "volume": float(k[6]) if len(k) > 6 else float(k[1]),
+                        "quoteVol": float(k[1]),
+                    }
+                    for k in raw
+                ]
+    except Exception:
+        pass
+    return []
+
+
+async def fetch_fallback_tickers() -> Tuple[str, List[Dict[str, Any]]]:
+    # 1) MEXC 24hr
+    try:
+        st, raw = await http_get_json("https://api.mexc.com/api/v3/ticker/24hr", timeout_s=9.0)
+        if st == 200 and isinstance(raw, list) and len(raw) > 50:
+            out: List[Dict[str, Any]] = []
+            for x in raw:
+                sym = str(x.get("symbol") or "")
+                p = float(x.get("lastPrice") or 0)
+                if not sym.endswith("USDT") or p <= 0:
+                    continue
+                out.append({
+                    "symbol": sym,
+                    "lastPrice": p,
+                    "bidPrice": p,
+                    "priceChangePercent": float(x.get("priceChangePercent") or 0),
+                    "quoteVolume": float(x.get("quoteVolume") or 0),
+                    "highPrice": float(x.get("highPrice") or p),
+                    "lowPrice": float(x.get("lowPrice") or p),
+                })
+            if len(out) > 40:
+                return "MEXC", out
+    except Exception:
+        pass
+
+    # 2) Bybit v5 Spot
+    try:
+        st, res = await http_get_json("https://api.bybit.com/v5/market/tickers?category=spot", timeout_s=9.0)
+        lst = ((res.get("result") or {}).get("list")) if isinstance(res, dict) else None
+        if st == 200 and isinstance(lst, list) and len(lst) > 50:
+            out = []
+            for x in lst:
+                sym = str(x.get("symbol") or "")
+                p = float(x.get("lastPrice") or 0)
+                if not sym.endswith("USDT") or p <= 0:
+                    continue
+                out.append({
+                    "symbol": sym,
+                    "lastPrice": p,
+                    "bidPrice": p,
+                    "priceChangePercent": float(x.get("price24hPcnt") or 0) * 100.0,
+                    "quoteVolume": float(x.get("turnover24h") or 0),
+                    "highPrice": float(x.get("highPrice24h") or p),
+                    "lowPrice": float(x.get("lowPrice24h") or p),
+                })
+            if len(out) > 40:
+                return "Bybit", out
+    except Exception:
+        pass
+
+    # 3) Gate.io Spot
+    try:
+        st, raw = await http_get_json("https://api.gateio.ws/api/v4/spot/tickers", timeout_s=9.0)
+        if st == 200 and isinstance(raw, list) and len(raw) > 50:
+            out = []
+            for x in raw:
+                pair = str(x.get("currency_pair") or "")
+                if not pair.endswith("_USDT"):
+                    continue
+                sym = pair.replace("_USDT", "USDT")
+                p = float(x.get("last") or 0)
+                if p <= 0:
+                    continue
+                out.append({
+                    "symbol": sym,
+                    "lastPrice": p,
+                    "bidPrice": p,
+                    "priceChangePercent": float(x.get("change_percentage") or 0),
+                    "quoteVolume": float(x.get("quote_volume") or 0),
+                    "highPrice": float(x.get("high_24h") or p),
+                    "lowPrice": float(x.get("low_24h") or p),
+                })
+            if len(out) > 40:
+                return "Gate", out
+    except Exception:
+        pass
+    return "", []
 
 
 def _strip_html_tags(s: str) -> str:
@@ -960,15 +1171,21 @@ def fmt_step(val: float, step_str: str) -> str:
 
 async def maybe_execute_auto_trade(signal: Dict[str, Any]) -> None:
     global PAPER_BALANCE_USDT
-    if not BOT_RUNNING or not AUTO_TRADE["enabled"] or signal["quote"] != "USDT":
+    if not BOT_RUNNING:
+        return
+    if not AUTO_TRADE["enabled"]:
+        return
+    if signal["quote"] != "USDT":
         return
     if not STRATEGY_CONFIG["autoTradeEngines"].get(signal["engine"], False):
+        _log(f"[OTO FUTURES] {signal['symbol']} ({signal['engine']}) -> tikli olmadigi icin islem acilmadi.")
         return
     sym = signal["symbol"]
     if sym in TRADE_INFLIGHT:
         return
     open_tr = [t for t in TRADES if t["status"] == "OPEN"]
     if AUTO_TRADE["maxOpenTrades"] > 0 and len(open_tr) >= AUTO_TRADE["maxOpenTrades"]:
+        _log(f"[OTO FUTURES] {sym} atlandi: maksimum acik pozisyon siniri ({AUTO_TRADE['maxOpenTrades']}).")
         return
     if any(t["symbol"] == sym or t["base"] == signal["base"] for t in open_tr):
         return
@@ -977,6 +1194,7 @@ async def maybe_execute_auto_trade(signal: Dict[str, Any]) -> None:
         if AUTO_TRADE["mode"] == "PAPER":
             flt = {"stepSize": "0.0001", "minQty": 0.0, "tickSize": "0.0001", "minNotional": 5.0}
         else:
+            _log(f"[OTO FUTURES] {sym} ({AUTO_TRADE['mode']}) -> USD-M Futures kontrati bulunamadi.")
             return
 
     dir_side = "SHORT" if signal.get("direction") == "SHORT" else "LONG"
@@ -1089,7 +1307,15 @@ async def emit_signal(signal: Dict[str, Any], png: bytes = b"") -> None:
     del SIGNALS[200:]
     save_state()
 
-    icons = {"ATL": "🕳", "ATH": "🏔", "PUMP15M": "🚀", "VOLATILITY": "⚠️"}
+    icons = {
+        "ATL": "🕳",
+        "ATH": "🏔",
+        "PUMP15M": "🚀",
+        "VOLATILITY": "⚠️",
+        "BOLLINGER": "📊",
+        "ICHIMOKU": "☁️",
+        "SUPERTREND": "⚡",
+    }
     ic = icons.get(signal["engine"], "🟢" if signal["direction"] == "LONG" else "🔴")
     cap = f"{ic} <b>{esc_html(signal['headline'])}</b>\n\n" + "\n".join(esc_html(l) for l in signal["details"])
     if png:
@@ -1118,13 +1344,24 @@ async def verify_and_emit_pump(t: Dict[str, Any], min7: Tuple[float, float], min
         return
     VERIFY_INFLIGHT.add(sym)
     try:
-        tk_raw, c1m, c15m = await asyncio.gather(
-            fetch_binance_json(f"/api/v3/ticker/24hr?symbol={sym}"),
+        c1m, c15m = await asyncio.gather(
             fetch_spot_klines(sym, "1m", 50),
             fetch_spot_klines(sym, "15m", 50),
         )
-        live_cur = float(tk_raw.get("lastPrice") or t["price"])
-        live_vol = float(tk_raw.get("quoteVolume") or t["volume24h"])
+        live_cur = float((TICKER_MAP.get(sym) or t).get("price") or t["price"])
+        live_vol = float((TICKER_MAP.get(sym) or t).get("volume24h") or t["volume24h"])
+        if time.time() >= BINANCE_BAN_UNTIL:
+            try:
+                tk_raw = await fetch_binance_json(f"/api/v3/ticker/24hr?symbol={sym}", timeout_s=5.0)
+                if isinstance(tk_raw, dict):
+                    live_cur = float(tk_raw.get("lastPrice") or live_cur)
+                    live_vol = float(tk_raw.get("quoteVolume") or live_vol)
+            except Exception:
+                pass
+        if not c1m and c15m:
+            c1m = c15m
+        if live_cur <= 0 and c1m:
+            live_cur = c1m[-1]["close"]
 
         cl1 = [live_cur if (i == len(c1m) - 1 and live_cur > 0) else b["close"] for i, b in enumerate(c1m)]
         cl15 = [live_cur if (i == len(c15m) - 1 and live_cur > 0) else b["close"] for i, b in enumerate(c15m)]
@@ -1293,53 +1530,314 @@ def detect_patterns_py(bars: List[Dict[str, float]], min_height_pct: float, enab
     return None
 
 
+def evaluate_bollinger_py(
+    bars: List[Dict[str, float]], period: int, std_mult: float, allow_long: bool, allow_short: bool
+) -> Optional[Dict[str, Any]]:
+    if len(bars) < period + 4:
+        return None
+    closes = [b["close"] for b in bars]
+    mid_s = compute_sma(closes, period)
+    upper_s: List[Optional[float]] = [None] * len(bars)
+    lower_s: List[Optional[float]] = [None] * len(bars)
+    for i in range(period - 1, len(bars)):
+        m = mid_s[i]
+        if m is None:
+            continue
+        var = sum((closes[j] - m) ** 2 for j in range(i - period + 1, i + 1)) / period
+        sd = math.sqrt(var)
+        upper_s[i] = m + std_mult * sd
+        lower_s[i] = m - std_mult * sd
+    i1, i2 = len(bars) - 3, len(bars) - 2
+    u1, u2, m2, l1, l2 = upper_s[i1], upper_s[i2], mid_s[i2], lower_s[i1], lower_s[i2]
+    if u1 is None or u2 is None or m2 is None or l1 is None or l2 is None:
+        return None
+    c1, c2 = bars[i1], bars[i2]
+    if allow_long:
+        if c2["close"] > u2 and c1["close"] <= u1 and c2["close"] > c2["open"]:
+            return {"dir": "LONG", "reason": "Üst Bant Yukarı Kırılımı", "upper": u2, "mid": m2, "lower": l2, "midSeries": mid_s, "openTime": c2["openTime"]}
+        if c1["low"] <= l1 and c2["close"] > l2 and c2["close"] > c2["open"]:
+            return {"dir": "LONG", "reason": "Alt Banttan Yukarı Dönüş", "upper": u2, "mid": m2, "lower": l2, "midSeries": mid_s, "openTime": c2["openTime"]}
+    if allow_short:
+        if c2["close"] < l2 and c1["close"] >= l1 and c2["close"] < c2["open"]:
+            return {"dir": "SHORT", "reason": "Alt Bant Aşağı Kırılımı", "upper": u2, "mid": m2, "lower": l2, "midSeries": mid_s, "openTime": c2["openTime"]}
+        if c1["high"] >= u1 and c2["close"] < u2 and c2["close"] < c2["open"]:
+            return {"dir": "SHORT", "reason": "Üst Banttan Aşağı Dönüş", "upper": u2, "mid": m2, "lower": l2, "midSeries": mid_s, "openTime": c2["openTime"]}
+    return None
+
+
+def evaluate_ichimoku_py(bars: List[Dict[str, float]], allow_long: bool, allow_short: bool) -> Optional[Dict[str, Any]]:
+    if len(bars) < 80:
+        return None
+
+    def dmid(idx: int, ln: int) -> Optional[float]:
+        if idx < ln - 1:
+            return None
+        sl = bars[idx - ln + 1 : idx + 1]
+        return (max(b["high"] for b in sl) + min(b["low"] for b in sl)) / 2.0
+
+    i1, i2 = len(bars) - 3, len(bars) - 2
+    t1, k1, t2, k2 = dmid(i1, 9), dmid(i1, 26), dmid(i2, 9), dmid(i2, 26)
+    sa1t, sa1k, sb1 = dmid(i1 - 26, 9), dmid(i1 - 26, 26), dmid(i1 - 26, 52)
+    sa2t, sa2k, sb2 = dmid(i2 - 26, 9), dmid(i2 - 26, 26), dmid(i2 - 26, 52)
+    if None in (t1, k1, t2, k2, sa1t, sa1k, sb1, sa2t, sa2k, sb2):
+        return None
+    sa1, sa2 = (sa1t + sa1k) / 2.0, (sa2t + sa2k) / 2.0
+    ct1, cb1 = max(sa1, sb1), min(sa1, sb1)
+    ct2, cb2 = max(sa2, sb2), min(sa2, sb2)
+    c1, c2 = bars[i1], bars[i2]
+    if allow_long:
+        if c2["close"] > ct2 and c1["close"] <= ct1 and c2["close"] > c2["open"]:
+            return {"dir": "LONG", "reason": "Kumo Bulutu Yukarı Kırılımı", "tenkan": t2, "kijun": k2, "top": ct2, "bot": cb2, "openTime": c2["openTime"]}
+        if t1 <= k1 and t2 > k2 and c2["close"] > ct2:
+            return {"dir": "LONG", "reason": "Bulut Üstü Tenkan/Kijun Kesişimi", "tenkan": t2, "kijun": k2, "top": ct2, "bot": cb2, "openTime": c2["openTime"]}
+    if allow_short:
+        if c2["close"] < cb2 and c1["close"] >= cb1 and c2["close"] < c2["open"]:
+            return {"dir": "SHORT", "reason": "Kumo Bulutu Aşağı Kırılımı", "tenkan": t2, "kijun": k2, "top": ct2, "bot": cb2, "openTime": c2["openTime"]}
+        if t1 >= k1 and t2 < k2 and c2["close"] < cb2:
+            return {"dir": "SHORT", "reason": "Bulut Altı Tenkan/Kijun Kesişimi", "tenkan": t2, "kijun": k2, "top": ct2, "bot": cb2, "openTime": c2["openTime"]}
+    return None
+
+
+def evaluate_supertrend_py(
+    bars: List[Dict[str, float]], atr_period: int, mult: float, allow_long: bool, allow_short: bool
+) -> Optional[Dict[str, Any]]:
+    n = len(bars)
+    if n < atr_period + 6:
+        return None
+    tr = [0.0] * n
+    for i in range(1, n):
+        tr[i] = max(bars[i]["high"] - bars[i]["low"], abs(bars[i]["high"] - bars[i - 1]["close"]), abs(bars[i]["low"] - bars[i - 1]["close"]))
+    atr = [0.0] * n
+    atr[atr_period] = sum(tr[1 : atr_period + 1]) / atr_period
+    for i in range(atr_period + 1, n):
+        atr[i] = (atr[i - 1] * (atr_period - 1) + tr[i]) / atr_period
+    fu, fl, trend = [0.0] * n, [0.0] * n, [1] * n
+    st_s: List[Optional[float]] = [None] * n
+    for i in range(atr_period, n):
+        hl2 = (bars[i]["high"] + bars[i]["low"]) / 2.0
+        bu, bl = hl2 + mult * atr[i], hl2 - mult * atr[i]
+        if i == atr_period:
+            fu[i], fl[i] = bu, bl
+            trend[i] = 1 if bars[i]["close"] >= hl2 else -1
+        else:
+            fu[i] = bu if (bu < fu[i - 1] or bars[i - 1]["close"] > fu[i - 1]) else fu[i - 1]
+            fl[i] = bl if (bl > fl[i - 1] or bars[i - 1]["close"] < fl[i - 1]) else fl[i - 1]
+            if trend[i - 1] == 1:
+                trend[i] = -1 if bars[i]["close"] < fl[i] else 1
+            else:
+                trend[i] = 1 if bars[i]["close"] > fu[i] else -1
+        st_s[i] = fl[i] if trend[i] == 1 else fu[i]
+    i1, i2 = n - 3, n - 2
+    stv = st_s[i2]
+    if stv is None:
+        return None
+    if allow_long and trend[i1] == -1 and trend[i2] == 1:
+        return {"dir": "LONG", "supertrend": stv, "stSeries": st_s, "openTime": bars[i2]["openTime"]}
+    if allow_short and trend[i1] == 1 and trend[i2] == -1:
+        return {"dir": "SHORT", "supertrend": stv, "stSeries": st_s, "openTime": bars[i2]["openTime"]}
+    return None
+
+
 # ==============================================================================
-# ARKA PLAN DONGULERI (PIYASA, MA200, VOLATILITE, FORMASYON, ATL/ATH, SYNC)
+# ARKA PLAN DONGULERI (WEBSOCKET + REST YEDEK, ATL/ATH, MA200, VOL, BB, ICHI, ST)
 # ==============================================================================
+def _ingest_ticker_item(item: Dict[str, Any], now_s: float) -> None:
+    sym = str(item.get("symbol") or item.get("s") or "")
+    if not sym.endswith("USDT") or (ACTIVE_SPOT_SYMBOLS and sym not in ACTIVE_SPOT_SYMBOLS):
+        return
+    price = float(item.get("lastPrice") or item.get("c") or 0)
+    vol = float(item.get("quoteVolume") or item.get("q") or 0)
+    if price <= 0:
+        return
+    bid = float(item.get("bidPrice") or item.get("b") or price)
+    if bid <= 0:
+        return
+    t = {
+        "symbol": sym, "base": sym[:-4], "quote": "USDT",
+        "price": price,
+        "change24h": float(item.get("priceChangePercent") or item.get("P") or 0),
+        "volume24h": vol,
+        "high24h": float(item.get("highPrice") or item.get("h") or price),
+        "low24h": float(item.get("lowPrice") or item.get("l") or price),
+    }
+    TICKER_MAP[sym] = t
+    dq = PRICE_HIST.setdefault(sym, deque(maxlen=400))
+    dq.append((now_s, price))
+    while dq and dq[0][0] < now_s - 900.0:
+        dq.popleft()
+    if BOT_RUNNING and len(dq) >= 2 and vol >= STRATEGY_CONFIG["pumpMinVolUsdt"]:
+        min15 = min(dq, key=lambda x: x[1])
+        min7_list = [x for x in dq if x[0] >= now_s - 420.0]
+        min7 = min(min7_list, key=lambda x: x[1]) if min7_list else min15
+        p7 = ((price - min7[1]) / min7[1]) * 100.0
+        p15 = ((price - min15[1]) / min15[1]) * 100.0
+        w7 = STRATEGY_CONFIG["pumpEnabled"] and p7 >= STRATEGY_CONFIG["pumpThresholdPct"] and not is_pump_locked(LOCKS["pump"], t["base"], now_s)
+        w15 = STRATEGY_CONFIG["pump15mEnabled"] and p15 >= STRATEGY_CONFIG["pump15mThresholdPct"] and not is_pump_locked(LOCKS["pump15m"], t["base"], now_s)
+        if (w7 or w15) and now_s >= VERIFY_COOLDOWN.get(sym, 0):
+            VERIFY_COOLDOWN[sym] = now_s + 15.0
+            asyncio.create_task(verify_and_emit_pump(t, min7, min15))
+
+
+def _ws_read_exact(sock: ssl.SSLSocket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("WebSocket baglantisi kapandi")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _ws_send_frame(sock: ssl.SSLSocket, opcode: int, payload: bytes = b"") -> None:
+    mask = os.urandom(4)
+    ln = len(payload)
+    hdr = bytearray([0x80 | opcode])
+    if ln < 126:
+        hdr.append(0x80 | ln)
+    elif ln < 65536:
+        hdr.append(0x80 | 126)
+        hdr.extend(struct.pack("!H", ln))
+    else:
+        hdr.append(0x80 | 127)
+        hdr.extend(struct.pack("!Q", ln))
+    hdr.extend(mask)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    sock.sendall(bytes(hdr) + masked)
+
+
+def _ws_blocking_reader(loop: asyncio.AbstractEventLoop) -> None:
+    global WS_CONNECTED, WS_LAST_MSG, ACTIVE_FEED_SOURCE
+    hosts = [
+        ("data-stream.binance.vision", 9443, "/ws/!ticker@arr"),
+        ("stream.binance.com", 9443, "/ws/!ticker@arr"),
+    ]
+    idx = 0
+    ctx = ssl.create_default_context()
+    while True:
+        host, port, path = hosts[idx % len(hosts)]
+        idx += 1
+        sock = None
+        try:
+            raw_sock = socket.create_connection((host, port), timeout=12)
+            sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+            sock.settimeout(25)
+            ws_key = base64.b64encode(os.urandom(16)).decode()
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            sock.sendall(req.encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("WS el sikisma kesildi")
+                resp += chunk
+                if len(resp) > 16384:
+                    raise ConnectionError("WS header cok uzun")
+            if b" 101 " not in resp.split(b"\r\n")[0]:
+                raise ConnectionError(f"WS reddedildi: {resp[:100]!r}")
+            WS_CONNECTED = True
+            ACTIVE_FEED_SOURCE = "Binance-WS"
+            _log(f"[WebSocket] Canli fiyat akisi baglandi -> wss://{host}:{port}{path} (0 REST agirligi)")
+            frag = bytearray()
+            while True:
+                b1, b2 = _ws_read_exact(sock, 2)
+                fin = (b1 >> 7) & 1
+                opcode = b1 & 0x0F
+                masked = (b2 >> 7) & 1
+                ln = b2 & 0x7F
+                if ln == 126:
+                    ln = struct.unpack("!H", _ws_read_exact(sock, 2))[0]
+                elif ln == 127:
+                    ln = struct.unpack("!Q", _ws_read_exact(sock, 8))[0]
+                mask_k = _ws_read_exact(sock, 4) if masked else b""
+                data = _ws_read_exact(sock, ln)
+                if masked:
+                    data = bytes(b ^ mask_k[i % 4] for i, b in enumerate(data))
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    _ws_send_frame(sock, 0xA, data)
+                    continue
+                if opcode in (0x1, 0x2, 0x0):
+                    frag.extend(data)
+                    if fin:
+                        txt = frag.decode("utf-8", errors="ignore")
+                        frag.clear()
+                        WS_LAST_MSG = time.time()
+                        try:
+                            arr = json.loads(txt)
+                            if isinstance(arr, list):
+                                def _apply(batch: List[Dict[str, Any]] = arr) -> None:
+                                    now_s = time.time()
+                                    for item in batch:
+                                        if isinstance(item, dict):
+                                            _ingest_ticker_item(item, now_s)
+                                loop.call_soon_threadsafe(_apply)
+                        except Exception:
+                            pass
+        except Exception as e:
+            WS_CONNECTED = False
+            _log(f"[WebSocket Yeniden Baglaniliyor] {host}: {e}")
+            time.sleep(5)
+        finally:
+            WS_CONNECTED = False
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+
+async def binance_ws_loop() -> None:
+    loop = asyncio.get_running_loop()
+    threading.Thread(target=_ws_blocking_reader, args=(loop,), daemon=True, name="binance-ws").start()
+    while True:
+        await asyncio.sleep(60)
+
+
 async def market_loop() -> None:
+    global ACTIVE_FEED_SOURCE
     last_err_log = 0.0
     while True:
         try:
-            raw = await fetch_binance_json("/api/v3/ticker/24hr")
             now_s = time.time()
-            for item in raw:
-                sym = str(item.get("symbol", ""))
-                if not sym.endswith("USDT") or (ACTIVE_SPOT_SYMBOLS and sym not in ACTIVE_SPOT_SYMBOLS):
-                    continue
-                price = float(item.get("lastPrice") or 0)
-                vol = float(item.get("quoteVolume") or 0)
-                if price <= 0 or float(item.get("bidPrice") or 0) <= 0:
-                    continue
-                t = {
-                    "symbol": sym, "base": sym[:-4], "quote": "USDT",
-                    "price": price, "change24h": float(item.get("priceChangePercent") or 0),
-                    "volume24h": vol, "high24h": float(item.get("highPrice") or price), "low24h": float(item.get("lowPrice") or price),
-                }
-                TICKER_MAP[sym] = t
-                dq = PRICE_HIST.setdefault(sym, deque(maxlen=400))
-                dq.append((now_s, price))
-                while dq and dq[0][0] < now_s - 900.0:
-                    dq.popleft()
-                if BOT_RUNNING and len(dq) >= 2 and vol >= STRATEGY_CONFIG["pumpMinVolUsdt"]:
-                    min15 = min(dq, key=lambda x: x[1])
-                    min7_list = [x for x in dq if x[0] >= now_s - 420.0]
-                    min7 = min(min7_list, key=lambda x: x[1]) if min7_list else min15
-                    p7 = ((price - min7[1]) / min7[1]) * 100.0
-                    p15 = ((price - min15[1]) / min15[1]) * 100.0
-                    w7 = STRATEGY_CONFIG["pumpEnabled"] and p7 >= STRATEGY_CONFIG["pumpThresholdPct"] and not is_pump_locked(LOCKS["pump"], t["base"], now_s)
-                    w15 = STRATEGY_CONFIG["pump15mEnabled"] and p15 >= STRATEGY_CONFIG["pump15mThresholdPct"] and not is_pump_locked(LOCKS["pump15m"], t["base"], now_s)
-                    if (w7 or w15) and now_s >= VERIFY_COOLDOWN.get(sym, 0):
-                        asyncio.create_task(verify_and_emit_pump(t, min7, min15))
+            ws_healthy = WS_CONNECTED and (now_s - WS_LAST_MSG < 30.0) and len(TICKER_MAP) > 40
+            if not ws_healthy:
+                raw: Any = None
+                src = ""
+                if now_s >= BINANCE_BAN_UNTIL:
+                    try:
+                        raw = await fetch_binance_json("/api/v3/ticker/24hr", timeout_s=10.0)
+                        src = "Binance-REST"
+                    except Exception:
+                        raw = None
+                if not isinstance(raw, list) or not raw:
+                    src, raw = await fetch_fallback_tickers()
+                if isinstance(raw, list) and raw:
+                    ACTIVE_FEED_SOURCE = src or "Fallback"
+                    t_now = time.time()
+                    for item in raw:
+                        if isinstance(item, dict):
+                            _ingest_ticker_item(item, t_now)
+                elif now_s - last_err_log > 90:
+                    last_err_log = now_s
+                    _log("[Market Loop] Tum REST kaynaklari gecici erisilemedi, yeniden deneniyor.")
         except Exception as e:
-            if time.time() - last_err_log > 60:
+            if time.time() - last_err_log > 90:
                 last_err_log = time.time()
                 _log(f"[Market Loop Hatasi] {e}")
-        await asyncio.sleep(3.5)
+        await asyncio.sleep(35.0 if (WS_CONNECTED and len(TICKER_MAP) > 40) else 12.0)
 
 
 async def ath_atl_loop() -> None:
     cursor = 0
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(3)
 
     async def process_coin(t: Dict[str, Any], tfs: List[str], now_s: float, lock_ratio: float, cd_sec: float) -> None:
         async with sem:
@@ -1401,17 +1899,17 @@ async def ath_atl_loop() -> None:
                 now_s = time.time()
                 lock_ratio = STRATEGY_CONFIG["athAtlLockPct"] / 100.0
                 cd_sec = STRATEGY_CONFIG["athAtlCooldownMin"] * 60.0
-                batch_sz = min(35, len(cands))
+                batch_sz = min(14, len(cands))
                 batch = [cands[(cursor + i) % len(cands)] for i in range(batch_sz)]
                 cursor += batch_sz
                 await asyncio.gather(*(process_coin(t, tfs, now_s, lock_ratio, cd_sec) for t in batch), return_exceptions=True)
         except Exception as e:
             _log(f"[ATH/ATL Loop Hatasi] {e}")
-        await asyncio.sleep(8)
+        await asyncio.sleep(15)
 
 
 async def advanced_strategies_loop() -> None:
-    ma_cur, pat_cur = 0, 0
+    ma_cur, pat_cur, ind_cur = 0, 0, 0
     while True:
         try:
             now_s = time.time()
@@ -1458,7 +1956,7 @@ async def advanced_strategies_loop() -> None:
                 cands = sorted([t for t in TICKER_MAP.values() if t["volume24h"] >= 400000], key=lambda x: x["volume24h"], reverse=True)[:80]
                 tf_ma = STRATEGY_CONFIG["ma200Timeframe"]
                 per = STRATEGY_CONFIG["ma200Period"]
-                for _ in range(min(10, len(cands))):
+                for _ in range(min(8, len(cands))):
                     t = cands[ma_cur % len(cands)]
                     ma_cur += 1
                     bars = await fetch_spot_klines(t["symbol"], tf_ma, per + 25)
@@ -1481,7 +1979,7 @@ async def advanced_strategies_loop() -> None:
             # 3) 7 FORMASYON MOTORU
             if BOT_RUNNING and STRATEGY_CONFIG["patternsEnabled"] and STRATEGY_CONFIG["patternTimeframes"] and TICKER_MAP:
                 cands = sorted([t for t in TICKER_MAP.values() if t["volume24h"] >= 500000], key=lambda x: x["volume24h"], reverse=True)[:55]
-                for _ in range(min(8, len(cands))):
+                for _ in range(min(6, len(cands))):
                     t = cands[pat_cur % len(cands)]
                     pat_cur += 1
                     for tf in STRATEGY_CONFIG["patternTimeframes"]:
@@ -1504,6 +2002,113 @@ async def advanced_strategies_loop() -> None:
                             "details": [f"🎯 Hedef: ${fmt_price(hit['target'])} | Destek/Boyun: ${fmt_price(hit['support'])}"],
                             "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
                         }, png)
+                        await asyncio.sleep(0.08)
+
+            # 4) BOLLINGER, ICHIMOKU VE SUPERTREND (COKLU ZAMAN DILIMI)
+            needed_tfs: List[str] = []
+            for key_on, key_tfs in [
+                ("bollingerEnabled", "bollingerTimeframes"),
+                ("ichimokuEnabled", "ichimokuTimeframes"),
+                ("supertrendEnabled", "supertrendTimeframes"),
+            ]:
+                if STRATEGY_CONFIG.get(key_on):
+                    for tf in STRATEGY_CONFIG.get(key_tfs, []):
+                        if tf not in needed_tfs:
+                            needed_tfs.append(tf)
+
+            if BOT_RUNNING and needed_tfs and TICKER_MAP:
+                cands = sorted([t for t in TICKER_MAP.values() if t["volume24h"] >= 400000], key=lambda x: x["volume24h"], reverse=True)[:55]
+                for _ in range(min(6, len(cands))):
+                    t = cands[ind_cur % len(cands)]
+                    ind_cur += 1
+                    for tf in needed_tfs:
+                        ck = f"{t['symbol']}:{tf}"
+                        if IND_COOLDOWN.get(ck, 0) > now_s:
+                            continue
+                        IND_COOLDOWN[ck] = now_s + (90 if tf == "15m" else 180)
+                        bars = await fetch_spot_klines(t["symbol"], tf, 120)
+                        if len(bars) < 30:
+                            continue
+
+                        if STRATEGY_CONFIG.get("bollingerEnabled") and tf in STRATEGY_CONFIG.get("bollingerTimeframes", []):
+                            bb = evaluate_bollinger_py(
+                                bars,
+                                int(STRATEGY_CONFIG.get("bollingerPeriod", 20)),
+                                float(STRATEGY_CONFIG.get("bollingerStdDev", 2.0)),
+                                bool(STRATEGY_CONFIG.get("bollingerLongEnabled", True)),
+                                bool(STRATEGY_CONFIG.get("bollingerShortEnabled", True)),
+                            )
+                            if bb:
+                                sid = f"BB-{t['symbol']}-{tf}-{bb['dir']}-{int(bb['openTime'])}"
+                                png = render_signal_candle_png(
+                                    f"{t['symbol']} | {tf.upper()} BOLLINGER {bb['dir']}",
+                                    bars,
+                                    t["price"],
+                                    support=bb["lower"] if bb["dir"] == "LONG" else bb["upper"],
+                                    target=bb["upper"] if bb["dir"] == "LONG" else bb["lower"],
+                                    ma_series=bb["midSeries"],
+                                    is_short=(bb["dir"] == "SHORT"),
+                                )
+                                await emit_signal({
+                                    "id": sid, "engine": "BOLLINGER", "engineLabel": f"Bollinger ({tf})",
+                                    "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": bb["dir"], "timeframe": tf,
+                                    "entryPrice": t["price"], "currentPrice": t["price"], "peakPrice": t["price"], "peakPct": 0.0,
+                                    "headline": f"Bollinger ({tf}) {bb['reason']} — #{t['symbol']} [{bb['dir']}]",
+                                    "details": [f"📊 Üst: ${fmt_price(bb['upper'])} | Orta: ${fmt_price(bb['mid'])} | Alt: ${fmt_price(bb['lower'])}"],
+                                    "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                                }, png)
+
+                        if STRATEGY_CONFIG.get("ichimokuEnabled") and tf in STRATEGY_CONFIG.get("ichimokuTimeframes", []):
+                            ich = evaluate_ichimoku_py(
+                                bars,
+                                bool(STRATEGY_CONFIG.get("ichimokuLongEnabled", True)),
+                                bool(STRATEGY_CONFIG.get("ichimokuShortEnabled", True)),
+                            )
+                            if ich:
+                                sid = f"ICH-{t['symbol']}-{tf}-{ich['dir']}-{int(ich['openTime'])}"
+                                png = render_signal_candle_png(
+                                    f"{t['symbol']} | {tf.upper()} ICHIMOKU {ich['dir']}",
+                                    bars,
+                                    t["price"],
+                                    support=ich["bot"],
+                                    target=ich["top"],
+                                    is_short=(ich["dir"] == "SHORT"),
+                                )
+                                await emit_signal({
+                                    "id": sid, "engine": "ICHIMOKU", "engineLabel": f"Ichimoku ({tf})",
+                                    "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": ich["dir"], "timeframe": tf,
+                                    "entryPrice": t["price"], "currentPrice": t["price"], "peakPrice": t["price"], "peakPct": 0.0,
+                                    "headline": f"Ichimoku ({tf}) {ich['reason']} — #{t['symbol']} [{ich['dir']}]",
+                                    "details": [f"☁️ Kumo: ${fmt_price(ich['bot'])} - ${fmt_price(ich['top'])} · Tenkan: ${fmt_price(ich['tenkan'])} | Kijun: ${fmt_price(ich['kijun'])}"],
+                                    "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                                }, png)
+
+                        if STRATEGY_CONFIG.get("supertrendEnabled") and tf in STRATEGY_CONFIG.get("supertrendTimeframes", []):
+                            st = evaluate_supertrend_py(
+                                bars,
+                                int(STRATEGY_CONFIG.get("supertrendAtrPeriod", 10)),
+                                float(STRATEGY_CONFIG.get("supertrendMultiplier", 3.0)),
+                                bool(STRATEGY_CONFIG.get("supertrendLongEnabled", True)),
+                                bool(STRATEGY_CONFIG.get("supertrendShortEnabled", True)),
+                            )
+                            if st:
+                                sid = f"ST-{t['symbol']}-{tf}-{st['dir']}-{int(st['openTime'])}"
+                                png = render_signal_candle_png(
+                                    f"{t['symbol']} | {tf.upper()} SUPERTREND {st['dir']}",
+                                    bars,
+                                    t["price"],
+                                    support=st["supertrend"],
+                                    ma_series=st["stSeries"],
+                                    is_short=(st["dir"] == "SHORT"),
+                                )
+                                await emit_signal({
+                                    "id": sid, "engine": "SUPERTREND", "engineLabel": f"Supertrend ({tf})",
+                                    "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": st["dir"], "timeframe": tf,
+                                    "entryPrice": t["price"], "currentPrice": t["price"], "peakPrice": t["price"], "peakPct": 0.0,
+                                    "headline": f"Supertrend ({tf}) Trend Dönüşü — #{t['symbol']} [{st['dir']}]",
+                                    "details": [f"⚡ Supertrend: ${fmt_price(st['supertrend'])} · Anlık: ${fmt_price(t['price'])}"],
+                                    "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                                }, png)
                         await asyncio.sleep(0.08)
         except Exception as e:
             _log(f"[Gelismis Strateji Hatasi] {e}")
@@ -1688,10 +2293,11 @@ async def telegram_command_loop() -> None:
                 elif cmd == "/durum":
                     await tg_send_text(
                         f"📊 <b>Bot Durumu</b> ({'🟢 Aktif' if BOT_RUNNING else '🔴 Durdu'})\n"
-                        f"• Çift: {len(TICKER_MAP)} · Sinyal: {len(SIGNALS)} · TG Gönderim: {TG_SENT_COUNT}\n"
+                        f"• Veri Kaynağı: {ACTIVE_FEED_SOURCE} | Çift: {len(TICKER_MAP)} | Sinyal: {len(SIGNALS)} | TG: {TG_SENT_COUNT}\n"
                         f"• Pump: {STRATEGY_CONFIG['pumpEnabled']} | 15m: {STRATEGY_CONFIG['pump15mEnabled']} | RSI≥{AUTO_TRADE['rsiMin']}\n"
                         f"• ATL/ATH ({','.join(STRATEGY_CONFIG['athAtlTimeframes'])}): {STRATEGY_CONFIG['atlEnabled']}/{STRATEGY_CONFIG['athEnabled']}\n"
-                        f"• 4s MA200: {STRATEGY_CONFIG['ma200Enabled']} | Vol ({','.join(STRATEGY_CONFIG['volatilityTimeframes'])}): {STRATEGY_CONFIG['volatilityEnabled']} | Formasyon: {STRATEGY_CONFIG['patternsEnabled']}"
+                        f"• MA200: {STRATEGY_CONFIG['ma200Enabled']} | Vol: {STRATEGY_CONFIG['volatilityEnabled']} | Formasyon: {STRATEGY_CONFIG['patternsEnabled']}\n"
+                        f"• BB ({','.join(STRATEGY_CONFIG.get('bollingerTimeframes', []))}): {STRATEGY_CONFIG.get('bollingerEnabled')} | Ichi ({','.join(STRATEGY_CONFIG.get('ichimokuTimeframes', []))}): {STRATEGY_CONFIG.get('ichimokuEnabled')} | ST ({','.join(STRATEGY_CONFIG.get('supertrendTimeframes', []))}): {STRATEGY_CONFIG.get('supertrendEnabled')}"
                         + (f"\n• Son TG Hata: {esc_html(LAST_TG_ERROR)}" if LAST_TG_ERROR else ""),
                         cid,
                     )
@@ -1708,7 +2314,14 @@ async def telegram_command_loop() -> None:
                         await tg_send_text("❌ Geçersiz /ayar_sync JSON verisi.", cid)
                 elif cmd == "/tik" and len(parts) >= 3:
                     key, val = parts[1].upper(), parts[2].upper() in ("AC", "ON", "TRUE", "1")
-                    m = {"PUMP": "pumpEnabled", "PUMP15M": "pump15mEnabled", "ATH": "athEnabled", "ATL": "atlEnabled", "MA200": "ma200Enabled", "VOL": "volatilityEnabled", "PATTERN": "patternsEnabled"}
+                    m = {
+                        "PUMP": "pumpEnabled", "PUMP15M": "pump15mEnabled",
+                        "ATH": "athEnabled", "ATL": "atlEnabled",
+                        "MA200": "ma200Enabled", "VOL": "volatilityEnabled", "PATTERN": "patternsEnabled",
+                        "BB": "bollingerEnabled", "BOLLINGER": "bollingerEnabled",
+                        "ICHI": "ichimokuEnabled", "ICHIMOKU": "ichimokuEnabled",
+                        "ST": "supertrendEnabled", "SUPERTREND": "supertrendEnabled",
+                    }
                     if key in m:
                         STRATEGY_CONFIG[m[key]] = val
                         save_state()
@@ -1733,20 +2346,24 @@ async def refresh_symbols_loop() -> None:
     fapi_warned = False
     while True:
         try:
-            sp = await fetch_binance_json("/api/v3/exchangeInfo")
-            ACTIVE_SPOT_SYMBOLS.clear()
-            for s in sp.get("symbols", []):
-                if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", True):
-                    sym = s["symbol"]
-                    ACTIVE_SPOT_SYMBOLS.add(sym)
-                    s_info = {"stepSize": "0.001", "minQty": 0.0, "tickSize": "0.0001", "minNotional": 5.0}
-                    for f in s.get("filters", []):
-                        if f.get("filterType") == "LOT_SIZE":
-                            s_info["stepSize"] = f.get("stepSize", "0.001")
-                            s_info["minQty"] = float(f.get("minQty") or 0)
-                        elif f.get("filterType") == "PRICE_FILTER":
-                            s_info["tickSize"] = f.get("tickSize", "0.0001")
-                    SPOT_FILTERS[sym] = s_info
+            try:
+                sp = await fetch_binance_json("/api/v3/exchangeInfo")
+                if isinstance(sp, dict) and sp.get("symbols"):
+                    ACTIVE_SPOT_SYMBOLS.clear()
+                    for s in sp.get("symbols", []):
+                        if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", True):
+                            sym = s["symbol"]
+                            ACTIVE_SPOT_SYMBOLS.add(sym)
+                            s_info = {"stepSize": "0.001", "minQty": 0.0, "tickSize": "0.0001", "minNotional": 5.0}
+                            for f in s.get("filters", []):
+                                if f.get("filterType") == "LOT_SIZE":
+                                    s_info["stepSize"] = f.get("stepSize", "0.001")
+                                    s_info["minQty"] = float(f.get("minQty") or 0)
+                                elif f.get("filterType") == "PRICE_FILTER":
+                                    s_info["tickSize"] = f.get("tickSize", "0.0001")
+                            SPOT_FILTERS[sym] = s_info
+            except Exception:
+                pass
             for fbase in ("https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"):
                 f_status, fp = await http_get_json(f"{fbase}/fapi/v1/exchangeInfo", timeout_s=10.0)
                 if f_status == 200 and isinstance(fp, dict) and fp.get("symbols"):
@@ -1775,8 +2392,10 @@ async def refresh_symbols_loop() -> None:
 async def heartbeat_loop() -> None:
     while True:
         await asyncio.sleep(60)
+        open_n = sum(1 for t in TRADES if t["status"] == "OPEN")
         _log(
-            f"[DURUM] Ciftler={len(TICKER_MAP)} | Sinyaller={len(SIGNALS)} | "
+            f"[DURUM] Kaynak={ACTIVE_FEED_SOURCE} | Ciftler={len(TICKER_MAP)} | Sinyaller={len(SIGNALS)} | "
+            f"Futures={'ACIK' if AUTO_TRADE['enabled'] else 'KAPALI'}({AUTO_TRADE['mode']}:{open_n}) | "
             f"TG={'@' + TG_BOT_USERNAME if TG_BOT_USERNAME else ('Aktif' if BOT_TOKEN else 'Kapali')} "
             f"(Gonderilen={TG_SENT_COUNT}) | Chatler={len(SUBSCRIBED_CHATS)}"
             + (f" | SonHata={LAST_TG_ERROR}" if LAST_TG_ERROR else "")
@@ -1789,6 +2408,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             payload = json.dumps({
                 "ok": True,
                 "botRunning": BOT_RUNNING,
+                "feedSource": ACTIVE_FEED_SOURCE,
+                "wsConnected": WS_CONNECTED,
                 "telegramEnabled": bool(BOT_TOKEN),
                 "tgOk": TG_OK,
                 "tgBotUsername": TG_BOT_USERNAME,
@@ -1829,6 +2450,7 @@ async def main() -> None:
     start_health_server(PORT)
     await telegram_startup_check()
     await asyncio.gather(
+        binance_ws_loop(),
         refresh_symbols_loop(),
         market_loop(),
         ath_atl_loop(),
