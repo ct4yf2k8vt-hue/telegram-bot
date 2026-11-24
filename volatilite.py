@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 22:55:29 · Rev #4
-# Aktif Motorlar: AI(BOTH,3dk) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,1b)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): AI_MARKET, MULTI_EXCHANGE, BIG_PUMP
+# Uretim: 23:13:55 · Rev #5
+# Aktif Motorlar: AI(BOTH,3dk) | Borsalar(BOTH,3b)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%5): AI_MARKET, MULTI_EXCHANGE, BIG_PUMP
 # ==============================================================================
 import asyncio
 import base64
@@ -110,7 +110,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "multiExchangeThresholdPct": 1.8,
     "multiExchangeMinExchanges": 3,
     "multiExchangeWindowMin": 3,
-    "bigPumpEnabled": True,
+    "bigPumpEnabled": False,
     "bigPumpDirection": "BOTH",
     "bigPumpThresholdPct": 5,
     "bigPumpWindowMin": 15,
@@ -145,8 +145,8 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "directionMode": "BOTH",
     "leverage": 3,
     "tradeUsdt": 25,
-    "tpPct": 10,
-    "slPct": 10,
+    "tpPct": 5,
+    "slPct": 5,
     "maxOpenTrades": 0,
     "rsiMin": 70,
     "notifyPaperTelegram": True,
