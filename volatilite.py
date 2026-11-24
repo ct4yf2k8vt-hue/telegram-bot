@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 22:38:53 · Rev #4
-# Aktif Motorlar: AI(BOTH,3dk) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,1b)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): AI_MARKET, MULTI_EXCHANGE, BIG_PUMP
+# Uretim: 22:48:27 · Rev #3
+# Aktif Motorlar: AI(BOTH,3dk) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,8b)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP, PUMP15M, AI_MARKET
 # ==============================================================================
 import asyncio
 import base64
@@ -116,13 +116,13 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "bigPumpWindowMin": 15,
     "bigPumpCooldownMin": 10,
     "bigPumpMinVolUsdt": 100000,
-    "bigPumpExchanges": ["BINANCE"],
+    "bigPumpExchanges": ["BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET"],
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": False,
-        "PUMP15M": False,
+        "PUMP": True,
+        "PUMP15M": True,
         "ATL": False,
         "ATH": False,
         "MA200_4H": False,
@@ -132,8 +132,8 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "ICHIMOKU": False,
         "SUPERTREND": False,
         "AI_MARKET": True,
-        "MULTI_EXCHANGE": True,
-        "BIG_PUMP": True,
+        "MULTI_EXCHANGE": False,
+        "BIG_PUMP": False,
     },
 }
 
@@ -149,7 +149,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "slPct": 10,
     "maxOpenTrades": 0,
     "rsiMin": 70,
-    "notifyPaperTelegram": True,
+    "notifyPaperTelegram": False,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
@@ -243,6 +243,8 @@ IND_COOLDOWN: Dict[str, float] = {}
 MULTI_EX_HIST: Dict[str, Dict[str, deque]] = {}
 MULTI_EX_COOLDOWN: Dict[str, float] = {}
 AI_COOLDOWN: Dict[str, float] = {}
+GEMINI_MODELS = ("gemini-3.1-flash-lite", "gemini-4-hydrogen")
+GEMINI_MODEL_BLOCKED_UNTIL: Dict[str, float] = {}
 BIG_PUMP_EXCHANGE_ORDER = ("BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET")
 EXCHANGE_SYMBOL_SETS: Dict[str, Set[str]] = {}
 BIG_PUMP_HIST: Dict[str, deque] = {}
@@ -491,6 +493,16 @@ def compute_sma(closes: List[float], period: int = 200) -> List[Optional[float]]
     for i in range(period, len(closes)):
         s += closes[i] - closes[i - period]
         out[i] = s / period
+    return out
+
+
+def compute_ema(closes: List[float], period: int) -> List[float]:
+    if not closes:
+        return []
+    k = 2.0 / (period + 1)
+    out = [float(closes[0])]
+    for i in range(1, len(closes)):
+        out.append(closes[i] * k + out[i - 1] * (1.0 - k))
     return out
 
 
@@ -2532,76 +2544,162 @@ async def multi_exchange_loop() -> None:
         await asyncio.sleep(20)
 
 
+async def run_quant_ai_fallback(dir_mode: str, min_conf: int) -> Tuple[str, List[Dict[str, Any]]]:
+    usdt = [t for t in TICKER_MAP.values() if t.get("volume24h", 0) >= 250000 and t.get("price", 0) > 0]
+    liq = sorted(usdt, key=lambda x: x["volume24h"], reverse=True)[:35]
+    bull_c = sum(1 for t in liq if t.get("change24h", 0) > 1.0 and t.get("window7mPct", 0) >= 0)
+    bear_c = sum(1 for t in liq if t.get("change24h", 0) < -1.0 and t.get("window7mPct", 0) <= 0)
+    regime = "Yükseliş Eğilimli" if bull_c >= max(12, int(len(liq) * 0.55)) else ("Satış Baskılı" if bear_c >= max(12, int(len(liq) * 0.55)) else "Dengeli & Seçici")
+
+    long_pool = sorted(usdt, key=lambda x: x.get("window7mPct", 0) * 2.5 + x.get("change24h", 0) * 0.35 + (2.0 if x["symbol"] in FUTURES_SYMBOLS else 0.0), reverse=True)[:5]
+    short_pool = sorted(usdt, key=lambda x: -x.get("window7mPct", 0) * 2.5 - x.get("change24h", 0) * 0.35 + (2.0 if x["symbol"] in FUTURES_SYMBOLS else 0.0), reverse=True)[:5]
+    pool = long_pool if dir_mode == "LONG" else (short_pool if dir_mode == "SHORT" else long_pool + short_pool)
+    seen_s: Set[str] = set()
+    cands: List[Dict[str, Any]] = []
+    for item in pool:
+        if item["symbol"] not in seen_s:
+            seen_s.add(item["symbol"])
+            cands.append(item)
+
+    evaluated: List[Dict[str, Any]] = []
+    for tk in cands[:8]:
+        rsi14 = 50.0
+        ema9 = tk["price"]
+        ema21 = tk["price"]
+        try:
+            bars = await fetch_spot_klines(tk["symbol"], "15m", 35)
+            if len(bars) >= 22:
+                closes = [b["close"] for b in bars]
+                rsi14 = compute_rsi(closes, 14)[-1]
+                ema9 = compute_ema(closes, 9)[-1]
+                ema21 = compute_ema(closes, 21)[-1]
+        except Exception:
+            pass
+        w7 = float(tk.get("window7mPct", 0) or 0)
+        c24 = float(tk.get("change24h", 0) or 0)
+        has_fut = tk["symbol"] in FUTURES_SYMBOLS
+        if dir_mode in ("LONG", "BOTH"):
+            sc = 54.0 + (min(16.0, w7 * 4.5) if w7 > 0.3 else 0.0) + (8.0 if ema9 > ema21 else 0.0) + (8.0 if 48 <= rsi14 <= 74 else 0.0) + (5.0 if has_fut else 0.0)
+            conf = min(93, max(54, int(round(sc))))
+            evaluated.append({
+                "symbol": tk["symbol"], "direction": "LONG", "confidence": conf,
+                "reason": f"15dk RSI {rsi14:.0f} · {'EMA9>EMA21 pozitif' if ema9 >= ema21 else 'tepki'} · 7dk {w7:+.2f}% · 24s {c24:+.1f}%",
+            })
+        if dir_mode in ("SHORT", "BOTH"):
+            sc = 54.0 + (min(16.0, abs(w7) * 4.5) if w7 < -0.3 else 0.0) + (8.0 if ema9 < ema21 else 0.0) + (8.0 if 26 <= rsi14 <= 52 else 0.0) + (5.0 if has_fut else 0.0)
+            conf = min(93, max(54, int(round(sc))))
+            evaluated.append({
+                "symbol": tk["symbol"], "direction": "SHORT", "confidence": conf,
+                "reason": f"15dk RSI {rsi14:.0f} · {'EMA9<EMA21 satış baskısı' if ema9 <= ema21 else 'tepe dönüşü'} · 7dk {w7:+.2f}% · 24s {c24:+.1f}%",
+            })
+
+    evaluated.sort(key=lambda x: x["confidence"], reverse=True)
+    picked_syms: Set[str] = set()
+    picks: List[Dict[str, Any]] = []
+    for item in evaluated:
+        if item["symbol"] in picked_syms:
+            continue
+        picked_syms.add(item["symbol"])
+        picks.append(item)
+        if len(picks) >= 3:
+            break
+    return regime, picks
+
+
 async def ai_market_loop() -> None:
     while True:
         try:
-            interval_s = max(60.0, float(STRATEGY_CONFIG.get("aiMarketIntervalMin", 5)) * 60.0)
-            if BOT_RUNNING and STRATEGY_CONFIG.get("aiMarketEnabled") and GEMINI_API_KEY and len(TICKER_MAP) >= 15:
-                usdt = [t for t in TICKER_MAP.values() if t.get("volume24h", 0) >= 250000]
-                top_v = sorted(usdt, key=lambda x: x["volume24h"], reverse=True)[:12]
-                top_g = sorted(usdt, key=lambda x: x["change24h"], reverse=True)[:12]
-                top_d = sorted(usdt, key=lambda x: x["change24h"])[:10]
-                seen: Set[str] = set()
-                sample: List[Dict[str, Any]] = []
-                for lst in (top_v, top_g, top_d):
-                    for it in lst:
-                        if it["symbol"] not in seen:
-                            seen.add(it["symbol"])
-                            sample.append(it)
-                lines = [
-                    f"{t['symbol']}|p={fmt_price(t['price'])}|24s={t['change24h']:+.2f}%|hacim=${int(t['volume24h']/1000)}K"
-                    for t in sample[:30]
-                ]
+            interval_s = max(60.0, float(STRATEGY_CONFIG.get("aiMarketIntervalMin", 15)) * 60.0)
+            if BOT_RUNNING and STRATEGY_CONFIG.get("aiMarketEnabled") and len(TICKER_MAP) >= 15:
                 dir_mode = str(STRATEGY_CONFIG.get("aiMarketDirection", "BOTH")).upper()
-                min_conf = int(STRATEGY_CONFIG.get("aiMarketMinConfidence", 70))
-                prompt = (
-                    f"Canli kripto piyasasini analiz et ve su an en olumlu en fazla 3 islem sec. Yon={dir_mode}, MinGuven={min_conf}.\n"
-                    'Yalnizca JSON dondur: {"marketRegime":"...","summary":"...","picks":[{"symbol":"BTCUSDT","direction":"LONG","confidence":82,"reason":"..."}]}\n'
-                    + "\n".join(lines)
-                )
-                body = json.dumps({
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseMimeType": "application/json"},
-                }).encode("utf-8")
-                st, raw = await http_request(
-                    "POST",
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent",
-                    headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-                    body=body,
-                    timeout_s=25.0,
-                )
-                js = _safe_json_loads(raw)
-                if st == 200 and isinstance(js, dict):
-                    txt = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [{}])[0].get("text") or "{}"
-                    parsed = json.loads(txt)
-                    now_s = time.time()
-                    for pk in parsed.get("picks") or []:
-                        sym = str(pk.get("symbol") or "").upper().strip()
-                        dr = str(pk.get("direction") or "").upper().strip()
-                        conf = int(pk.get("confidence") or 0)
-                        if dr not in ("LONG", "SHORT") or conf < min_conf or sym not in TICKER_MAP:
+                min_conf = int(STRATEGY_CONFIG.get("aiMarketMinConfidence", 72))
+                now_s = time.time()
+                gemini_used = False
+                regime = "Canlı Analiz"
+                picks: List[Dict[str, Any]] = []
+
+                if GEMINI_API_KEY:
+                    usdt = [t for t in TICKER_MAP.values() if t.get("volume24h", 0) >= 250000]
+                    top_v = sorted(usdt, key=lambda x: x["volume24h"], reverse=True)[:12]
+                    top_g = sorted(usdt, key=lambda x: x["change24h"], reverse=True)[:12]
+                    top_d = sorted(usdt, key=lambda x: x["change24h"])[:10]
+                    seen: Set[str] = set()
+                    sample: List[Dict[str, Any]] = []
+                    for lst in (top_v, top_g, top_d):
+                        for it in lst:
+                            if it["symbol"] not in seen:
+                                seen.add(it["symbol"])
+                                sample.append(it)
+                    lines = [
+                        f"{t['symbol']}|p={fmt_price(t['price'])}|24s={t['change24h']:+.2f}%|hacim=${int(t['volume24h']/1000)}K"
+                        for t in sample[:30]
+                    ]
+                    prompt = (
+                        f"Canli kripto piyasasini analiz et ve su an en olumlu en fazla 3 islem sec. Yon={dir_mode}, MinGuven={min_conf}.\n"
+                        'Yalnizca JSON dondur: {"marketRegime":"...","summary":"...","picks":[{"symbol":"BTCUSDT","direction":"LONG","confidence":82,"reason":"..."}]}\n'
+                        + "\n".join(lines)
+                    )
+                    body = json.dumps({
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"responseMimeType": "application/json"},
+                    }).encode("utf-8")
+
+                    for model_name in GEMINI_MODELS:
+                        if GEMINI_MODEL_BLOCKED_UNTIL.get(model_name, 0.0) > now_s:
                             continue
-                        if (dir_mode == "LONG" and dr != "LONG") or (dir_mode == "SHORT" and dr != "SHORT"):
-                            continue
-                        ck = f"{sym}:{dr}"
-                        if AI_COOLDOWN.get(ck, 0) > now_s:
-                            continue
-                        AI_COOLDOWN[ck] = now_s + 900.0
-                        tk = TICKER_MAP[sym]
-                        await emit_signal({
-                            "id": f"AI-{sym}-{dr}-{int(now_s*1000)}",
-                            "engine": "AI_MARKET",
-                            "engineLabel": f"Yapay Zeka AI ({conf}%)",
-                            "symbol": sym, "base": tk["base"], "quote": "USDT", "direction": dr,
-                            "entryPrice": tk["price"], "currentPrice": tk["price"], "peakPrice": tk["price"], "peakPct": 0.0,
-                            "headline": f"🤖 YAPAY ZEKA {dr} (%{conf}) — #{sym}",
-                            "details": [
-                                f"🧠 Rejim: {parsed.get('marketRegime', 'Canlı Analiz')} · Güven: %{conf}",
-                                f"💡 Analiz: {pk.get('reason', 'Piyasa & momentum analizi')}",
-                                f"💰 Anlık Fiyat: ${fmt_price(tk['price'])} (24s: {tk['change24h']:+.2f}%)",
-                            ],
-                            "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
-                        })
+                        st, raw = await http_request(
+                            "POST",
+                            f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
+                            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+                            body=body,
+                            timeout_s=25.0,
+                        )
+                        js = _safe_json_loads(raw)
+                        if st == 200 and isinstance(js, dict):
+                            txt = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [{}])[0].get("text") or "{}"
+                            parsed = json.loads(txt)
+                            regime = str(parsed.get("marketRegime") or "Canlı Analiz")
+                            picks = list(parsed.get("picks") or [])
+                            gemini_used = True
+                            break
+                        wait_s = 1800.0
+                        m_delay = re.search(r'"retryDelay"\s*:\s*"(\d+)s"', raw)
+                        if m_delay:
+                            wait_s = max(60.0, min(86400.0, float(m_delay.group(1))))
+                        GEMINI_MODEL_BLOCKED_UNTIL[model_name] = now_s + (wait_s if st == 429 else 300.0)
+                        _log(f"[AI Market {model_name}] HTTP {st} — yedek modele/teknik motora geçiliyor (bekleme {int(wait_s//60)}dk).")
+
+                engine_tag = "Gemini AI" if gemini_used else "Teknik AI Yedek"
+                if not gemini_used:
+                    regime, picks = await run_quant_ai_fallback(dir_mode, min_conf)
+
+                for pk in picks:
+                    sym = str(pk.get("symbol") or "").upper().strip()
+                    dr = str(pk.get("direction") or "").upper().strip()
+                    conf = int(pk.get("confidence") or 0)
+                    if dr not in ("LONG", "SHORT") or conf < min_conf or sym not in TICKER_MAP:
+                        continue
+                    if (dir_mode == "LONG" and dr != "LONG") or (dir_mode == "SHORT" and dr != "SHORT"):
+                        continue
+                    ck = f"{sym}:{dr}"
+                    if AI_COOLDOWN.get(ck, 0) > now_s:
+                        continue
+                    AI_COOLDOWN[ck] = now_s + 900.0
+                    tk = TICKER_MAP[sym]
+                    await emit_signal({
+                        "id": f"AI-{sym}-{dr}-{int(now_s*1000)}",
+                        "engine": "AI_MARKET",
+                        "engineLabel": f"{engine_tag} ({conf}%)",
+                        "symbol": sym, "base": tk["base"], "quote": "USDT", "direction": dr,
+                        "entryPrice": tk["price"], "currentPrice": tk["price"], "peakPrice": tk["price"], "peakPct": 0.0,
+                        "headline": f"🤖 YAPAY ZEKA {dr} (%{conf}) — #{sym}",
+                        "details": [
+                            f"🧠 Rejim: {regime} · Güven: %{conf} ({engine_tag})",
+                            f"💡 Analiz: {pk.get('reason', 'Piyasa & momentum analizi')}",
+                            f"💰 Anlık Fiyat: ${fmt_price(tk['price'])} (24s: {tk['change24h']:+.2f}%)",
+                        ],
+                        "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                    })
             await asyncio.sleep(interval_s)
         except Exception as e:
             _log(f"[AI Piyasa Loop Hatasi] {e}")
