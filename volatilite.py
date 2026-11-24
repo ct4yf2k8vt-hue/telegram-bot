@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 19:09:35 · Rev #3
-# Aktif Motorlar: Formasyon(2/7)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PATTERN
+# Uretim: 22:20:04 · Rev #5
+# Aktif Motorlar: ATH/ATL(1M,1d) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,2b)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP, PUMP15M, AI_MARKET
 # ==============================================================================
 import asyncio
 import base64
@@ -39,13 +39,13 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pump15mThresholdPct": 3.2,
     "pump15mMinRvol": 1.4,
     "athEnabled": False,
-    "atlEnabled": False,
+    "atlEnabled": True,
     "athAtlTimeframes": ["1M", "1d"],
     "athAtlLockPct": 1,
     "athAtlCooldownMin": 5,
     "ma200Enabled": False,
-    "ma200LongEnabled": True,
-    "ma200ShortEnabled": True,
+    "ma200LongEnabled": False,
+    "ma200ShortEnabled": False,
     "ma200Timeframe": "4h",
     "ma200Period": 200,
     "volatilityEnabled": False,
@@ -73,16 +73,16 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityMinMovePct": 1.8,
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
-    "patternsEnabled": True,
-    "patternTimeframes": ["1h"],
+    "patternsEnabled": False,
+    "patternTimeframes": ["15m", "1h", "4h", "1d"],
     "enabledPatterns": {
-        "DOUBLE_BOTTOM": False,
-        "DOUBLE_TOP": False,
+        "DOUBLE_BOTTOM": True,
+        "DOUBLE_TOP": True,
         "HEAD_SHOULDERS": True,
         "INV_HEAD_SHOULDERS": True,
-        "BULL_FLAG": False,
-        "BEAR_FLAG": False,
-        "BEAR_RECTANGLE": False,
+        "BULL_FLAG": True,
+        "BEAR_FLAG": True,
+        "BEAR_RECTANGLE": True,
     },
     "patternMinHeightPct": 1.2,
     "bollingerEnabled": False,
@@ -101,20 +101,39 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "supertrendMultiplier": 3,
     "supertrendLongEnabled": True,
     "supertrendShortEnabled": True,
+    "aiMarketEnabled": False,
+    "aiMarketDirection": "BOTH",
+    "aiMarketIntervalMin": 3,
+    "aiMarketMinConfidence": 72,
+    "multiExchangeEnabled": True,
+    "multiExchangeDirection": "BOTH",
+    "multiExchangeThresholdPct": 1.8,
+    "multiExchangeMinExchanges": 3,
+    "multiExchangeWindowMin": 3,
+    "bigPumpEnabled": True,
+    "bigPumpDirection": "BOTH",
+    "bigPumpThresholdPct": 5,
+    "bigPumpWindowMin": 15,
+    "bigPumpCooldownMin": 10,
+    "bigPumpMinVolUsdt": 100000,
+    "bigPumpExchanges": ["BINANCE", "BINGX"],
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": False,
-        "PUMP15M": False,
+        "PUMP": True,
+        "PUMP15M": True,
         "ATL": False,
         "ATH": False,
         "MA200_4H": False,
         "VOLATILITY": False,
-        "PATTERN": True,
+        "PATTERN": False,
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
+        "AI_MARKET": True,
+        "MULTI_EXCHANGE": False,
+        "BIG_PUMP": False,
     },
 }
 
@@ -128,9 +147,9 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "tradeUsdt": 25,
     "tpPct": 10,
     "slPct": 10,
-    "maxOpenTrades": 999,
+    "maxOpenTrades": 0,
     "rsiMin": 70,
-    "notifyPaperTelegram": True,
+    "notifyPaperTelegram": False,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
@@ -162,6 +181,7 @@ PORT = int(os.getenv("PORT", "10000"))
 BINANCE_API_KEY = _read_env_any("BINANCE_API_KEY")
 BINANCE_API_SECRET = _read_env_any("BINANCE_API_SECRET")
 BINANCE_KEYS_READY = bool(BINANCE_API_KEY and BINANCE_API_SECRET)
+GEMINI_API_KEY = _read_env_any("GEMINI_API_KEY")
 
 if os.getenv("AUTO_TRADE_ENABLED"):
     AUTO_TRADE["enabled"] = os.getenv("AUTO_TRADE_ENABLED", "").lower() in ("1", "true", "yes", "on")
@@ -220,6 +240,15 @@ ATH_ATL_INFLIGHT: Set[str] = set()
 MA200_COOLDOWN: Dict[str, float] = {}
 VOL_COOLDOWN: Dict[str, float] = {}
 IND_COOLDOWN: Dict[str, float] = {}
+MULTI_EX_HIST: Dict[str, Dict[str, deque]] = {}
+MULTI_EX_COOLDOWN: Dict[str, float] = {}
+AI_COOLDOWN: Dict[str, float] = {}
+BIG_PUMP_EXCHANGE_ORDER = ("BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET")
+EXCHANGE_SYMBOL_SETS: Dict[str, Set[str]] = {}
+BIG_PUMP_HIST: Dict[str, deque] = {}
+BIG_PUMP_ALERTS: Dict[str, List[float]] = {}
+BIG_PUMP_COOLDOWN: Dict[str, float] = {}
+BIG_PUMP_INFLIGHT: Set[str] = set()
 TRADE_INFLIGHT: Set[str] = set()
 SUBSCRIBED_CHATS: Set[str] = set(INITIAL_CHAT_IDS)
 
@@ -275,6 +304,7 @@ def apply_strategy_patch(raw: Any) -> None:
         "bollingerEnabled", "bollingerLongEnabled", "bollingerShortEnabled",
         "ichimokuEnabled", "ichimokuLongEnabled", "ichimokuShortEnabled",
         "supertrendEnabled", "supertrendLongEnabled", "supertrendShortEnabled",
+        "aiMarketEnabled", "multiExchangeEnabled", "bigPumpEnabled",
         "hourlyGainersReportEnabled", "dailyWinnerReportEnabled", "top24SummaryReportEnabled",
     ]
     for bk in bool_keys:
@@ -294,6 +324,9 @@ def apply_strategy_patch(raw: Any) -> None:
         "patternMinHeightPct": (0.4, 25.0),
         "bollingerStdDev": (1.0, 4.0),
         "supertrendMultiplier": (1.0, 7.0),
+        "multiExchangeThresholdPct": (0.5, 30.0),
+        "bigPumpThresholdPct": (1.0, 50.0),
+        "bigPumpMinVolUsdt": (1000.0, 100_000_000.0),
     }
     for nk, (lo, hi) in num_bounds.items():
         if nk in raw:
@@ -307,6 +340,12 @@ def apply_strategy_patch(raw: Any) -> None:
         ("ma200Period", 20, 400),
         ("bollingerPeriod", 10, 50),
         ("supertrendAtrPeriod", 5, 30),
+        ("aiMarketIntervalMin", 1, 60),
+        ("aiMarketMinConfidence", 40, 99),
+        ("multiExchangeMinExchanges", 2, 6),
+        ("multiExchangeWindowMin", 1, 60),
+        ("bigPumpWindowMin", 1, 120),
+        ("bigPumpCooldownMin", 1, 120),
     ]:
         if ik in raw:
             try:
@@ -316,6 +355,15 @@ def apply_strategy_patch(raw: Any) -> None:
 
     if raw.get("ma200Timeframe") in ("1h", "4h", "1d"):
         STRATEGY_CONFIG["ma200Timeframe"] = raw["ma200Timeframe"]
+
+    for dkey in ("aiMarketDirection", "multiExchangeDirection", "bigPumpDirection"):
+        dv = str(raw.get(dkey) or "").upper()
+        if dv in ("LONG", "SHORT", "BOTH"):
+            STRATEGY_CONFIG[dkey] = dv
+
+    if isinstance(raw.get("bigPumpExchanges"), list):
+        chosen_ex = [str(ex).strip().upper() for ex in raw["bigPumpExchanges"]]
+        STRATEGY_CONFIG["bigPumpExchanges"] = [ex for ex in BIG_PUMP_EXCHANGE_ORDER if ex in chosen_ex]
 
     if isinstance(raw.get("athAtlTimeframes"), list):
         valid = [tf for tf in raw["athAtlTimeframes"] if tf in ("1h", "4h", "1d", "1w", "1M")]
@@ -345,7 +393,7 @@ def apply_strategy_patch(raw: Any) -> None:
                 STRATEGY_CONFIG["enabledPatterns"][pk] = raw["enabledPatterns"][pk]
 
     if isinstance(raw.get("autoTradeEngines"), dict):
-        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN", "BOLLINGER", "ICHIMOKU", "SUPERTREND"):
+        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN", "BOLLINGER", "ICHIMOKU", "SUPERTREND", "AI_MARKET", "MULTI_EXCHANGE", "BIG_PUMP"):
             if isinstance(raw["autoTradeEngines"].get(ek), bool):
                 STRATEGY_CONFIG["autoTradeEngines"][ek] = raw["autoTradeEngines"][ek]
 
@@ -667,6 +715,63 @@ def render_signal_candle_png(
         draw_line(pad_l, ly, pad_l + plot_w, ly, (56, 189, 248), True)
         fill_rect(pad_l + plot_w + 4, ly - 7, w - 4, ly + 7, (2, 132, 199))
         draw_text(pad_l + plot_w + 8, ly - 3, fmt_price(live_price), (248, 250, 252), 1)
+    return encode_png(w, h, buf)
+
+
+def render_big_pump_png(symbol: str, bars: List[Dict[str, float]], live_price: float) -> bytes:
+    sl = bars[-95:]
+    if not sl:
+        return b""
+    w, h = 860, 420
+    buf, fill_rect, draw_border, _, draw_line, draw_text = _canvas(w, h, (232, 234, 238))
+    pad_l, pad_r, pad_t, pad_b = 16, 96, 34, 34
+    plot_w = w - pad_l - pad_r
+    plot_h = h - pad_t - pad_b
+
+    title_txt = symbol.upper()
+    title_x = max(pad_l, round(pad_l + plot_w / 2 - (len(title_txt) * 12) / 2))
+    draw_text(title_x, 11, title_txt, (24, 28, 36), 2)
+    draw_border(pad_l, pad_t, pad_l + plot_w, pad_t + plot_h, (226, 229, 234), (30, 36, 46))
+
+    prices = [b["high"] for b in sl if b["high"] > 0] + [b["low"] for b in sl if b["low"] > 0]
+    if live_price > 0:
+        prices.append(live_price)
+    if not prices:
+        return b""
+    raw_min, raw_max = min(prices), max(prices)
+    span = max(raw_max - raw_min, raw_min * 0.002)
+    lo_p = raw_min - span * 0.06
+    hi_p = raw_max + span * 0.06
+    rng_p = max(hi_p - lo_p, 1e-12)
+
+    def y_of(p: float) -> int:
+        return max(pad_t + 2, min(pad_t + plot_h - 2, round(pad_t + ((hi_p - p) / rng_p) * plot_h)))
+
+    grid_col, lbl_col = (194, 199, 207), (35, 42, 54)
+    for i in range(1, 7):
+        frac = i / 7.0
+        gy = round(pad_t + plot_h * frac)
+        draw_line(pad_l + 1, gy, pad_l + plot_w - 1, gy, grid_col, True)
+        draw_text(pad_l + plot_w + 6, gy - 3, fmt_price(hi_p - rng_p * frac), lbl_col, 1)
+
+    step = plot_w / len(sl)
+    bw = max(3, int(step * 0.65))
+    dark = (17, 24, 39)
+    for idx, b in enumerate(sl):
+        cx = round(pad_l + (idx + 0.5) * step)
+        if idx > 0 and idx % 15 == 0:
+            draw_line(cx, pad_t + 1, cx, pad_t + plot_h - 1, grid_col, True)
+            tr_dt = datetime.fromtimestamp(b["openTime"], tz=TR_TZ)
+            draw_text(cx - 15, pad_t + plot_h + 8, tr_dt.strftime("%H:%M"), lbl_col, 1)
+        yo, yc, yh, yl = y_of(b["open"]), y_of(b["close"]), y_of(b["high"]), y_of(b["low"])
+        draw_line(cx, yh, cx, yl, dark)
+        top_y = min(yo, yc)
+        bot_y = max(top_y + 1, max(yo, yc))
+        x0, x1 = cx - bw // 2, cx + bw // 2
+        if b["close"] >= b["open"]:
+            draw_border(x0, top_y, x1, bot_y, (255, 255, 255), dark)
+        else:
+            fill_rect(x0, top_y, x1, bot_y, dark)
     return encode_png(w, h, buf)
 
 
@@ -1325,9 +1430,16 @@ async def emit_signal(signal: Dict[str, Any], png: bytes = b"") -> None:
         "BOLLINGER": "📊",
         "ICHIMOKU": "☁️",
         "SUPERTREND": "⚡",
+        "AI_MARKET": "🤖",
+        "MULTI_EXCHANGE": "🌐",
+        "BIG_PUMP": "🟢" if signal["direction"] == "LONG" else "🔴",
     }
     ic = icons.get(signal["engine"], "🟢" if signal["direction"] == "LONG" else "🔴")
-    cap = f"{ic} <b>{esc_html(signal['headline'])}</b>\n\n" + "\n".join(esc_html(l) for l in signal["details"])
+    if signal["engine"] == "BIG_PUMP":
+        ex_line = (signal.get("details") or [""])[0]
+        cap = f"<b>{esc_html(signal['headline'])}</b>\n<b>{esc_html(ex_line)}</b>"
+    else:
+        cap = f"{ic} <b>{esc_html(signal['headline'])}</b>\n\n" + "\n".join(esc_html(l) for l in signal["details"])
     if png:
         await tg_send_photo(png, cap)
     else:
@@ -1686,6 +1798,181 @@ def _ingest_ticker_item(item: Dict[str, Any], now_s: float) -> None:
         if (w7 or w15) and now_s >= VERIFY_COOLDOWN.get(sym, 0):
             VERIFY_COOLDOWN[sym] = now_s + 15.0
             asyncio.create_task(verify_and_emit_pump(t, min7, min15))
+    evaluate_big_pump_for_symbol(t, now_s)
+
+
+def get_exchanges_for_symbol(sym: str) -> List[str]:
+    selected = [str(x).upper() for x in (STRATEGY_CONFIG.get("bigPumpExchanges") or list(BIG_PUMP_EXCHANGE_ORDER))]
+    if not selected:
+        return []
+    out: List[str] = []
+    for ex in BIG_PUMP_EXCHANGE_ORDER:
+        if ex not in selected:
+            continue
+        if ex == "BINANCE":
+            if sym in TICKER_MAP or sym in EXCHANGE_SYMBOL_SETS.get("BINANCE", set()):
+                out.append(ex)
+        elif sym in EXCHANGE_SYMBOL_SETS.get(ex, set()):
+            out.append(ex)
+    return out
+
+
+async def verify_and_emit_big_pump(t: Dict[str, Any], dr: str, pct_override: float, anchor: float) -> None:
+    sym = t["symbol"]
+    ck = f"{sym}:{dr}"
+    if ck in BIG_PUMP_INFLIGHT:
+        return
+    BIG_PUMP_INFLIGHT.add(ck)
+    try:
+        win_m = max(1, int(STRATEGY_CONFIG.get("bigPumpWindowMin", 15)))
+        bars = await fetch_spot_klines(sym, "1m", min(120, max(95, win_m + 30)))
+        live_cur = float((TICKER_MAP.get(sym) or t).get("price") or t["price"])
+        recent = bars[-max(2, win_m):] if bars else []
+        measured = pct_override
+        base_anchor = anchor
+        if len(recent) >= 2:
+            if dr == "LONG":
+                lo = min((b["low"] for b in recent if b["low"] > 0), default=0.0)
+                if lo > 0:
+                    kp = ((live_cur - lo) / lo) * 100.0
+                    if abs(kp) > abs(measured):
+                        measured, base_anchor = kp, lo
+            else:
+                hi = max((b["high"] for b in recent if b["high"] > 0), default=0.0)
+                if hi > 0:
+                    kp = ((live_cur - hi) / hi) * 100.0
+                    if abs(kp) > abs(measured):
+                        measured, base_anchor = kp, hi
+        thresh = max(1.0, float(STRATEGY_CONFIG.get("bigPumpThresholdPct", 5.0)))
+        now_s = time.time()
+        if abs(measured) < thresh or BIG_PUMP_COOLDOWN.get(ck, 0) > now_s:
+            return
+        ex_list = get_exchanges_for_symbol(sym)
+        if not ex_list:
+            return
+        BIG_PUMP_COOLDOWN[ck] = now_s + max(1, int(STRATEGY_CONFIG.get("bigPumpCooldownMin", 10))) * 60.0
+        al = BIG_PUMP_ALERTS.setdefault(sym, [])
+        cutoff = now_s - 86400.0
+        al[:] = [x for x in al if x >= cutoff] + [now_s]
+        alert_num = len(al)
+        png = render_big_pump_png(sym, bars, live_cur) if len(bars) > 5 else b""
+        icon = "🔴" if dr == "SHORT" else "🟢"
+        sign_pfx = "+ " if measured >= 0 else "- "
+        headline = f"{icon}#{t['base']}: {sign_pfx}{abs(measured):.2f}%. 🔔 {alert_num}"
+        await emit_signal({
+            "id": f"BIGPUMP-{sym}-{dr}-{int(now_s * 1000)}",
+            "engine": "BIG_PUMP",
+            "engineLabel": f"Big Pumps ({win_m}dk)",
+            "symbol": sym, "base": t["base"], "quote": "USDT", "direction": dr, "timeframe": "1m",
+            "entryPrice": live_cur, "currentPrice": live_cur, "peakPrice": live_cur, "peakPct": 0.0,
+            "headline": headline,
+            "details": [
+                " ".join(ex_list),
+                f"📊 {win_m} dk Hareket: {measured:+.2f}% | Başlangıç: ${fmt_price(base_anchor)} ➡️ Anlık: ${fmt_price(live_cur)}",
+            ],
+            "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+        }, png)
+    except Exception as e:
+        _log(f"[Big Pump Hatasi ({sym})] {e}")
+    finally:
+        BIG_PUMP_INFLIGHT.discard(ck)
+
+
+def evaluate_big_pump_for_symbol(t: Dict[str, Any], now_s: float) -> None:
+    if not BOT_RUNNING or not STRATEGY_CONFIG.get("bigPumpEnabled"):
+        return
+    sym = t["symbol"]
+    win_m = max(1, int(STRATEGY_CONFIG.get("bigPumpWindowMin", 15)))
+    dq = BIG_PUMP_HIST.setdefault(sym, deque(maxlen=240))
+    if not dq or (now_s - dq[-1][0]) >= 5.0:
+        dq.append((now_s, t["price"]))
+    else:
+        dq[-1] = (dq[-1][0], t["price"])
+    cutoff = now_s - win_m * 60.0
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+    if len(dq) < 2 or t["volume24h"] < float(STRATEGY_CONFIG.get("bigPumpMinVolUsdt", 100000.0)):
+        return
+    if not get_exchanges_for_symbol(sym):
+        return
+    min_pt = min(dq, key=lambda x: x[1])
+    max_pt = max(dq, key=lambda x: x[1])
+    up_pct = ((t["price"] - min_pt[1]) / min_pt[1]) * 100.0 if min_pt[1] > 0 else 0.0
+    dn_pct = ((t["price"] - max_pt[1]) / max_pt[1]) * 100.0 if max_pt[1] > 0 else 0.0
+    thresh = max(1.0, float(STRATEGY_CONFIG.get("bigPumpThresholdPct", 5.0)))
+    dm = str(STRATEGY_CONFIG.get("bigPumpDirection", "BOTH")).upper()
+    hit_l = dm != "SHORT" and up_pct >= thresh
+    hit_s = dm != "LONG" and abs(dn_pct) >= thresh
+    if not hit_l and not hit_s:
+        return
+    if hit_s and (not hit_l or abs(dn_pct) >= abs(up_pct)):
+        dr, chosen, anchor = "SHORT", dn_pct, max_pt[1]
+    else:
+        dr, chosen, anchor = "LONG", up_pct, min_pt[1]
+    ck = f"{sym}:{dr}"
+    if BIG_PUMP_COOLDOWN.get(ck, 0) <= now_s and ck not in BIG_PUMP_INFLIGHT:
+        asyncio.create_task(verify_and_emit_big_pump(t, dr, chosen, anchor))
+
+
+async def refresh_exchange_memberships_loop() -> None:
+    while True:
+        try:
+            async def _fetch_set(name: str, url: str) -> None:
+                st, raw = await http_get_json(url, timeout_s=8.0)
+                if st != 200:
+                    return
+                s: Set[str] = set()
+                if name == "BYBIT" and isinstance(raw, dict):
+                    for x in (raw.get("result") or {}).get("list") or []:
+                        sym = str(x.get("symbol") or "")
+                        if sym.endswith("USDT") and float(x.get("lastPrice") or 0) > 0:
+                            s.add(sym)
+                elif name == "MEXC" and isinstance(raw, list):
+                    for x in raw:
+                        sym = str(x.get("symbol") or "")
+                        if sym.endswith("USDT") and float(x.get("lastPrice") or 0) > 0:
+                            s.add(sym)
+                elif name == "GATE" and isinstance(raw, list):
+                    for x in raw:
+                        p = str(x.get("currency_pair") or "")
+                        if p.endswith("_USDT") and float(x.get("last") or 0) > 0:
+                            s.add(p.replace("_USDT", "USDT"))
+                elif name == "OKX" and isinstance(raw, dict):
+                    for x in raw.get("data") or []:
+                        inst = str(x.get("instId") or "")
+                        if inst.endswith("-USDT") and float(x.get("last") or 0) > 0:
+                            s.add(inst.replace("-USDT", "USDT"))
+                elif name == "KUCOIN" and isinstance(raw, dict):
+                    for x in (raw.get("data") or {}).get("ticker") or []:
+                        sym = str(x.get("symbol") or "")
+                        if sym.endswith("-USDT") and float(x.get("last") or 0) > 0:
+                            s.add(sym.replace("-USDT", "USDT"))
+                elif name == "BINGX" and isinstance(raw, dict):
+                    for x in (raw.get("data") or {}).get("symbols") or []:
+                        sym = str(x.get("symbol") or "")
+                        if sym.endswith("-USDT"):
+                            s.add(sym.replace("-USDT", "USDT"))
+                elif name == "BITGET" and isinstance(raw, dict):
+                    for x in raw.get("data") or []:
+                        sym = str(x.get("symbol") or "")
+                        if sym.endswith("USDT") and float(x.get("lastPr") or 0) > 0:
+                            s.add(sym)
+                if len(s) > 20:
+                    EXCHANGE_SYMBOL_SETS[name] = s
+
+            await asyncio.gather(
+                _fetch_set("BYBIT", "https://api.bybit.com/v5/market/tickers?category=spot"),
+                _fetch_set("MEXC", "https://api.mexc.com/api/v3/ticker/24hr"),
+                _fetch_set("GATE", "https://api.gateio.ws/api/v4/spot/tickers"),
+                _fetch_set("OKX", "https://www.okx.com/api/v5/market/tickers?instType=SPOT"),
+                _fetch_set("KUCOIN", "https://api.kucoin.com/api/v1/market/allTickers"),
+                _fetch_set("BINGX", "https://open-api.bingx.com/openApi/spot/v1/common/symbols"),
+                _fetch_set("BITGET", "https://api.bitget.com/api/v2/spot/market/tickers"),
+                return_exceptions=True,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(900)
 
 
 def _ws_read_exact(sock: ssl.SSLSocket, n: int) -> bytes:
@@ -2125,6 +2412,202 @@ async def advanced_strategies_loop() -> None:
         await asyncio.sleep(25)
 
 
+async def multi_exchange_loop() -> None:
+    async def fetch_ex_prices(name: str, url: str) -> Tuple[str, Dict[str, float]]:
+        out: Dict[str, float] = {}
+        try:
+            st, raw = await http_get_json(url, timeout_s=8.0)
+            if st != 200:
+                return name, out
+            if name == "MEXC" and isinstance(raw, list):
+                for x in raw:
+                    sym = str(x.get("symbol") or "")
+                    p = float(x.get("lastPrice") or 0)
+                    if sym.endswith("USDT") and p > 0 and float(x.get("quoteVolume") or 0) >= 100000:
+                        out[sym] = p
+            elif name == "Bybit" and isinstance(raw, dict):
+                for x in (raw.get("result") or {}).get("list") or []:
+                    sym = str(x.get("symbol") or "")
+                    p = float(x.get("lastPrice") or 0)
+                    if sym.endswith("USDT") and p > 0 and float(x.get("turnover24h") or 0) >= 100000:
+                        out[sym] = p
+            elif name == "Gate" and isinstance(raw, list):
+                for x in raw:
+                    pair = str(x.get("currency_pair") or "")
+                    p = float(x.get("last") or 0)
+                    if pair.endswith("_USDT") and p > 0 and float(x.get("quote_volume") or 0) >= 100000:
+                        out[pair.replace("_USDT", "USDT")] = p
+            elif name == "OKX" and isinstance(raw, dict):
+                for x in raw.get("data") or []:
+                    inst = str(x.get("instId") or "")
+                    p = float(x.get("last") or 0)
+                    if inst.endswith("-USDT") and p > 0 and float(x.get("volCcy24h") or 0) >= 100000:
+                        out[inst.replace("-USDT", "USDT")] = p
+            elif name == "KuCoin" and isinstance(raw, dict):
+                for x in (raw.get("data") or {}).get("ticker") or []:
+                    sym = str(x.get("symbol") or "")
+                    p = float(x.get("last") or 0)
+                    if sym.endswith("-USDT") and p > 0 and float(x.get("volValue") or 0) >= 100000:
+                        out[sym.replace("-USDT", "USDT")] = p
+        except Exception:
+            pass
+        return name, out
+
+    while True:
+        try:
+            if BOT_RUNNING and STRATEGY_CONFIG.get("multiExchangeEnabled"):
+                now_s = time.time()
+                win_s = max(60.0, float(STRATEGY_CONFIG.get("multiExchangeWindowMin", 5)) * 60.0)
+                min_ex = max(2, int(STRATEGY_CONFIG.get("multiExchangeMinExchanges", 3)))
+                thresh = max(0.5, float(STRATEGY_CONFIG.get("multiExchangeThresholdPct", 2.5)))
+                dir_mode = str(STRATEGY_CONFIG.get("multiExchangeDirection", "BOTH")).upper()
+                allow_long = dir_mode != "SHORT"
+                allow_short = dir_mode != "LONG"
+
+                feeds: List[Tuple[str, Dict[str, float]]] = []
+                bin_map = {sym: t["price"] for sym, t in TICKER_MAP.items() if t.get("price", 0) > 0 and t.get("volume24h", 0) >= 150000}
+                if bin_map:
+                    feeds.append(("Binance", bin_map))
+                fetched = await asyncio.gather(
+                    fetch_ex_prices("MEXC", "https://api.mexc.com/api/v3/ticker/24hr"),
+                    fetch_ex_prices("Bybit", "https://api.bybit.com/v5/market/tickers?category=spot"),
+                    fetch_ex_prices("Gate", "https://api.gateio.ws/api/v4/spot/tickers"),
+                    fetch_ex_prices("OKX", "https://www.okx.com/api/v5/market/tickers?instType=SPOT"),
+                    fetch_ex_prices("KuCoin", "https://api.kucoin.com/api/v1/market/allTickers"),
+                )
+                for ex_name, ex_map in fetched:
+                    if len(ex_map) > 20:
+                        feeds.append((ex_name, ex_map))
+
+                for ex_name, ex_map in feeds:
+                    for sym, p in ex_map.items():
+                        s_hist = MULTI_EX_HIST.setdefault(sym, {})
+                        dq = s_hist.setdefault(ex_name, deque(maxlen=120))
+                        dq.append((now_s, p))
+                        while dq and (now_s - dq[0][0]) > win_s + 30.0:
+                            dq.popleft()
+
+                for sym, s_hist in list(MULTI_EX_HIST.items()):
+                    if len(s_hist) < min_ex:
+                        continue
+                    up_hits: List[Tuple[str, float, float]] = []
+                    dn_hits: List[Tuple[str, float, float]] = []
+                    for ex_name, dq in s_hist.items():
+                        if len(dq) < 2 or (now_s - dq[-1][0]) > 45.0 or dq[0][1] <= 0:
+                            continue
+                        pct = ((dq[-1][1] - dq[0][1]) / dq[0][1]) * 100.0
+                        if thresh <= pct <= 60.0:
+                            up_hits.append((ex_name, pct, dq[-1][1]))
+                        elif -60.0 <= pct <= -thresh:
+                            dn_hits.append((ex_name, pct, dq[-1][1]))
+
+                    for dr, hits in (("LONG", up_hits), ("SHORT", dn_hits)):
+                        if (dr == "LONG" and not allow_long) or (dr == "SHORT" and not allow_short):
+                            continue
+                        if len(hits) < min_ex:
+                            continue
+                        ck = f"{sym}:{dr}"
+                        if MULTI_EX_COOLDOWN.get(ck, 0) > now_s:
+                            continue
+                        MULTI_EX_COOLDOWN[ck] = now_s + 900.0
+                        avg_pct = sum(h[1] for h in hits) / len(hits)
+                        avg_p = sum(h[2] for h in hits) / len(hits)
+                        ref_p = (TICKER_MAP.get(sym) or {}).get("price") or avg_p
+                        ex_txt = " | ".join(f"{h[0]}: {h[1]:+.2f}%" for h in sorted(hits, key=lambda x: abs(x[1]), reverse=True))
+                        await emit_signal({
+                            "id": f"MX-{sym}-{dr}-{int(now_s*1000)}",
+                            "engine": "MULTI_EXCHANGE",
+                            "engineLabel": f"Tüm Borsalar ({len(hits)}/{len(feeds)})",
+                            "symbol": sym, "base": sym[:-4], "quote": "USDT", "direction": dr,
+                            "entryPrice": ref_p, "currentPrice": ref_p, "peakPrice": ref_p, "peakPct": 0.0,
+                            "headline": f"🌐 TÜM BORSALARDA ANİ {'YÜKSELİŞ' if dr == 'LONG' else 'DÜŞÜŞ'} ({len(hits)}/{len(feeds)} Borsa) — #{sym}",
+                            "details": [
+                                f"📊 {int(STRATEGY_CONFIG.get('multiExchangeWindowMin', 5))} dk Ort. Hareket: {avg_pct:+.2f}% · Anlık: ${fmt_price(ref_p)}",
+                                f"🏦 Eş Zamanlı Borsalar: {ex_txt}",
+                            ],
+                            "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                        })
+        except Exception as e:
+            _log(f"[Tum Borsalar Loop Hatasi] {e}")
+        await asyncio.sleep(20)
+
+
+async def ai_market_loop() -> None:
+    while True:
+        try:
+            interval_s = max(60.0, float(STRATEGY_CONFIG.get("aiMarketIntervalMin", 5)) * 60.0)
+            if BOT_RUNNING and STRATEGY_CONFIG.get("aiMarketEnabled") and GEMINI_API_KEY and len(TICKER_MAP) >= 15:
+                usdt = [t for t in TICKER_MAP.values() if t.get("volume24h", 0) >= 250000]
+                top_v = sorted(usdt, key=lambda x: x["volume24h"], reverse=True)[:12]
+                top_g = sorted(usdt, key=lambda x: x["change24h"], reverse=True)[:12]
+                top_d = sorted(usdt, key=lambda x: x["change24h"])[:10]
+                seen: Set[str] = set()
+                sample: List[Dict[str, Any]] = []
+                for lst in (top_v, top_g, top_d):
+                    for it in lst:
+                        if it["symbol"] not in seen:
+                            seen.add(it["symbol"])
+                            sample.append(it)
+                lines = [
+                    f"{t['symbol']}|p={fmt_price(t['price'])}|24s={t['change24h']:+.2f}%|hacim=${int(t['volume24h']/1000)}K"
+                    for t in sample[:30]
+                ]
+                dir_mode = str(STRATEGY_CONFIG.get("aiMarketDirection", "BOTH")).upper()
+                min_conf = int(STRATEGY_CONFIG.get("aiMarketMinConfidence", 70))
+                prompt = (
+                    f"Canli kripto piyasasini analiz et ve su an en olumlu en fazla 3 islem sec. Yon={dir_mode}, MinGuven={min_conf}.\n"
+                    'Yalnizca JSON dondur: {"marketRegime":"...","summary":"...","picks":[{"symbol":"BTCUSDT","direction":"LONG","confidence":82,"reason":"..."}]}\n'
+                    + "\n".join(lines)
+                )
+                body = json.dumps({
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"responseMimeType": "application/json"},
+                }).encode("utf-8")
+                st, raw = await http_request(
+                    "POST",
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent",
+                    headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+                    body=body,
+                    timeout_s=25.0,
+                )
+                js = _safe_json_loads(raw)
+                if st == 200 and isinstance(js, dict):
+                    txt = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [{}])[0].get("text") or "{}"
+                    parsed = json.loads(txt)
+                    now_s = time.time()
+                    for pk in parsed.get("picks") or []:
+                        sym = str(pk.get("symbol") or "").upper().strip()
+                        dr = str(pk.get("direction") or "").upper().strip()
+                        conf = int(pk.get("confidence") or 0)
+                        if dr not in ("LONG", "SHORT") or conf < min_conf or sym not in TICKER_MAP:
+                            continue
+                        if (dir_mode == "LONG" and dr != "LONG") or (dir_mode == "SHORT" and dr != "SHORT"):
+                            continue
+                        ck = f"{sym}:{dr}"
+                        if AI_COOLDOWN.get(ck, 0) > now_s:
+                            continue
+                        AI_COOLDOWN[ck] = now_s + 900.0
+                        tk = TICKER_MAP[sym]
+                        await emit_signal({
+                            "id": f"AI-{sym}-{dr}-{int(now_s*1000)}",
+                            "engine": "AI_MARKET",
+                            "engineLabel": f"Yapay Zeka AI ({conf}%)",
+                            "symbol": sym, "base": tk["base"], "quote": "USDT", "direction": dr,
+                            "entryPrice": tk["price"], "currentPrice": tk["price"], "peakPrice": tk["price"], "peakPct": 0.0,
+                            "headline": f"🤖 YAPAY ZEKA {dr} (%{conf}) — #{sym}",
+                            "details": [
+                                f"🧠 Rejim: {parsed.get('marketRegime', 'Canlı Analiz')} · Güven: %{conf}",
+                                f"💡 Analiz: {pk.get('reason', 'Piyasa & momentum analizi')}",
+                                f"💰 Anlık Fiyat: ${fmt_price(tk['price'])} (24s: {tk['change24h']:+.2f}%)",
+                            ],
+                            "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                        })
+            await asyncio.sleep(interval_s)
+        except Exception as e:
+            _log(f"[AI Piyasa Loop Hatasi] {e}")
+            await asyncio.sleep(60)
+
+
 async def web_config_sync_loop() -> None:
     if not WEB_SYNC_URL:
         return
@@ -2307,7 +2790,8 @@ async def telegram_command_loop() -> None:
                         f"• Pump: {STRATEGY_CONFIG['pumpEnabled']} | 15m: {STRATEGY_CONFIG['pump15mEnabled']} | RSI≥{AUTO_TRADE['rsiMin']}\n"
                         f"• ATL/ATH ({','.join(STRATEGY_CONFIG['athAtlTimeframes'])}): {STRATEGY_CONFIG['atlEnabled']}/{STRATEGY_CONFIG['athEnabled']}\n"
                         f"• MA200: {STRATEGY_CONFIG['ma200Enabled']} | Vol: {STRATEGY_CONFIG['volatilityEnabled']} | Formasyon: {STRATEGY_CONFIG['patternsEnabled']}\n"
-                        f"• BB ({','.join(STRATEGY_CONFIG.get('bollingerTimeframes', []))}): {STRATEGY_CONFIG.get('bollingerEnabled')} | Ichi ({','.join(STRATEGY_CONFIG.get('ichimokuTimeframes', []))}): {STRATEGY_CONFIG.get('ichimokuEnabled')} | ST ({','.join(STRATEGY_CONFIG.get('supertrendTimeframes', []))}): {STRATEGY_CONFIG.get('supertrendEnabled')}"
+                        f"• BB ({','.join(STRATEGY_CONFIG.get('bollingerTimeframes', []))}): {STRATEGY_CONFIG.get('bollingerEnabled')} | Ichi ({','.join(STRATEGY_CONFIG.get('ichimokuTimeframes', []))}): {STRATEGY_CONFIG.get('ichimokuEnabled')} | ST ({','.join(STRATEGY_CONFIG.get('supertrendTimeframes', []))}): {STRATEGY_CONFIG.get('supertrendEnabled')}\n"
+                        f"• AI: {STRATEGY_CONFIG.get('aiMarketEnabled')} ({STRATEGY_CONFIG.get('aiMarketDirection', 'BOTH')}) | TumBorsalar: {STRATEGY_CONFIG.get('multiExchangeEnabled')} ({STRATEGY_CONFIG.get('multiExchangeDirection', 'BOTH')}) | BigPumps: {STRATEGY_CONFIG.get('bigPumpEnabled')} ({','.join(STRATEGY_CONFIG.get('bigPumpExchanges', []))})"
                         + (f"\n• Son TG Hata: {esc_html(LAST_TG_ERROR)}" if LAST_TG_ERROR else ""),
                         cid,
                     )
@@ -2331,6 +2815,9 @@ async def telegram_command_loop() -> None:
                         "BB": "bollingerEnabled", "BOLLINGER": "bollingerEnabled",
                         "ICHI": "ichimokuEnabled", "ICHIMOKU": "ichimokuEnabled",
                         "ST": "supertrendEnabled", "SUPERTREND": "supertrendEnabled",
+                        "AI": "aiMarketEnabled", "AI_MARKET": "aiMarketEnabled",
+                        "BORSA": "multiExchangeEnabled", "MULTI_EXCHANGE": "multiExchangeEnabled",
+                        "BIGPUMP": "bigPumpEnabled", "BIG_PUMP": "bigPumpEnabled",
                     }
                     if key in m:
                         STRATEGY_CONFIG[m[key]] = val
@@ -2462,9 +2949,12 @@ async def main() -> None:
     await asyncio.gather(
         binance_ws_loop(),
         refresh_symbols_loop(),
+        refresh_exchange_memberships_loop(),
         market_loop(),
         ath_atl_loop(),
         advanced_strategies_loop(),
+        multi_exchange_loop(),
+        ai_market_loop(),
         web_config_sync_loop(),
         reports_loop(),
         telegram_command_loop(),
