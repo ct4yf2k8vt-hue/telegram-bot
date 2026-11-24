@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 22:25:35 · Rev #4
+# Uretim: 22:38:53 · Rev #4
 # Aktif Motorlar: AI(BOTH,3dk) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,1b)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP, PUMP15M, AI_MARKET
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): AI_MARKET, MULTI_EXCHANGE, BIG_PUMP
 # ==============================================================================
 import asyncio
 import base64
@@ -121,8 +121,8 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": True,
-        "PUMP15M": True,
+        "PUMP": False,
+        "PUMP15M": False,
         "ATL": False,
         "ATH": False,
         "MA200_4H": False,
@@ -132,8 +132,8 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "ICHIMOKU": False,
         "SUPERTREND": False,
         "AI_MARKET": True,
-        "MULTI_EXCHANGE": False,
-        "BIG_PUMP": False,
+        "MULTI_EXCHANGE": True,
+        "BIG_PUMP": True,
     },
 }
 
@@ -149,7 +149,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "slPct": 10,
     "maxOpenTrades": 0,
     "rsiMin": 70,
-    "notifyPaperTelegram": False,
+    "notifyPaperTelegram": True,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
