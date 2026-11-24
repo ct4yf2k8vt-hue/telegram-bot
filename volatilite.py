@@ -1,7 +1,7 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 22:23:01 · Rev #8
-# Aktif Motorlar: Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,2b)
+# Uretim: 22:25:35 · Rev #4
+# Aktif Motorlar: AI(BOTH,3dk) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,1b)
 # Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP, PUMP15M, AI_MARKET
 # ==============================================================================
 import asyncio
@@ -101,7 +101,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "supertrendMultiplier": 3,
     "supertrendLongEnabled": True,
     "supertrendShortEnabled": True,
-    "aiMarketEnabled": False,
+    "aiMarketEnabled": True,
     "aiMarketDirection": "BOTH",
     "aiMarketIntervalMin": 3,
     "aiMarketMinConfidence": 72,
@@ -116,7 +116,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "bigPumpWindowMin": 15,
     "bigPumpCooldownMin": 10,
     "bigPumpMinVolUsdt": 100000,
-    "bigPumpExchanges": ["BINANCE", "BINGX"],
+    "bigPumpExchanges": ["BINANCE"],
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
