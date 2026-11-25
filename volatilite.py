@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 15:55:22 · Rev #3
-# Aktif Motorlar: ATH/ATL(1M) | AI(BOTH,15dk)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): Secili Yok
+# Uretim: 16:14:15 · Rev #2
+# Aktif Motorlar: ATH/ATL(1M) | AI(BOTH,15dk) | BuyumeDCA(-5/13/34%,TP>=%2.5)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP, PUMP15M, AI_MARKET, GROWTH_DCA
 # ==============================================================================
 import asyncio
 import base64
@@ -105,6 +105,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "aiMarketDirection": "BOTH",
     "aiMarketIntervalMin": 15,
     "aiMarketMinConfidence": 72,
+    "aiMarketNotifyTelegram": True,
     "multiExchangeEnabled": False,
     "multiExchangeDirection": "BOTH",
     "multiExchangeThresholdPct": 1.8,
@@ -117,12 +118,20 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "bigPumpCooldownMin": 10,
     "bigPumpMinVolUsdt": 100000,
     "bigPumpExchanges": ["BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET"],
+    "growthDcaEnabled": True,
+    "growthDcaTpPct": 2.5,
+    "growthDcaDrop1Pct": 5,
+    "growthDcaDrop2Pct": 13,
+    "growthDcaDrop3Pct": 34,
+    "growthDcaSizeScale": 2,
+    "growthDcaMinVolUsdt": 300000,
+    "growthDcaCooldownMin": 60,
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": False,
-        "PUMP15M": False,
+        "PUMP": True,
+        "PUMP15M": True,
         "ATL": False,
         "ATH": False,
         "MA200_4H": False,
@@ -131,9 +140,10 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
-        "AI_MARKET": False,
+        "AI_MARKET": True,
         "MULTI_EXCHANGE": False,
         "BIG_PUMP": False,
+        "GROWTH_DCA": True,
     },
 }
 
@@ -149,7 +159,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "slPct": 10,
     "maxOpenTrades": 0,
     "rsiMin": 70,
-    "notifyPaperTelegram": True,
+    "notifyPaperTelegram": False,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
@@ -243,6 +253,7 @@ IND_COOLDOWN: Dict[str, float] = {}
 MULTI_EX_HIST: Dict[str, Dict[str, deque]] = {}
 MULTI_EX_COOLDOWN: Dict[str, float] = {}
 AI_COOLDOWN: Dict[str, float] = {}
+GROWTH_DCA_COOLDOWN: Dict[str, float] = {}
 GEMINI_MODELS = ("gemini-3.1-flash-lite", "gemini-4-hydrogen")
 GEMINI_MODEL_BLOCKED_UNTIL: Dict[str, float] = {}
 BIG_PUMP_EXCHANGE_ORDER = ("BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET")
@@ -306,7 +317,7 @@ def apply_strategy_patch(raw: Any) -> None:
         "bollingerEnabled", "bollingerLongEnabled", "bollingerShortEnabled",
         "ichimokuEnabled", "ichimokuLongEnabled", "ichimokuShortEnabled",
         "supertrendEnabled", "supertrendLongEnabled", "supertrendShortEnabled",
-        "aiMarketEnabled", "multiExchangeEnabled", "bigPumpEnabled",
+        "aiMarketEnabled", "aiMarketNotifyTelegram", "multiExchangeEnabled", "bigPumpEnabled", "growthDcaEnabled",
         "hourlyGainersReportEnabled", "dailyWinnerReportEnabled", "top24SummaryReportEnabled",
     ]
     for bk in bool_keys:
@@ -329,6 +340,12 @@ def apply_strategy_patch(raw: Any) -> None:
         "multiExchangeThresholdPct": (0.5, 30.0),
         "bigPumpThresholdPct": (1.0, 50.0),
         "bigPumpMinVolUsdt": (1000.0, 100_000_000.0),
+        "growthDcaTpPct": (2.0, 50.0),
+        "growthDcaDrop1Pct": (1.0, 30.0),
+        "growthDcaDrop2Pct": (2.0, 60.0),
+        "growthDcaDrop3Pct": (5.0, 85.0),
+        "growthDcaSizeScale": (1.0, 5.0),
+        "growthDcaMinVolUsdt": (10000.0, 100_000_000.0),
     }
     for nk, (lo, hi) in num_bounds.items():
         if nk in raw:
@@ -348,6 +365,7 @@ def apply_strategy_patch(raw: Any) -> None:
         ("multiExchangeWindowMin", 1, 60),
         ("bigPumpWindowMin", 1, 120),
         ("bigPumpCooldownMin", 1, 120),
+        ("growthDcaCooldownMin", 5, 1440),
     ]:
         if ik in raw:
             try:
@@ -395,7 +413,7 @@ def apply_strategy_patch(raw: Any) -> None:
                 STRATEGY_CONFIG["enabledPatterns"][pk] = raw["enabledPatterns"][pk]
 
     if isinstance(raw.get("autoTradeEngines"), dict):
-        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN", "BOLLINGER", "ICHIMOKU", "SUPERTREND", "AI_MARKET", "MULTI_EXCHANGE", "BIG_PUMP"):
+        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN", "BOLLINGER", "ICHIMOKU", "SUPERTREND", "AI_MARKET", "MULTI_EXCHANGE", "BIG_PUMP", "GROWTH_DCA"):
             if isinstance(raw["autoTradeEngines"].get(ek), bool):
                 STRATEGY_CONFIG["autoTradeEngines"][ek] = raw["autoTradeEngines"][ek]
 
@@ -1339,8 +1357,11 @@ async def maybe_execute_auto_trade(signal: Dict[str, Any]) -> None:
     TRADE_INFLIGHT.add(sym)
     try:
         ref_p = signal["entryPrice"]
-        tp_mult = (1 - AUTO_TRADE["tpPct"] / 100.0) if dir_side == "SHORT" else (1 + AUTO_TRADE["tpPct"] / 100.0)
+        eff_tp_pct = max(2.0, float(STRATEGY_CONFIG.get("growthDcaTpPct", 2.5))) if signal["engine"] == "GROWTH_DCA" else AUTO_TRADE["tpPct"]
+        tp_mult = (1 - eff_tp_pct / 100.0) if dir_side == "SHORT" else (1 + eff_tp_pct / 100.0)
         sl_mult = (1 + AUTO_TRADE["slPct"] / 100.0) if dir_side == "SHORT" else (1 - AUTO_TRADE["slPct"] / 100.0)
+        allow_ai_tg = bool(STRATEGY_CONFIG.get("aiMarketNotifyTelegram", True))
+        ai_prefix = "🤖 [YAPAY ZEKA ALIM] " if signal["engine"] == "AI_MARKET" else ""
 
         if mode == "PAPER":
             qty = round_step(notional / ref_p, flt["stepSize"])
@@ -1361,11 +1382,11 @@ async def maybe_execute_auto_trade(signal: Dict[str, Any]) -> None:
             }
             TRADES.insert(0, tr)
             save_state()
-            if AUTO_TRADE["notifyPaperTelegram"]:
+            if AUTO_TRADE["notifyPaperTelegram"] or (signal["engine"] == "AI_MARKET" and allow_ai_tg):
                 await tg_send_text(
-                    f"{'🟢' if dir_side == 'LONG' else '🔴'} <b>FUTURES {lev}x {dir_side} AÇILDI (PAPER · {esc_html(signal['engineLabel'])})</b>\n"
+                    f"{'🟢' if dir_side == 'LONG' else '🔴'} <b>{ai_prefix}FUTURES {lev}x {dir_side} AÇILDI (PAPER · {esc_html(signal['engineLabel'])})</b>\n"
                     f"• #{esc_html(sym)} · Teminat: ${actual_margin:.2f} | Giriş: ${fmt_price(ref_p)}\n"
-                    f"🎯 TP: <b>${fmt_price(tp_p)}</b> | 🛑 SL: <b>${fmt_price(sl_p)}</b>",
+                    f"🎯 TP (+%{eff_tp_pct:.1f}): <b>${fmt_price(tp_p)}</b> | 🛑 SL: <b>${fmt_price(sl_p)}</b>",
                 )
             return
 
@@ -1416,11 +1437,12 @@ async def maybe_execute_auto_trade(signal: Dict[str, Any]) -> None:
         }
         TRADES.insert(0, tr)
         save_state()
-        await tg_send_text(
-            f"{'🟢' if dir_side == 'LONG' else '🔴'} <b>FUTURES {lev}x {dir_side} AÇILDI ({mode} · {esc_html(signal['engineLabel'])})</b>\n"
-            f"• #{esc_html(sym)} · Miktar: {qty_str} | Giriş: ${fmt_price(entry_p)}\n"
-            f"🎯 +{AUTO_TRADE['tpPct']}% TP: <b>${tp_str}</b> | 🛑 -{AUTO_TRADE['slPct']}% SL: <b>${sl_str}</b>",
-        )
+        if signal["engine"] != "AI_MARKET" or allow_ai_tg:
+            await tg_send_text(
+                f"{'🟢' if dir_side == 'LONG' else '🔴'} <b>{ai_prefix}FUTURES {lev}x {dir_side} AÇILDI ({mode} · {esc_html(signal['engineLabel'])})</b>\n"
+                f"• #{esc_html(sym)} · Miktar: {qty_str} | Giriş: ${fmt_price(entry_p)}\n"
+                f"🎯 +{eff_tp_pct:.1f}% TP: <b>${tp_str}</b> | 🛑 -{AUTO_TRADE['slPct']}% SL: <b>${sl_str}</b>",
+            )
     except Exception as e:
         await tg_send_text(f"⚠️ <b>Futures Oto İşlem Hatası (#{esc_html(sym)})</b>\n{esc_html(str(e))}")
     finally:
@@ -1444,6 +1466,7 @@ async def emit_signal(signal: Dict[str, Any], png: bytes = b"") -> None:
         "SUPERTREND": "⚡",
         "AI_MARKET": "🤖",
         "MULTI_EXCHANGE": "🌐",
+        "GROWTH_DCA": "🌱",
         "BIG_PUMP": "🟢" if signal["direction"] == "LONG" else "🔴",
     }
     ic = icons.get(signal["engine"], "🟢" if signal["direction"] == "LONG" else "🔴")
@@ -1452,10 +1475,12 @@ async def emit_signal(signal: Dict[str, Any], png: bytes = b"") -> None:
         cap = f"<b>{esc_html(signal['headline'])}</b>\n<b>{esc_html(ex_line)}</b>"
     else:
         cap = f"{ic} <b>{esc_html(signal['headline'])}</b>\n\n" + "\n".join(esc_html(l) for l in signal["details"])
-    if png:
-        await tg_send_photo(png, cap)
-    else:
-        await tg_send_text(cap)
+    allow_tg = signal["engine"] != "AI_MARKET" or bool(STRATEGY_CONFIG.get("aiMarketNotifyTelegram", True))
+    if allow_tg:
+        if png:
+            await tg_send_photo(png, cap)
+        else:
+            await tg_send_text(cap)
     await maybe_execute_auto_trade(signal)
 
 
@@ -2706,6 +2731,88 @@ async def ai_market_loop() -> None:
             await asyncio.sleep(60)
 
 
+async def growth_dca_loop() -> None:
+    while True:
+        try:
+            if BOT_RUNNING and STRATEGY_CONFIG.get("growthDcaEnabled") and len(TICKER_MAP) >= 15:
+                min_vol = float(STRATEGY_CONFIG.get("growthDcaMinVolUsdt", 250_000))
+                tp_pct = max(2.0, float(STRATEGY_CONFIG.get("growthDcaTpPct", 2.5)))
+                d1 = float(STRATEGY_CONFIG.get("growthDcaDrop1Pct", 5.0))
+                d2 = float(STRATEGY_CONFIG.get("growthDcaDrop2Pct", 13.0))
+                d3 = float(STRATEGY_CONFIG.get("growthDcaDrop3Pct", 34.0))
+                scale = max(1.0, float(STRATEGY_CONFIG.get("growthDcaSizeScale", 2.0)))
+                cd_s = max(300.0, float(STRATEGY_CONFIG.get("growthDcaCooldownMin", 60)) * 60.0)
+                now_s = time.time()
+
+                cands: List[Tuple[int, Dict[str, Any]]] = []
+                for tk in TICKER_MAP.values():
+                    if tk.get("volume24h", 0) < min_vol or tk.get("price", 0) <= 0:
+                        continue
+                    c24 = float(tk.get("change24h", 0) or 0)
+                    w7 = float(tk.get("window7mPct", 0) or 0)
+                    hi, lo, p = float(tk.get("high24h", 0) or 0), float(tk.get("low24h", 0) or 0), float(tk["price"])
+                    pos = ((p - lo) / max(hi - lo, 1e-12)) if hi > lo else 0.5
+                    sc = 40
+                    if -6.0 <= c24 <= 8.5:
+                        sc += 18
+                    elif c24 < -6.0 and c24 >= -18.0:
+                        sc += 10
+                    if 0.20 <= pos <= 0.68:
+                        sc += 16
+                    if w7 >= 0.15:
+                        sc += min(16, int(round(w7 * 5)))
+                    if tk["volume24h"] >= 2_000_000:
+                        sc += 10
+                    if sc >= 68:
+                        cands.append((min(98, sc), tk))
+
+                cands.sort(key=lambda x: x[0], reverse=True)
+                triggered = 0
+                for sc, tk in cands[:8]:
+                    sym = tk["symbol"]
+                    if GROWTH_DCA_COOLDOWN.get(sym, 0.0) > now_s:
+                        continue
+                    bars1h = await fetch_spot_klines(sym, "1h", 40)
+                    if len(bars1h) < 24:
+                        continue
+                    closes = [b["close"] for b in bars1h]
+                    rsi = compute_rsi(closes, 14)[-1]
+                    ema9 = compute_ema(closes, 9)[-1]
+                    ema21 = compute_ema(closes, 21)[-1]
+                    if not ((ema9 >= ema21 and 42 <= rsi <= 68) or (32 <= rsi <= 48 and tk.get("window7mPct", 0) > 0.2)):
+                        continue
+                    GROWTH_DCA_COOLDOWN[sym] = now_s + cd_s
+                    p0 = tk["price"]
+                    so1, so2, so3 = p0 * (1 - d1 / 100.0), p0 * (1 - d2 / 100.0), p0 * (1 - d3 / 100.0)
+                    w0, w1, w2, w3 = 1.0, scale, scale ** 2, scale ** 3
+                    avg1 = (w0 * p0 + w1 * so1) / (w0 + w1)
+                    avg2 = (w0 * p0 + w1 * so1 + w2 * so2) / (w0 + w1 + w2)
+                    avg3 = (w0 * p0 + w1 * so1 + w2 * so2 + w3 * so3) / (w0 + w1 + w2 + w3)
+                    tp_p = p0 * (1 + tp_pct / 100.0)
+                    tag = "Güçlü Büyüme" if sc >= 78 else "Büyüme Adayı"
+                    png = render_signal_candle_png(f"{sym} | 1S BUYUME & DCA", bars1h, p0, support=so1, target=tp_p)
+                    await emit_signal({
+                        "id": f"GDCA-{sym}-{int(now_s*1000)}",
+                        "engine": "GROWTH_DCA",
+                        "engineLabel": f"Büyüme & DCA (Skor {sc})",
+                        "symbol": sym, "base": tk["base"], "quote": "USDT", "direction": "LONG",
+                        "entryPrice": p0, "currentPrice": p0, "peakPrice": p0, "peakPct": 0.0,
+                        "headline": f"🌱 YAKIN GÜN BÜYÜME & ÜSTEL DCA (TP +%{tp_pct:.1f}+) — #{sym}",
+                        "details": [
+                            f"📈 Skor: {sc}/100 ({tag}) · 1s RSI: {rsi:.1f} · Hacim: ${tk['volume24h']/1_000_000:.2f}M",
+                            f"📉 Üstel DCA (1x→{scale:g}x→{w2:g}x→{w3:g}x): -%{d1:g} (${fmt_price(so1)} → Ort ${fmt_price(avg1)}) · -%{d2:g} (${fmt_price(so2)} → Ort ${fmt_price(avg2)}) · -%{d3:g} (${fmt_price(so3)} → Ort ${fmt_price(avg3)})",
+                            f"🎯 Hedef Kâr Al (+%{tp_pct:.1f}): Baz ${fmt_price(tp_p)} · 3.DCA Ort. sonrası ${fmt_price(avg3 * (1 + tp_pct / 100.0))}",
+                        ],
+                        "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                    }, png)
+                    triggered += 1
+                    if triggered >= 2:
+                        break
+        except Exception as e:
+            _log(f"[Buyume DCA Loop Hatasi] {e}")
+        await asyncio.sleep(45)
+
+
 async def web_config_sync_loop() -> None:
     if not WEB_SYNC_URL:
         return
@@ -2889,7 +2996,7 @@ async def telegram_command_loop() -> None:
                         f"• ATL/ATH ({','.join(STRATEGY_CONFIG['athAtlTimeframes'])}): {STRATEGY_CONFIG['atlEnabled']}/{STRATEGY_CONFIG['athEnabled']}\n"
                         f"• MA200: {STRATEGY_CONFIG['ma200Enabled']} | Vol: {STRATEGY_CONFIG['volatilityEnabled']} | Formasyon: {STRATEGY_CONFIG['patternsEnabled']}\n"
                         f"• BB ({','.join(STRATEGY_CONFIG.get('bollingerTimeframes', []))}): {STRATEGY_CONFIG.get('bollingerEnabled')} | Ichi ({','.join(STRATEGY_CONFIG.get('ichimokuTimeframes', []))}): {STRATEGY_CONFIG.get('ichimokuEnabled')} | ST ({','.join(STRATEGY_CONFIG.get('supertrendTimeframes', []))}): {STRATEGY_CONFIG.get('supertrendEnabled')}\n"
-                        f"• AI: {STRATEGY_CONFIG.get('aiMarketEnabled')} ({STRATEGY_CONFIG.get('aiMarketDirection', 'BOTH')}) | TumBorsalar: {STRATEGY_CONFIG.get('multiExchangeEnabled')} ({STRATEGY_CONFIG.get('multiExchangeDirection', 'BOTH')}) | BigPumps: {STRATEGY_CONFIG.get('bigPumpEnabled')} ({','.join(STRATEGY_CONFIG.get('bigPumpExchanges', []))})"
+                        f"• AI: {STRATEGY_CONFIG.get('aiMarketEnabled')} ({STRATEGY_CONFIG.get('aiMarketDirection', 'BOTH')}, TG:{STRATEGY_CONFIG.get('aiMarketNotifyTelegram', True)}) | TumBorsalar: {STRATEGY_CONFIG.get('multiExchangeEnabled')} | BigPumps: {STRATEGY_CONFIG.get('bigPumpEnabled')} | BuyumeDCA: {STRATEGY_CONFIG.get('growthDcaEnabled')}"
                         + (f"\n• Son TG Hata: {esc_html(LAST_TG_ERROR)}" if LAST_TG_ERROR else ""),
                         cid,
                     )
@@ -2913,9 +3020,10 @@ async def telegram_command_loop() -> None:
                         "BB": "bollingerEnabled", "BOLLINGER": "bollingerEnabled",
                         "ICHI": "ichimokuEnabled", "ICHIMOKU": "ichimokuEnabled",
                         "ST": "supertrendEnabled", "SUPERTREND": "supertrendEnabled",
-                        "AI": "aiMarketEnabled", "AI_MARKET": "aiMarketEnabled",
+                        "AI": "aiMarketEnabled", "AI_MARKET": "aiMarketEnabled", "AI_TG": "aiMarketNotifyTelegram",
                         "BORSA": "multiExchangeEnabled", "MULTI_EXCHANGE": "multiExchangeEnabled",
                         "BIGPUMP": "bigPumpEnabled", "BIG_PUMP": "bigPumpEnabled",
+                        "DCA": "growthDcaEnabled", "GROWTH": "growthDcaEnabled", "GROWTH_DCA": "growthDcaEnabled",
                     }
                     if key in m:
                         STRATEGY_CONFIG[m[key]] = val
@@ -3053,6 +3161,7 @@ async def main() -> None:
         advanced_strategies_loop(),
         multi_exchange_loop(),
         ai_market_loop(),
+        growth_dca_loop(),
         web_config_sync_loop(),
         reports_loop(),
         telegram_command_loop(),
