@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 13:28:17 · Rev #4
-# Aktif Motorlar: AI(BOTH,15dk)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%50): AI_MARKET
+# Uretim: 14:18:07 · Rev #7
+# Aktif Motorlar: Pump(%4) | Formasyon(1/7) | AI(BOTH,15dk)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%50): PUMP, PUMP15M, PATTERN, AI_MARKET
 # ==============================================================================
 import asyncio
 import base64
@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Web panelinden secilen guncel tikler ve parametreler (GitHub volatilite.py / bot.py ile birebir degistirin):
 DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
-    "pumpEnabled": False,
+    "pumpEnabled": True,
     "pumpThresholdPct": 4,
     "pumpMinVolUsdt": 150000,
     "pumpRepeatHours": 2,
@@ -73,16 +73,16 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityMinMovePct": 1.8,
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
-    "patternsEnabled": False,
+    "patternsEnabled": True,
     "patternTimeframes": ["1h"],
     "enabledPatterns": {
-        "DOUBLE_BOTTOM": True,
-        "DOUBLE_TOP": True,
-        "HEAD_SHOULDERS": True,
-        "INV_HEAD_SHOULDERS": False,
-        "BULL_FLAG": True,
-        "BEAR_FLAG": True,
-        "BEAR_RECTANGLE": True,
+        "DOUBLE_BOTTOM": False,
+        "DOUBLE_TOP": False,
+        "HEAD_SHOULDERS": False,
+        "INV_HEAD_SHOULDERS": True,
+        "BULL_FLAG": False,
+        "BEAR_FLAG": False,
+        "BEAR_RECTANGLE": False,
     },
     "patternMinHeightPct": 1.2,
     "bollingerEnabled": False,
@@ -121,13 +121,13 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": False,
-        "PUMP15M": False,
+        "PUMP": True,
+        "PUMP15M": True,
         "ATL": False,
         "ATH": False,
         "MA200_4H": False,
         "VOLATILITY": False,
-        "PATTERN": False,
+        "PATTERN": True,
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
