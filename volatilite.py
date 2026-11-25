@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 14:18:07 · Rev #7
-# Aktif Motorlar: Pump(%4) | Formasyon(1/7) | AI(BOTH,15dk)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%50): PUMP, PUMP15M, PATTERN, AI_MARKET
+# Uretim: 15:51:21 · Rev #6
+# Aktif Motorlar: ATH/ATL(1M) | AI(BOTH,15dk)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): ATL
 # ==============================================================================
 import asyncio
 import base64
@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Web panelinden secilen guncel tikler ve parametreler (GitHub volatilite.py / bot.py ile birebir degistirin):
 DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
-    "pumpEnabled": True,
+    "pumpEnabled": False,
     "pumpThresholdPct": 4,
     "pumpMinVolUsdt": 150000,
     "pumpRepeatHours": 2,
@@ -39,8 +39,8 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pump15mThresholdPct": 3.2,
     "pump15mMinRvol": 1.4,
     "athEnabled": False,
-    "atlEnabled": False,
-    "athAtlTimeframes": ["1M", "1d"],
+    "atlEnabled": True,
+    "athAtlTimeframes": ["1M"],
     "athAtlLockPct": 1,
     "athAtlCooldownMin": 5,
     "ma200Enabled": False,
@@ -73,16 +73,16 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityMinMovePct": 1.8,
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
-    "patternsEnabled": True,
-    "patternTimeframes": ["1h"],
+    "patternsEnabled": False,
+    "patternTimeframes": ["15m", "1h", "4h", "1d"],
     "enabledPatterns": {
-        "DOUBLE_BOTTOM": False,
-        "DOUBLE_TOP": False,
-        "HEAD_SHOULDERS": False,
+        "DOUBLE_BOTTOM": True,
+        "DOUBLE_TOP": True,
+        "HEAD_SHOULDERS": True,
         "INV_HEAD_SHOULDERS": True,
-        "BULL_FLAG": False,
-        "BEAR_FLAG": False,
-        "BEAR_RECTANGLE": False,
+        "BULL_FLAG": True,
+        "BEAR_FLAG": True,
+        "BEAR_RECTANGLE": True,
     },
     "patternMinHeightPct": 1.2,
     "bollingerEnabled": False,
@@ -116,22 +116,22 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "bigPumpWindowMin": 15,
     "bigPumpCooldownMin": 10,
     "bigPumpMinVolUsdt": 100000,
-    "bigPumpExchanges": ["BINANCE"],
+    "bigPumpExchanges": ["BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET"],
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": True,
-        "PUMP15M": True,
-        "ATL": False,
+        "PUMP": False,
+        "PUMP15M": False,
+        "ATL": True,
         "ATH": False,
         "MA200_4H": False,
         "VOLATILITY": False,
-        "PATTERN": True,
+        "PATTERN": False,
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
-        "AI_MARKET": True,
+        "AI_MARKET": False,
         "MULTI_EXCHANGE": False,
         "BIG_PUMP": False,
     },
@@ -145,11 +145,11 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "directionMode": "BOTH",
     "leverage": 3,
     "tradeUsdt": 25,
-    "tpPct": 5,
-    "slPct": 50,
-    "maxOpenTrades": 9999,
+    "tpPct": 10,
+    "slPct": 10,
+    "maxOpenTrades": 0,
     "rsiMin": 70,
-    "notifyPaperTelegram": True,
+    "notifyPaperTelegram": False,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
