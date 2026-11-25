@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 15:51:21 · Rev #6
+# Uretim: 15:55:22 · Rev #3
 # Aktif Motorlar: ATH/ATL(1M) | AI(BOTH,15dk)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): ATL
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): Secili Yok
 # ==============================================================================
 import asyncio
 import base64
@@ -123,7 +123,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "autoTradeEngines": {
         "PUMP": False,
         "PUMP15M": False,
-        "ATL": True,
+        "ATL": False,
         "ATH": False,
         "MA200_4H": False,
         "VOLATILITY": False,
@@ -149,7 +149,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "slPct": 10,
     "maxOpenTrades": 0,
     "rsiMin": 70,
-    "notifyPaperTelegram": False,
+    "notifyPaperTelegram": True,
 }
 
 AUTO_TRADE: Dict[str, Any] = copy.deepcopy(DEFAULT_AUTO_TRADE)
