@@ -1,7 +1,7 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 23:13:55 · Rev #5
-# Aktif Motorlar: AI(BOTH,3dk) | Borsalar(BOTH,3b)
+# Uretim: 08:51:59 · Rev #3
+# Aktif Motorlar: AI(BOTH,15dk) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,1b)
 # Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%5): AI_MARKET, MULTI_EXCHANGE, BIG_PUMP
 # ==============================================================================
 import asyncio
@@ -44,8 +44,8 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "athAtlLockPct": 1,
     "athAtlCooldownMin": 5,
     "ma200Enabled": False,
-    "ma200LongEnabled": False,
-    "ma200ShortEnabled": False,
+    "ma200LongEnabled": True,
+    "ma200ShortEnabled": True,
     "ma200Timeframe": "4h",
     "ma200Period": 200,
     "volatilityEnabled": False,
@@ -103,14 +103,14 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "supertrendShortEnabled": True,
     "aiMarketEnabled": True,
     "aiMarketDirection": "BOTH",
-    "aiMarketIntervalMin": 3,
+    "aiMarketIntervalMin": 15,
     "aiMarketMinConfidence": 72,
     "multiExchangeEnabled": True,
     "multiExchangeDirection": "BOTH",
     "multiExchangeThresholdPct": 1.8,
     "multiExchangeMinExchanges": 3,
     "multiExchangeWindowMin": 3,
-    "bigPumpEnabled": False,
+    "bigPumpEnabled": True,
     "bigPumpDirection": "BOTH",
     "bigPumpThresholdPct": 5,
     "bigPumpWindowMin": 15,
@@ -147,7 +147,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "tradeUsdt": 25,
     "tpPct": 5,
     "slPct": 5,
-    "maxOpenTrades": 0,
+    "maxOpenTrades": 9999,
     "rsiMin": 70,
     "notifyPaperTelegram": True,
 }
