@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 08:51:59 · Rev #3
-# Aktif Motorlar: AI(BOTH,15dk) | Borsalar(BOTH,3b) | BigPumps(BOTH,±%5,1b)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%5): AI_MARKET, MULTI_EXCHANGE, BIG_PUMP
+# Uretim: 10:36:05 · Rev #3
+# Aktif Motorlar: AI(BOTH,15dk) | Borsalar(BOTH,3b)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%3 / SL -%50): AI_MARKET, MULTI_EXCHANGE
 # ==============================================================================
 import asyncio
 import base64
@@ -110,7 +110,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "multiExchangeThresholdPct": 1.8,
     "multiExchangeMinExchanges": 3,
     "multiExchangeWindowMin": 3,
-    "bigPumpEnabled": True,
+    "bigPumpEnabled": False,
     "bigPumpDirection": "BOTH",
     "bigPumpThresholdPct": 5,
     "bigPumpWindowMin": 15,
@@ -133,7 +133,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "SUPERTREND": False,
         "AI_MARKET": True,
         "MULTI_EXCHANGE": True,
-        "BIG_PUMP": True,
+        "BIG_PUMP": False,
     },
 }
 
@@ -145,8 +145,8 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "directionMode": "BOTH",
     "leverage": 3,
     "tradeUsdt": 25,
-    "tpPct": 5,
-    "slPct": 5,
+    "tpPct": 3,
+    "slPct": 50,
     "maxOpenTrades": 9999,
     "rsiMin": 70,
     "notifyPaperTelegram": True,
