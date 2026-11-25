@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 10:36:05 · Rev #3
-# Aktif Motorlar: AI(BOTH,15dk) | Borsalar(BOTH,3b)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%3 / SL -%50): AI_MARKET, MULTI_EXCHANGE
+# Uretim: 13:28:17 · Rev #4
+# Aktif Motorlar: AI(BOTH,15dk)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%50): AI_MARKET
 # ==============================================================================
 import asyncio
 import base64
@@ -74,12 +74,12 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "volatilityLongEnabled": True,
     "volatilityShortEnabled": True,
     "patternsEnabled": False,
-    "patternTimeframes": ["15m", "1h", "4h", "1d"],
+    "patternTimeframes": ["1h"],
     "enabledPatterns": {
         "DOUBLE_BOTTOM": True,
         "DOUBLE_TOP": True,
         "HEAD_SHOULDERS": True,
-        "INV_HEAD_SHOULDERS": True,
+        "INV_HEAD_SHOULDERS": False,
         "BULL_FLAG": True,
         "BEAR_FLAG": True,
         "BEAR_RECTANGLE": True,
@@ -105,7 +105,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "aiMarketDirection": "BOTH",
     "aiMarketIntervalMin": 15,
     "aiMarketMinConfidence": 72,
-    "multiExchangeEnabled": True,
+    "multiExchangeEnabled": False,
     "multiExchangeDirection": "BOTH",
     "multiExchangeThresholdPct": 1.8,
     "multiExchangeMinExchanges": 3,
@@ -132,7 +132,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "ICHIMOKU": False,
         "SUPERTREND": False,
         "AI_MARKET": True,
-        "MULTI_EXCHANGE": True,
+        "MULTI_EXCHANGE": False,
         "BIG_PUMP": False,
     },
 }
@@ -145,7 +145,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "directionMode": "BOTH",
     "leverage": 3,
     "tradeUsdt": 25,
-    "tpPct": 3,
+    "tpPct": 5,
     "slPct": 50,
     "maxOpenTrades": 9999,
     "rsiMin": 70,
