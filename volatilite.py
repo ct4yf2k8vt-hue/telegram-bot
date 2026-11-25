@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 18:15:53 · Rev #5
+# Uretim: 19:27:54 · Rev #3
 # Aktif Motorlar: 15dk(%3.2) | ATH/ATL(1M) | AI(BOTH,15dk) | BuyumeDCA(-5/13/34%,TP>=%2.5)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP, PUMP15M, AI_MARKET, GROWTH_DCA
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): ATL, AI_MARKET, GROWTH_DCA
 # ==============================================================================
 import asyncio
 import base64
@@ -130,9 +130,9 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
     "autoTradeEngines": {
-        "PUMP": True,
-        "PUMP15M": True,
-        "ATL": False,
+        "PUMP": False,
+        "PUMP15M": False,
+        "ATL": True,
         "ATH": False,
         "MA200_4H": False,
         "VOLATILITY": False,
@@ -2591,6 +2591,7 @@ async def run_quant_ai_fallback(dir_mode: str, min_conf: int) -> Tuple[str, List
         rsi14 = 50.0
         ema9 = tk["price"]
         ema21 = tk["price"]
+        move15m = float(tk.get("window7mPct", 0) or 0)
         try:
             bars = await fetch_spot_klines(tk["symbol"], "15m", 35)
             if len(bars) >= 22:
@@ -2598,20 +2599,44 @@ async def run_quant_ai_fallback(dir_mode: str, min_conf: int) -> Tuple[str, List
                 rsi14 = compute_rsi(closes, 14)[-1]
                 ema9 = compute_ema(closes, 9)[-1]
                 ema21 = compute_ema(closes, 21)[-1]
+                prev_c = closes[-2] or tk["price"]
+                if prev_c > 0:
+                    move15m = ((tk["price"] - prev_c) / prev_c) * 100.0
         except Exception:
             pass
         w7 = float(tk.get("window7mPct", 0) or 0)
         c24 = float(tk.get("change24h", 0) or 0)
+        hi24, lo24, px = float(tk.get("high24h", 0) or 0), float(tk.get("low24h", 0) or 0), float(tk["price"])
+        range_pos = ((px - lo24) / (hi24 - lo24) * 100.0) if hi24 > lo24 else 50.0
+        vol_score = 10.0 if tk.get("volume24h", 0) >= 10_000_000 else (6.0 if tk.get("volume24h", 0) >= 2_000_000 else 3.0)
         has_fut = tk["symbol"] in FUTURES_SYMBOLS
         if dir_mode in ("LONG", "BOTH"):
-            sc = 54.0 + (min(16.0, w7 * 4.5) if w7 > 0.3 else 0.0) + (8.0 if ema9 > ema21 else 0.0) + (8.0 if 48 <= rsi14 <= 74 else 0.0) + (5.0 if has_fut else 0.0)
+            sc = (
+                52.0
+                + (min(16.0, w7 * 4.5) if w7 > 0.3 else 0.0)
+                + (min(8.0, move15m * 3.0) if move15m > 0.2 else 0.0)
+                + (8.0 if ema9 > ema21 else 0.0)
+                + (8.0 if 48 <= rsi14 <= 74 else (7.0 if rsi14 < 35 and w7 > 0 else 0.0))
+                + (5.0 if 45 <= range_pos <= 92 else 0.0)
+                + (5.0 if has_fut else 0.0)
+                + vol_score * 0.5
+            )
             conf = min(93, max(54, int(round(sc))))
             evaluated.append({
                 "symbol": tk["symbol"], "direction": "LONG", "confidence": conf,
-                "reason": f"15dk RSI {rsi14:.0f} · {'EMA9>EMA21 pozitif' if ema9 >= ema21 else 'tepki'} · 7dk {w7:+.2f}% · 24s {c24:+.1f}%",
+                "reason": f"15dk RSI {rsi14:.0f} · {'EMA9>EMA21 pozitif' if ema9 >= ema21 else 'dip tepki'} · 7dk {w7:+.2f}% · 24s {c24:+.1f}%",
             })
         if dir_mode in ("SHORT", "BOTH"):
-            sc = 54.0 + (min(16.0, abs(w7) * 4.5) if w7 < -0.3 else 0.0) + (8.0 if ema9 < ema21 else 0.0) + (8.0 if 26 <= rsi14 <= 52 else 0.0) + (5.0 if has_fut else 0.0)
+            sc = (
+                52.0
+                + (min(16.0, abs(w7) * 4.5) if w7 < -0.3 else 0.0)
+                + (min(8.0, abs(move15m) * 3.0) if move15m < -0.2 else 0.0)
+                + (8.0 if ema9 < ema21 else 0.0)
+                + (8.0 if 26 <= rsi14 <= 52 else (7.0 if rsi14 > 72 and w7 < 0 else 0.0))
+                + (5.0 if 8 <= range_pos <= 55 else 0.0)
+                + (5.0 if has_fut else 0.0)
+                + vol_score * 0.5
+            )
             conf = min(93, max(54, int(round(sc))))
             evaluated.append({
                 "symbol": tk["symbol"], "direction": "SHORT", "confidence": conf,
@@ -2631,100 +2656,153 @@ async def run_quant_ai_fallback(dir_mode: str, min_conf: int) -> Tuple[str, List
     return regime, picks
 
 
+def _normalize_ai_symbol(raw_sym: Any) -> str:
+    cleaned = re.sub(r"[^A-Z0-9]", "", str(raw_sym or "").upper().strip())
+    if not cleaned:
+        return ""
+    if cleaned in TICKER_MAP:
+        return cleaned
+    if not cleaned.endswith("USDT") and f"{cleaned}USDT" in TICKER_MAP:
+        return f"{cleaned}USDT"
+    return cleaned
+
+
+async def run_ai_market_scan(manual: bool = False, explicit_cid: Optional[str] = None) -> None:
+    if len(TICKER_MAP) < 15:
+        if explicit_cid:
+            await tg_send_text("⏳ Canlı piyasa verileri henüz yükleniyor, birkaç saniye sonra /ai tekrar deneyin.", explicit_cid)
+        return
+    dir_mode = str(STRATEGY_CONFIG.get("aiMarketDirection", "BOTH")).upper()
+    min_conf = int(STRATEGY_CONFIG.get("aiMarketMinConfidence", 72))
+    now_s = time.time()
+    gemini_used = False
+    regime = "Canlı Analiz"
+    summary = ""
+    picks: List[Dict[str, Any]] = []
+
+    if GEMINI_API_KEY:
+        usdt = [t for t in TICKER_MAP.values() if t.get("volume24h", 0) >= 250000]
+        top_v = sorted(usdt, key=lambda x: x["volume24h"], reverse=True)[:12]
+        top_g = sorted(usdt, key=lambda x: x["change24h"], reverse=True)[:12]
+        top_d = sorted(usdt, key=lambda x: x["change24h"])[:10]
+        seen: Set[str] = set()
+        sample: List[Dict[str, Any]] = []
+        for lst in (top_v, top_g, top_d):
+            for it in lst:
+                if it["symbol"] not in seen:
+                    seen.add(it["symbol"])
+                    sample.append(it)
+        lines = [
+            f"{t['symbol']}|p={fmt_price(t['price'])}|24s={t['change24h']:+.2f}%|hacim=${int(t['volume24h']/1000)}K"
+            for t in sample[:30]
+        ]
+        prompt = (
+            f"Canli kripto piyasasini analiz et ve su an en olumlu en fazla 3 islem sec. Yon={dir_mode}, MinGuven={min_conf}. Tum aciklamalari Turkce yaz.\n"
+            'Yalnizca JSON dondur: {"marketRegime":"...","summary":"...","picks":[{"symbol":"BTCUSDT","direction":"LONG","confidence":82,"reason":"..."}]}\n'
+            + "\n".join(lines)
+        )
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }).encode("utf-8")
+
+        for model_name in GEMINI_MODELS:
+            if GEMINI_MODEL_BLOCKED_UNTIL.get(model_name, 0.0) > now_s:
+                continue
+            try:
+                st, raw = await http_request(
+                    "POST",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
+                    headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+                    body=body,
+                    timeout_s=25.0,
+                )
+                raw_txt = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+                js = _safe_json_loads(raw)
+                if st == 200 and isinstance(js, dict) and js.get("candidates"):
+                    txt = str((((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [{}])[0].get("text") or "{}").strip()
+                    txt = re.sub(r"^\x60{3}(?:json)?\s*|\s*\x60{3}$", "", txt, flags=re.IGNORECASE).strip()
+                    parsed = json.loads(txt)
+                    regime = str(parsed.get("marketRegime") or "Canlı Analiz")
+                    summary = str(parsed.get("summary") or "")
+                    picks = list(parsed.get("picks") or [])
+                    gemini_used = True
+                    break
+                wait_s = 1800.0
+                m_delay = re.search(r'"retryDelay"\s*:\s*"(\d+)s"', raw_txt)
+                if m_delay:
+                    wait_s = max(60.0, min(86400.0, float(m_delay.group(1))))
+                GEMINI_MODEL_BLOCKED_UNTIL[model_name] = now_s + (wait_s if st == 429 else 300.0)
+                _log(f"[AI Market {model_name}] HTTP {st} — yedek modele/teknik motora geçiliyor (bekleme {int(wait_s//60)}dk).")
+            except Exception as exc:
+                GEMINI_MODEL_BLOCKED_UNTIL[model_name] = now_s + 300.0
+                _log(f"[AI Market {model_name}] Istisna ({exc}) — yedek modele/teknik motora geçiliyor.")
+
+    engine_tag = "Gemini AI" if gemini_used else "Teknik AI Yedek"
+    if not gemini_used:
+        regime, picks = await run_quant_ai_fallback(dir_mode, min_conf)
+        if not summary:
+            summary = f"{len(TICKER_MAP)} canlı parite 15dk RSI/EMA ve ivme ile tarandı ({regime})."
+
+    emitted = 0
+    min_cd = 45.0 if manual else 900.0
+    for pk in picks:
+        sym = _normalize_ai_symbol(pk.get("symbol"))
+        dr = str(pk.get("direction") or "").upper().strip()
+        conf = int(pk.get("confidence") or 0)
+        if dr not in ("LONG", "SHORT") or conf < min_conf or sym not in TICKER_MAP:
+            continue
+        if (dir_mode == "LONG" and dr != "LONG") or (dir_mode == "SHORT" and dr != "SHORT"):
+            continue
+        ck = f"{sym}:{dr}"
+        if AI_COOLDOWN.get(ck, 0.0) > (now_s if not manual else (now_s - (900.0 - min_cd))):
+            continue
+        AI_COOLDOWN[ck] = now_s + 900.0
+        tk = TICKER_MAP[sym]
+        bars15m = await fetch_spot_klines(sym, "15m", 40)
+        png = render_signal_candle_png(f"{sym} | 15DK YAPAY ZEKA ({dr})", bars15m, tk["price"], is_short=(dr == "SHORT")) if len(bars15m) >= 10 else b""
+        det = [
+            f"🧠 Rejim: {regime} · Güven: %{conf} ({engine_tag})",
+            f"💡 Analiz: {pk.get('reason', 'Piyasa & momentum analizi')}",
+            f"💰 Anlık Fiyat: ${fmt_price(tk['price'])} (24s: {tk['change24h']:+.2f}%)",
+        ]
+        if emitted == 0 and summary:
+            det.append(f"📝 Özet: {summary}")
+        await emit_signal({
+            "id": f"AI-{sym}-{dr}-{int(now_s*1000)}",
+            "engine": "AI_MARKET",
+            "engineLabel": f"{engine_tag} ({conf}%)",
+            "symbol": sym, "base": tk["base"], "quote": "USDT", "direction": dr,
+            "entryPrice": tk["price"], "currentPrice": tk["price"], "peakPrice": tk["price"], "peakPct": 0.0,
+            "headline": f"🤖 YAPAY ZEKA {dr} (%{conf}) — #{sym}",
+            "details": det,
+            "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+        }, png)
+        emitted += 1
+
+    if emitted == 0 and STRATEGY_CONFIG.get("aiMarketNotifyTelegram", True):
+        pk_lines = [
+            f"{'🟢' if str(p.get('direction','')).upper()=='LONG' else '🔴'} <b>#{esc_html(_normalize_ai_symbol(p.get('symbol')))}</b> ({p.get('direction')} · %{p.get('confidence')}) — {esc_html(str(p.get('reason','')))}"
+            for p in picks[:3]
+        ]
+        await tg_send_text(
+            f"🤖 <b>YAPAY ZEKA PİYASA ANALİZİ ({esc_html(engine_tag)})</b>\n"
+            f"🧠 Rejim: <b>{esc_html(regime)}</b>\n"
+            + (f"📝 {esc_html(summary)}\n" if summary else "")
+            + ("\n" + "\n".join(pk_lines) if pk_lines else "\nℹ️ Şu an minimum güven eşiği üzerinde fırsat bekleniyor."),
+            explicit_cid,
+        )
+
+
 async def ai_market_loop() -> None:
     while True:
         try:
+            if len(TICKER_MAP) < 15:
+                await asyncio.sleep(5)
+                continue
             interval_s = max(60.0, float(STRATEGY_CONFIG.get("aiMarketIntervalMin", 15)) * 60.0)
-            if BOT_RUNNING and STRATEGY_CONFIG.get("aiMarketEnabled") and len(TICKER_MAP) >= 15:
-                dir_mode = str(STRATEGY_CONFIG.get("aiMarketDirection", "BOTH")).upper()
-                min_conf = int(STRATEGY_CONFIG.get("aiMarketMinConfidence", 72))
-                now_s = time.time()
-                gemini_used = False
-                regime = "Canlı Analiz"
-                picks: List[Dict[str, Any]] = []
-
-                if GEMINI_API_KEY:
-                    usdt = [t for t in TICKER_MAP.values() if t.get("volume24h", 0) >= 250000]
-                    top_v = sorted(usdt, key=lambda x: x["volume24h"], reverse=True)[:12]
-                    top_g = sorted(usdt, key=lambda x: x["change24h"], reverse=True)[:12]
-                    top_d = sorted(usdt, key=lambda x: x["change24h"])[:10]
-                    seen: Set[str] = set()
-                    sample: List[Dict[str, Any]] = []
-                    for lst in (top_v, top_g, top_d):
-                        for it in lst:
-                            if it["symbol"] not in seen:
-                                seen.add(it["symbol"])
-                                sample.append(it)
-                    lines = [
-                        f"{t['symbol']}|p={fmt_price(t['price'])}|24s={t['change24h']:+.2f}%|hacim=${int(t['volume24h']/1000)}K"
-                        for t in sample[:30]
-                    ]
-                    prompt = (
-                        f"Canli kripto piyasasini analiz et ve su an en olumlu en fazla 3 islem sec. Yon={dir_mode}, MinGuven={min_conf}.\n"
-                        'Yalnizca JSON dondur: {"marketRegime":"...","summary":"...","picks":[{"symbol":"BTCUSDT","direction":"LONG","confidence":82,"reason":"..."}]}\n'
-                        + "\n".join(lines)
-                    )
-                    body = json.dumps({
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"responseMimeType": "application/json"},
-                    }).encode("utf-8")
-
-                    for model_name in GEMINI_MODELS:
-                        if GEMINI_MODEL_BLOCKED_UNTIL.get(model_name, 0.0) > now_s:
-                            continue
-                        st, raw = await http_request(
-                            "POST",
-                            f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
-                            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-                            body=body,
-                            timeout_s=25.0,
-                        )
-                        js = _safe_json_loads(raw)
-                        if st == 200 and isinstance(js, dict):
-                            txt = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [{}])[0].get("text") or "{}"
-                            parsed = json.loads(txt)
-                            regime = str(parsed.get("marketRegime") or "Canlı Analiz")
-                            picks = list(parsed.get("picks") or [])
-                            gemini_used = True
-                            break
-                        wait_s = 1800.0
-                        m_delay = re.search(r'"retryDelay"\s*:\s*"(\d+)s"', raw)
-                        if m_delay:
-                            wait_s = max(60.0, min(86400.0, float(m_delay.group(1))))
-                        GEMINI_MODEL_BLOCKED_UNTIL[model_name] = now_s + (wait_s if st == 429 else 300.0)
-                        _log(f"[AI Market {model_name}] HTTP {st} — yedek modele/teknik motora geçiliyor (bekleme {int(wait_s//60)}dk).")
-
-                engine_tag = "Gemini AI" if gemini_used else "Teknik AI Yedek"
-                if not gemini_used:
-                    regime, picks = await run_quant_ai_fallback(dir_mode, min_conf)
-
-                for pk in picks:
-                    sym = str(pk.get("symbol") or "").upper().strip()
-                    dr = str(pk.get("direction") or "").upper().strip()
-                    conf = int(pk.get("confidence") or 0)
-                    if dr not in ("LONG", "SHORT") or conf < min_conf or sym not in TICKER_MAP:
-                        continue
-                    if (dir_mode == "LONG" and dr != "LONG") or (dir_mode == "SHORT" and dr != "SHORT"):
-                        continue
-                    ck = f"{sym}:{dr}"
-                    if AI_COOLDOWN.get(ck, 0) > now_s:
-                        continue
-                    AI_COOLDOWN[ck] = now_s + 900.0
-                    tk = TICKER_MAP[sym]
-                    await emit_signal({
-                        "id": f"AI-{sym}-{dr}-{int(now_s*1000)}",
-                        "engine": "AI_MARKET",
-                        "engineLabel": f"{engine_tag} ({conf}%)",
-                        "symbol": sym, "base": tk["base"], "quote": "USDT", "direction": dr,
-                        "entryPrice": tk["price"], "currentPrice": tk["price"], "peakPrice": tk["price"], "peakPct": 0.0,
-                        "headline": f"🤖 YAPAY ZEKA {dr} (%{conf}) — #{sym}",
-                        "details": [
-                            f"🧠 Rejim: {regime} · Güven: %{conf} ({engine_tag})",
-                            f"💡 Analiz: {pk.get('reason', 'Piyasa & momentum analizi')}",
-                            f"💰 Anlık Fiyat: ${fmt_price(tk['price'])} (24s: {tk['change24h']:+.2f}%)",
-                        ],
-                        "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
-                    })
+            if BOT_RUNNING and STRATEGY_CONFIG.get("aiMarketEnabled"):
+                await run_ai_market_scan(manual=False)
             await asyncio.sleep(interval_s)
         except Exception as e:
             _log(f"[AI Piyasa Loop Hatasi] {e}")
@@ -2951,9 +3029,12 @@ async def telegram_command_loop() -> None:
                     await tg_send_text(
                         "⚡ <b>7/24 Spot &amp; Futures Botu Aktif</b>\n"
                         f"🆔 Sohbet ID: <code>{esc_html(cid)}</code>\n"
-                        "Komutlar: /test · /durum · /saatlik · /24s · /islemler · /ayar_sync &lt;json&gt; · /tik &lt;motor&gt; ac|kapat · /varsayilan · /sifirla",
+                        "Komutlar: /test · /ai · /durum · /saatlik · /24s · /islemler · /ayar_sync &lt;json&gt; · /tik &lt;motor&gt; ac|kapat · /varsayilan · /sifirla",
                         cid,
                     )
+                elif cmd in ("/ai", "/yapayzeka"):
+                    await tg_send_text("🤖 <b>Yapay Zeka (AI) piyasa taraması başlatılıyor...</b>", cid)
+                    await run_ai_market_scan(manual=True, explicit_cid=cid)
                 elif cmd == "/test":
                     await tg_send_text(
                         f"🧪 <b>TEST BİLDİRİMİ — Render Telegram Aktif!</b>\n"
