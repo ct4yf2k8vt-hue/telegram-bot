@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 22:48:49 · Rev #4
-# Aktif Motorlar: Volatilite(15m,1h, Tumu)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP15M
+# Uretim: 23:40:22 · Rev #3
+# Aktif Motorlar: Volatilite(15m,1h, Tumu) | AI(BOTH,15dk) | Ticker1.5(BOTH,±%1.5)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP15M, AI_MARKET
 # ==============================================================================
 import asyncio
 import base64
@@ -101,7 +101,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "supertrendMultiplier": 3,
     "supertrendLongEnabled": True,
     "supertrendShortEnabled": True,
-    "aiMarketEnabled": False,
+    "aiMarketEnabled": True,
     "aiMarketDirection": "BOTH",
     "aiMarketIntervalMin": 15,
     "aiMarketMinConfidence": 72,
@@ -126,6 +126,18 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "growthDcaSizeScale": 2,
     "growthDcaMinVolUsdt": 300000,
     "growthDcaCooldownMin": 60,
+    "priceTicker15Enabled": True,
+    "priceTicker15Direction": "BOTH",
+    "priceTicker15ThresholdPct": 1.5,
+    "priceTicker15CooldownMin": 1,
+    "priceTicker15MinVolUsdt": 0,
+    "adxTrendEnabled": False,
+    "adxTimeframes": ["15m", "1h"],
+    "adxPeriod": 14,
+    "adxMinStrength": 25,
+    "adxLongEnabled": True,
+    "adxShortEnabled": True,
+    "adxCooldownMin": 30,
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
@@ -142,10 +154,12 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
-        "AI_MARKET": False,
+        "AI_MARKET": True,
         "MULTI_EXCHANGE": False,
         "BIG_PUMP": False,
         "GROWTH_DCA": False,
+        "TICKER_1_5": False,
+        "ADX_TREND": False,
     },
 }
 
@@ -256,6 +270,9 @@ MULTI_EX_HIST: Dict[str, Dict[str, deque]] = {}
 MULTI_EX_COOLDOWN: Dict[str, float] = {}
 AI_COOLDOWN: Dict[str, float] = {}
 GROWTH_DCA_COOLDOWN: Dict[str, float] = {}
+TICKER_15_STATE: Dict[str, Dict[str, Any]] = {}
+TICKER_15_INFLIGHT: Set[str] = set()
+ADX_COOLDOWN: Dict[str, float] = {}
 GEMINI_MODELS = ("gemini-3.1-flash-lite", "gemini-4-hydrogen")
 GEMINI_MODEL_BLOCKED_UNTIL: Dict[str, float] = {}
 BIG_PUMP_EXCHANGE_ORDER = ("BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET")
@@ -320,6 +337,7 @@ def apply_strategy_patch(raw: Any) -> None:
         "ichimokuEnabled", "ichimokuLongEnabled", "ichimokuShortEnabled",
         "supertrendEnabled", "supertrendLongEnabled", "supertrendShortEnabled",
         "aiMarketEnabled", "aiMarketNotifyTelegram", "multiExchangeEnabled", "bigPumpEnabled", "growthDcaEnabled",
+        "priceTicker15Enabled", "adxTrendEnabled", "adxLongEnabled", "adxShortEnabled",
         "hourlyGainersReportEnabled", "dailyWinnerReportEnabled", "top24SummaryReportEnabled", "phonePushEnabled",
     ]
     for bk in bool_keys:
@@ -348,6 +366,8 @@ def apply_strategy_patch(raw: Any) -> None:
         "growthDcaDrop3Pct": (5.0, 85.0),
         "growthDcaSizeScale": (1.0, 5.0),
         "growthDcaMinVolUsdt": (10000.0, 100_000_000.0),
+        "priceTicker15ThresholdPct": (0.2, 20.0),
+        "priceTicker15MinVolUsdt": (0.0, 100_000_000.0),
     }
     for nk, (lo, hi) in num_bounds.items():
         if nk in raw:
@@ -368,6 +388,10 @@ def apply_strategy_patch(raw: Any) -> None:
         ("bigPumpWindowMin", 1, 120),
         ("bigPumpCooldownMin", 1, 120),
         ("growthDcaCooldownMin", 5, 1440),
+        ("priceTicker15CooldownMin", 0, 120),
+        ("adxPeriod", 5, 50),
+        ("adxMinStrength", 10, 60),
+        ("adxCooldownMin", 1, 1440),
     ]:
         if ik in raw:
             try:
@@ -378,7 +402,7 @@ def apply_strategy_patch(raw: Any) -> None:
     if raw.get("ma200Timeframe") in ("1h", "4h", "1d"):
         STRATEGY_CONFIG["ma200Timeframe"] = raw["ma200Timeframe"]
 
-    for dkey in ("aiMarketDirection", "multiExchangeDirection", "bigPumpDirection"):
+    for dkey in ("aiMarketDirection", "multiExchangeDirection", "bigPumpDirection", "priceTicker15Direction"):
         dv = str(raw.get(dkey) or "").upper()
         if dv in ("LONG", "SHORT", "BOTH"):
             STRATEGY_CONFIG[dkey] = dv
@@ -404,7 +428,7 @@ def apply_strategy_patch(raw: Any) -> None:
         valid_p = [tf for tf in raw["patternTimeframes"] if tf in ("15m", "1h", "4h", "1d")]
         STRATEGY_CONFIG["patternTimeframes"] = list(dict.fromkeys(valid_p))
 
-    for tf_field in ("bollingerTimeframes", "ichimokuTimeframes", "supertrendTimeframes"):
+    for tf_field in ("bollingerTimeframes", "ichimokuTimeframes", "supertrendTimeframes", "adxTimeframes"):
         if isinstance(raw.get(tf_field), list):
             valid_i = [tf for tf in raw[tf_field] if tf in ("15m", "1h", "4h", "1d", "1w", "1M")]
             STRATEGY_CONFIG[tf_field] = list(dict.fromkeys(valid_i))
@@ -415,7 +439,7 @@ def apply_strategy_patch(raw: Any) -> None:
                 STRATEGY_CONFIG["enabledPatterns"][pk] = raw["enabledPatterns"][pk]
 
     if isinstance(raw.get("autoTradeEngines"), dict):
-        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN", "BOLLINGER", "ICHIMOKU", "SUPERTREND", "AI_MARKET", "MULTI_EXCHANGE", "BIG_PUMP", "GROWTH_DCA"):
+        for ek in ("PUMP", "PUMP15M", "ATL", "ATH", "MA200_4H", "VOLATILITY", "PATTERN", "BOLLINGER", "ICHIMOKU", "SUPERTREND", "AI_MARKET", "MULTI_EXCHANGE", "BIG_PUMP", "GROWTH_DCA", "TICKER_1_5", "ADX_TREND"):
             if isinstance(raw["autoTradeEngines"].get(ek), bool):
                 STRATEGY_CONFIG["autoTradeEngines"][ek] = raw["autoTradeEngines"][ek]
 
@@ -551,6 +575,63 @@ def compute_rsi(closes: List[float], period: int = 14) -> List[float]:
         else:
             out[i] = 100.0 - 100.0 / (1.0 + avg_g / avg_l)
     return out
+
+
+def compute_wilder_adx(bars: List[Dict[str, float]], period: int = 14) -> Optional[Dict[str, float]]:
+    n = max(5, min(50, int(period)))
+    if len(bars) < n * 2 + 5:
+        return None
+    tr_l: List[float] = []
+    pdm_l: List[float] = []
+    mdm_l: List[float] = []
+    for i in range(1, len(bars)):
+        cur, prev = bars[i], bars[i - 1]
+        up = cur["high"] - prev["high"]
+        dn = prev["low"] - cur["low"]
+        pdm_l.append(up if (up > dn and up > 0) else 0.0)
+        mdm_l.append(dn if (dn > up and dn > 0) else 0.0)
+        tr_l.append(max(cur["high"] - cur["low"], abs(cur["high"] - prev["close"]), abs(cur["low"] - prev["close"])))
+    if len(tr_l) < n * 2:
+        return None
+    sm_tr = sum(tr_l[:n])
+    sm_p = sum(pdm_l[:n])
+    sm_m = sum(mdm_l[:n])
+    dx_l: List[float] = []
+    p_di, m_di, prev_p, prev_m = 0.0, 0.0, 0.0, 0.0
+    for i in range(n, len(tr_l)):
+        prev_p, prev_m = p_di, m_di
+        if i > n:
+            sm_tr = sm_tr - sm_tr / n + tr_l[i]
+            sm_p = sm_p - sm_p / n + pdm_l[i]
+            sm_m = sm_m - sm_m / n + mdm_l[i]
+        p_di = (sm_p / sm_tr) * 100.0 if sm_tr > 0 else 0.0
+        m_di = (sm_m / sm_tr) * 100.0 if sm_tr > 0 else 0.0
+        ds = p_di + m_di
+        dx_l.append((abs(p_di - m_di) / ds) * 100.0 if ds > 0 else 0.0)
+    if len(dx_l) < n:
+        return None
+    adx = sum(dx_l[:n]) / n
+    for i in range(n, len(dx_l)):
+        adx = (adx * (n - 1) + dx_l[i]) / n
+    return {
+        "adx": round(adx, 2),
+        "plusDi": round(p_di, 2),
+        "minusDi": round(m_di, 2),
+        "prevPlusDi": round(prev_p, 2),
+        "prevMinusDi": round(prev_m, 2),
+    }
+
+
+def get_adx_strength_label(adx: float) -> str:
+    if adx >= 45:
+        return "AŞIRI GÜÇLÜ TREND"
+    if adx >= 35:
+        return "ÇOK GÜÇLÜ TREND"
+    if adx >= 25:
+        return "GÜÇLÜ TREND"
+    if adx >= 20:
+        return "TREND BAŞLIYOR"
+    return "YATAY / ZAYIF"
 
 
 # ==============================================================================
@@ -1469,6 +1550,8 @@ async def emit_signal(signal: Dict[str, Any], png: bytes = b"") -> None:
         "AI_MARKET": "🤖",
         "MULTI_EXCHANGE": "🌐",
         "GROWTH_DCA": "🌱",
+        "TICKER_1_5": "📈" if signal["direction"] == "LONG" else "📉",
+        "ADX_TREND": "🧭🟢" if signal["direction"] == "LONG" else "🧭🔴",
         "BIG_PUMP": "🟢" if signal["direction"] == "LONG" else "🔴",
     }
     ic = icons.get(signal["engine"], "🟢" if signal["direction"] == "LONG" else "🔴")
@@ -1838,6 +1921,65 @@ def _ingest_ticker_item(item: Dict[str, Any], now_s: float) -> None:
             VERIFY_COOLDOWN[sym] = now_s + 15.0
             asyncio.create_task(verify_and_emit_pump(t, min7, min15))
     evaluate_big_pump_for_symbol(t, now_s)
+    evaluate_price_ticker_15_py(t, now_s)
+
+
+async def verify_and_emit_ticker15_py(t: Dict[str, Any], dr: str, delta_pct: float, prev_anchor: float, move_cnt: int, th: float) -> None:
+    sym = t["symbol"]
+    if sym in TICKER_15_INFLIGHT:
+        return
+    TICKER_15_INFLIGHT.add(sym)
+    try:
+        bars = await fetch_spot_klines(sym, "15m", 40)
+        png = render_signal_candle_png(f"{sym} | {th}% PRICE TICKER ({delta_pct:+.2f}%)", bars, t["price"], is_short=(dr == "SHORT")) if len(bars) >= 10 else b""
+        arrow = "📈" if dr == "LONG" else "📉"
+        sign = "+" if delta_pct >= 0 else ""
+        await emit_signal({
+            "id": f"T15-{sym}-{dr}-{int(time.time()*1000)}",
+            "engine": "TICKER_1_5",
+            "engineLabel": f"1.5% Ticker ({sign}{delta_pct:.2f}%)",
+            "symbol": sym, "base": t["base"], "quote": "USDT", "direction": dr, "timeframe": "15m",
+            "entryPrice": prev_anchor, "currentPrice": t["price"], "peakPrice": t["price"], "peakPct": round(abs(delta_pct), 2),
+            "headline": f"{arrow} #{t['base']}: {sign}{delta_pct:.2f}% (±{th}% Ticker · #{move_cnt})",
+            "details": [
+                f"{'🟢 YÜKSELİŞ' if dr == 'LONG' else '🔴 DÜŞÜŞ'} | Referans: ${fmt_price(prev_anchor)} ➡️ Anlık: ${fmt_price(t['price'])} ({sign}{delta_pct:.2f}%)",
+                f"👀 1.5% Price Ticker #{move_cnt} · 24s: {t['change24h']:+.2f}% · Hacim: ${t['volume24h']/1_000_000:.2f}M",
+            ],
+            "createdAt": int(time.time() * 1000), "peakAt": int(time.time() * 1000),
+        }, png)
+    except Exception as e:
+        _log(f"[Ticker1.5 Hatasi ({sym})] {e}")
+    finally:
+        TICKER_15_INFLIGHT.discard(sym)
+
+
+def evaluate_price_ticker_15_py(t: Dict[str, Any], now_s: float) -> None:
+    sym = t["symbol"]
+    st = TICKER_15_STATE.get(sym)
+    if not st:
+        TICKER_15_STATE[sym] = {"anchor": t["price"], "count": 0, "lastAt": 0.0}
+        return
+    if not BOT_RUNNING or not STRATEGY_CONFIG.get("priceTicker15Enabled"):
+        return
+    if t.get("volume24h", 0) < float(STRATEGY_CONFIG.get("priceTicker15MinVolUsdt", 0)):
+        return
+    th = max(0.2, float(STRATEGY_CONFIG.get("priceTicker15ThresholdPct", 1.5)))
+    delta = ((t["price"] - st["anchor"]) / st["anchor"]) * 100.0 if st["anchor"] > 0 else 0.0
+    if abs(delta) < th:
+        return
+    dr = "LONG" if delta >= 0 else "SHORT"
+    dm = str(STRATEGY_CONFIG.get("priceTicker15Direction", "BOTH")).upper()
+    if (dm == "LONG" and dr != "LONG") or (dm == "SHORT" and dr != "SHORT"):
+        st["anchor"] = t["price"]
+        return
+    cd_s = max(0.0, float(STRATEGY_CONFIG.get("priceTicker15CooldownMin", 1))) * 60.0
+    if st["lastAt"] > 0 and (now_s - st["lastAt"]) < cd_s:
+        return
+    prev_anchor = st["anchor"]
+    st["anchor"] = t["price"]
+    st["count"] += 1
+    st["lastAt"] = now_s
+    asyncio.create_task(verify_and_emit_ticker15_py(t, dr, delta, prev_anchor, st["count"], th))
 
 
 def get_exchanges_for_symbol(sym: str) -> List[str]:
@@ -2893,6 +3035,61 @@ async def growth_dca_loop() -> None:
         await asyncio.sleep(45)
 
 
+async def adx_trend_loop() -> None:
+    adx_cur = 0
+    while True:
+        try:
+            if BOT_RUNNING and STRATEGY_CONFIG.get("adxTrendEnabled") and len(TICKER_MAP) >= 15:
+                cands = sorted([t for t in TICKER_MAP.values() if t.get("volume24h", 0) >= 150_000], key=lambda x: x["volume24h"], reverse=True)[:120]
+                tfs = STRATEGY_CONFIG.get("adxTimeframes") or ["15m"]
+                period = max(5, min(50, int(STRATEGY_CONFIG.get("adxPeriod", 14))))
+                min_adx = max(10.0, min(60.0, float(STRATEGY_CONFIG.get("adxMinStrength", 25))))
+                cd_s = max(1.0, float(STRATEGY_CONFIG.get("adxCooldownMin", 30))) * 60.0
+                now_s = time.time()
+                for _ in range(min(12, len(cands))):
+                    t = cands[adx_cur % len(cands)]
+                    adx_cur += 1
+                    for tf in tfs[:2]:
+                        bars = await fetch_spot_klines(t["symbol"], tf, max(80, period * 4))
+                        res = compute_wilder_adx(bars, period)
+                        if not res or res["adx"] < min_adx:
+                            continue
+                        dr = "LONG" if res["plusDi"] >= res["minusDi"] else "SHORT"
+                        if dr == "LONG" and not STRATEGY_CONFIG.get("adxLongEnabled", True):
+                            continue
+                        if dr == "SHORT" and not STRATEGY_CONFIG.get("adxShortEnabled", True):
+                            continue
+                        spread = abs(res["plusDi"] - res["minusDi"])
+                        crossed = (dr == "LONG" and res["prevPlusDi"] <= res["prevMinusDi"] and res["plusDi"] > res["minusDi"]) or (dr == "SHORT" and res["prevMinusDi"] <= res["prevPlusDi"] and res["minusDi"] > res["plusDi"])
+                        if not crossed and spread < 5.0:
+                            continue
+                        ck = f"{t['symbol']}:{tf}:{dr}"
+                        if ADX_COOLDOWN.get(ck, 0.0) > now_s:
+                            continue
+                        ADX_COOLDOWN[ck] = now_s + cd_s
+                        s_lbl = get_adx_strength_label(res["adx"])
+                        t_lbl = "Boğa Tonu (+DI > -DI)" if dr == "LONG" else "Ayı Tonu (-DI > +DI)"
+                        png = render_signal_candle_png(f"{t['symbol']} | {tf.upper()} ADX {res['adx']:.1f} ({dr})", bars[-42:], t["price"], is_short=(dr == "SHORT"))
+                        await emit_signal({
+                            "id": f"ADX-{t['symbol']}-{tf}-{dr}-{int(now_s*1000)}",
+                            "engine": "ADX_TREND",
+                            "engineLabel": f"ADX {res['adx']:.1f} ({tf})",
+                            "symbol": t["symbol"], "base": t["base"], "quote": "USDT", "direction": dr, "timeframe": tf,
+                            "entryPrice": t["price"], "currentPrice": t["price"], "peakPrice": t["price"], "peakPct": 0.0,
+                            "headline": f"🧭 ADX {res['adx']:.1f} {s_lbl} — #{t['symbol']} ({dr})",
+                            "details": [
+                                f"{'🟢' if dr == 'LONG' else '🔴'} Yön/Ton: {t_lbl} · Zaman Dilimi: {tf.upper()}",
+                                f"💪 ADX({period}): {res['adx']:.1f} · +DI: {res['plusDi']:.1f} · -DI: {res['minusDi']:.1f} ({'Yeni DI Kesişimi!' if crossed else f'Fark: {spread:.1f}'})",
+                                f"💰 Fiyat: ${fmt_price(t['price'])} · 24s: {t['change24h']:+.2f}%",
+                            ],
+                            "createdAt": int(now_s * 1000), "peakAt": int(now_s * 1000),
+                        }, png)
+                        await asyncio.sleep(0.08)
+        except Exception as e:
+            _log(f"[ADX Trend Loop Hatasi] {e}")
+        await asyncio.sleep(30)
+
+
 async def web_config_sync_loop() -> None:
     if not WEB_SYNC_URL:
         return
@@ -3087,7 +3284,7 @@ async def telegram_command_loop() -> None:
                         f"• ATL/ATH ({','.join(STRATEGY_CONFIG['athAtlTimeframes'])}): {STRATEGY_CONFIG['atlEnabled']}/{STRATEGY_CONFIG['athEnabled']}\n"
                         f"• MA200: {STRATEGY_CONFIG['ma200Enabled']} | Vol: {STRATEGY_CONFIG['volatilityEnabled']} | Formasyon: {STRATEGY_CONFIG['patternsEnabled']}\n"
                         f"• BB ({','.join(STRATEGY_CONFIG.get('bollingerTimeframes', []))}): {STRATEGY_CONFIG.get('bollingerEnabled')} | Ichi ({','.join(STRATEGY_CONFIG.get('ichimokuTimeframes', []))}): {STRATEGY_CONFIG.get('ichimokuEnabled')} | ST ({','.join(STRATEGY_CONFIG.get('supertrendTimeframes', []))}): {STRATEGY_CONFIG.get('supertrendEnabled')}\n"
-                        f"• AI: {STRATEGY_CONFIG.get('aiMarketEnabled')} ({STRATEGY_CONFIG.get('aiMarketDirection', 'BOTH')}, TG:{STRATEGY_CONFIG.get('aiMarketNotifyTelegram', True)}) | TumBorsalar: {STRATEGY_CONFIG.get('multiExchangeEnabled')} | BigPumps: {STRATEGY_CONFIG.get('bigPumpEnabled')} | BuyumeDCA: {STRATEGY_CONFIG.get('growthDcaEnabled')}"
+                        f"• AI: {STRATEGY_CONFIG.get('aiMarketEnabled')} ({STRATEGY_CONFIG.get('aiMarketDirection', 'BOTH')}, TG:{STRATEGY_CONFIG.get('aiMarketNotifyTelegram', True)}) | TumBorsalar: {STRATEGY_CONFIG.get('multiExchangeEnabled')} | BigPumps: {STRATEGY_CONFIG.get('bigPumpEnabled')} | BuyumeDCA: {STRATEGY_CONFIG.get('growthDcaEnabled')} | 1.5%Ticker: {STRATEGY_CONFIG.get('priceTicker15Enabled')} | ADX: {STRATEGY_CONFIG.get('adxTrendEnabled')}"
                         + (f"\n• Son TG Hata: {esc_html(LAST_TG_ERROR)}" if LAST_TG_ERROR else ""),
                         cid,
                     )
@@ -3115,6 +3312,8 @@ async def telegram_command_loop() -> None:
                         "BORSA": "multiExchangeEnabled", "MULTI_EXCHANGE": "multiExchangeEnabled",
                         "BIGPUMP": "bigPumpEnabled", "BIG_PUMP": "bigPumpEnabled",
                         "DCA": "growthDcaEnabled", "GROWTH": "growthDcaEnabled", "GROWTH_DCA": "growthDcaEnabled",
+                        "TICKER15": "priceTicker15Enabled", "TICKER_1_5": "priceTicker15Enabled",
+                        "ADX": "adxTrendEnabled", "ADX_TREND": "adxTrendEnabled",
                     }
                     if key in m:
                         STRATEGY_CONFIG[m[key]] = val
@@ -3253,6 +3452,7 @@ async def main() -> None:
         multi_exchange_loop(),
         ai_market_loop(),
         growth_dca_loop(),
+        adx_trend_loop(),
         web_config_sync_loop(),
         reports_loop(),
         telegram_command_loop(),
