@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 22:44:59 · Rev #4
-# Aktif Motorlar: Volatilite(15m,1h, Major)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP15M, AI_MARKET, MULTI_EXCHANGE, GROWTH_DCA
+# Uretim: 22:48:49 · Rev #4
+# Aktif Motorlar: Volatilite(15m,1h, Tumu)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP15M
 # ==============================================================================
 import asyncio
 import base64
@@ -50,7 +50,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "ma200Period": 200,
     "volatilityEnabled": True,
     "volatilityTimeframes": ["15m", "1h"],
-    "volatilityMajorOnly": True,
+    "volatilityMajorOnly": False,
     "volatilityMajorCoins": [
         "BTC",
         "ETH",
@@ -117,7 +117,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "bigPumpWindowMin": 15,
     "bigPumpCooldownMin": 10,
     "bigPumpMinVolUsdt": 100000,
-    "bigPumpExchanges": ["BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET"],
+    "bigPumpExchanges": ["BINANCE"],
     "growthDcaEnabled": False,
     "growthDcaTpPct": 2.5,
     "growthDcaDrop1Pct": 5,
@@ -142,10 +142,10 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
-        "AI_MARKET": True,
-        "MULTI_EXCHANGE": True,
+        "AI_MARKET": False,
+        "MULTI_EXCHANGE": False,
         "BIG_PUMP": False,
-        "GROWTH_DCA": True,
+        "GROWTH_DCA": False,
     },
 }
 
