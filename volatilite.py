@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 21:53:29 · Rev #5
-# Aktif Motorlar: AI(BOTH,15dk) | BuyumeDCA(-5/13/34%,TP>=%2.5)
-# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP15M, GROWTH_DCA
+# Uretim: 22:44:59 · Rev #4
+# Aktif Motorlar: Volatilite(15m,1h, Major)
+# Oto Futures (AKTIF · 3x · Yon:BOTH · $25 · TP +%10 / SL -%10): PUMP15M, AI_MARKET, MULTI_EXCHANGE, GROWTH_DCA
 # ==============================================================================
 import asyncio
 import base64
@@ -40,7 +40,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "pump15mMinRvol": 1.4,
     "athEnabled": False,
     "atlEnabled": False,
-    "athAtlTimeframes": ["1M"],
+    "athAtlTimeframes": ["1M", "1d"],
     "athAtlLockPct": 1,
     "athAtlCooldownMin": 5,
     "ma200Enabled": False,
@@ -48,7 +48,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "ma200ShortEnabled": True,
     "ma200Timeframe": "4h",
     "ma200Period": 200,
-    "volatilityEnabled": False,
+    "volatilityEnabled": True,
     "volatilityTimeframes": ["15m", "1h"],
     "volatilityMajorOnly": True,
     "volatilityMajorCoins": [
@@ -101,7 +101,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "supertrendMultiplier": 3,
     "supertrendLongEnabled": True,
     "supertrendShortEnabled": True,
-    "aiMarketEnabled": True,
+    "aiMarketEnabled": False,
     "aiMarketDirection": "BOTH",
     "aiMarketIntervalMin": 15,
     "aiMarketMinConfidence": 72,
@@ -118,7 +118,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "bigPumpCooldownMin": 10,
     "bigPumpMinVolUsdt": 100000,
     "bigPumpExchanges": ["BYBIT", "BINANCE", "BINGX", "MEXC", "OKX", "GATE", "KUCOIN", "BITGET"],
-    "growthDcaEnabled": True,
+    "growthDcaEnabled": False,
     "growthDcaTpPct": 2.5,
     "growthDcaDrop1Pct": 5,
     "growthDcaDrop2Pct": 13,
@@ -129,6 +129,8 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "hourlyGainersReportEnabled": True,
     "dailyWinnerReportEnabled": True,
     "top24SummaryReportEnabled": True,
+    "phonePushEnabled": False,
+    "phonePushTopic": "",
     "autoTradeEngines": {
         "PUMP": False,
         "PUMP15M": True,
@@ -140,8 +142,8 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
-        "AI_MARKET": False,
-        "MULTI_EXCHANGE": False,
+        "AI_MARKET": True,
+        "MULTI_EXCHANGE": True,
         "BIG_PUMP": False,
         "GROWTH_DCA": True,
     },
@@ -318,7 +320,7 @@ def apply_strategy_patch(raw: Any) -> None:
         "ichimokuEnabled", "ichimokuLongEnabled", "ichimokuShortEnabled",
         "supertrendEnabled", "supertrendLongEnabled", "supertrendShortEnabled",
         "aiMarketEnabled", "aiMarketNotifyTelegram", "multiExchangeEnabled", "bigPumpEnabled", "growthDcaEnabled",
-        "hourlyGainersReportEnabled", "dailyWinnerReportEnabled", "top24SummaryReportEnabled",
+        "hourlyGainersReportEnabled", "dailyWinnerReportEnabled", "top24SummaryReportEnabled", "phonePushEnabled",
     ]
     for bk in bool_keys:
         if isinstance(raw.get(bk), bool):
@@ -3015,14 +3017,22 @@ async def telegram_command_loop() -> None:
             conflict_logged = False
             for upd in js.get("result", []):
                 offset = max(offset, int(upd["update_id"]) + 1)
-                msg = upd.get("message") or {}
+                mcm = upd.get("my_chat_member") or {}
+                mchat = mcm.get("chat") or {}
+                mstat = str((mcm.get("new_chat_member") or {}).get("status") or "")
+                if mchat.get("id") and mstat in ("administrator", "member"):
+                    mcid = str(mchat["id"])
+                    if mcid not in SUBSCRIBED_CHATS:
+                        SUBSCRIBED_CHATS.add(mcid)
+                        save_state()
+                msg = upd.get("message") or upd.get("channel_post") or {}
                 txt = str(msg.get("text") or "").strip()
                 cid = str((msg.get("chat") or {}).get("id") or "")
-                if not txt or not cid:
-                    continue
-                if cid not in SUBSCRIBED_CHATS:
+                if cid and cid not in SUBSCRIBED_CHATS:
                     SUBSCRIBED_CHATS.add(cid)
                     save_state()
+                if not txt or not cid:
+                    continue
                 parts = txt.split()
                 cmd = parts[0].split("@")[0].lower()
                 if cmd in ("/start", "/help"):
