@@ -1,8 +1,8 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - 7/24 RENDER BOT.PY (WEB AYARLARIYLA OTOMATIK URETILDI)
-# Uretim: 12:19:19 · Rev #3
-# Aktif Motorlar: Tumu Kapali
-# Oto Futures (PASIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%10): Secili Yok
+# Uretim: 12:29:05 · Rev #6
+# Aktif Motorlar: Volatilite(15m,1h, Major) | AI(BOTH,15dk) | Ticker1.5(BOTH,±%1.5)
+# Oto Futures (PASIF · 3x · Yon:BOTH · $25 · TP +%5 / SL -%10): AI_MARKET, TICKER_1_5
 # ==============================================================================
 import asyncio
 import base64
@@ -48,7 +48,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "ma200ShortEnabled": True,
     "ma200Timeframe": "4h",
     "ma200Period": 200,
-    "volatilityEnabled": False,
+    "volatilityEnabled": True,
     "volatilityTimeframes": ["15m", "1h"],
     "volatilityMajorOnly": True,
     "volatilityMajorCoins": [
@@ -101,7 +101,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "supertrendMultiplier": 3,
     "supertrendLongEnabled": True,
     "supertrendShortEnabled": True,
-    "aiMarketEnabled": False,
+    "aiMarketEnabled": True,
     "aiMarketDirection": "BOTH",
     "aiMarketIntervalMin": 15,
     "aiMarketMinConfidence": 72,
@@ -126,7 +126,7 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "growthDcaSizeScale": 2,
     "growthDcaMinVolUsdt": 300000,
     "growthDcaCooldownMin": 60,
-    "priceTicker15Enabled": False,
+    "priceTicker15Enabled": True,
     "priceTicker15Direction": "BOTH",
     "priceTicker15ThresholdPct": 1.5,
     "priceTicker15CooldownMin": 1,
@@ -138,9 +138,9 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
     "adxLongEnabled": True,
     "adxShortEnabled": True,
     "adxCooldownMin": 30,
-    "hourlyGainersReportEnabled": False,
-    "dailyWinnerReportEnabled": False,
-    "top24SummaryReportEnabled": False,
+    "hourlyGainersReportEnabled": True,
+    "dailyWinnerReportEnabled": True,
+    "top24SummaryReportEnabled": True,
     "phonePushEnabled": False,
     "phonePushTopic": "",
     "autoTradeEngines": {
@@ -154,11 +154,11 @@ DEFAULT_STRATEGY_CONFIG: Dict[str, Any] = {
         "BOLLINGER": False,
         "ICHIMOKU": False,
         "SUPERTREND": False,
-        "AI_MARKET": False,
+        "AI_MARKET": True,
         "MULTI_EXCHANGE": False,
         "BIG_PUMP": False,
         "GROWTH_DCA": False,
-        "TICKER_1_5": False,
+        "TICKER_1_5": True,
         "ADX_TREND": False,
     },
 }
@@ -173,7 +173,7 @@ DEFAULT_AUTO_TRADE: Dict[str, Any] = {
     "tradeUsdt": 25,
     "tpPct": 5,
     "slPct": 10,
-    "maxOpenTrades": 9999,
+    "maxOpenTrades": 0,
     "rsiMin": 70,
     "notifyPaperTelegram": True,
 }
