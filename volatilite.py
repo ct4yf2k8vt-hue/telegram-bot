@@ -1,6 +1,6 @@
 # ==============================================================================
 # SPOT AKIS TERMINALI - SADECE KAPANAN ISLEMLER TELEGRAM BOTU (BAGIMSIZ)
-# Uretim: 17:32:15 · Rev #2
+# Uretim: 17:58:20 · Rev #3
 # Durum: Ustteki tum stratejiler, sinyaller, raporlar ve acilis bildirimleri OFF.
 #        Yalnizca kapanan islemler (TP / SL / Manuel) Telegram'a gonderilir.
 #        "Tum Ayarlari Kaydet & bot.py Uret" butonundan tamamen bagimsizdir.
